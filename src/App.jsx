@@ -460,6 +460,139 @@ function useTimeline(){
 // ═══════════════════════════════════════════════════════════════════════════════
 // GPS MAP MODAL
 // ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// INSTRUCTIONS MODAL
+// ═══════════════════════════════════════════════════════════════════════════════
+function InstructionsModal({color,onClose}){
+  const[tab,setTab]=useState("start");
+  const tabs={
+    start:"QUICK START",
+    modes:"IR MODES",
+    motion:"MOTION",
+    sync:"SYNC",
+    features:"FEATURES",
+  };
+  const content={
+    start:[
+      {icon:"📷",title:"ALLOW CAMERA",body:"Open in Chrome/Safari. Tap Allow when prompted for camera. For GPS tap Allow on the location prompt. For audio tap Allow on the mic prompt. iOS: Settings → Safari → Camera → Allow."},
+      {icon:"🔒",title:"HTTPS REQUIRED",body:"Camera only works on HTTPS. The Vercel URL is already secure. If self-hosting use localhost or add an SSL cert."},
+      {icon:"📱",title:"BEST ON MOBILE",body:"Open the Vercel URL on your phone in Chrome. Tap the share button → Add to Home Screen for a full-screen app experience with no browser chrome."},
+      {icon:"🌙",title:"NIGHT USE",body:"In a dark environment, crank GAIN to +2 and switch to NVG mode. Point at any light source briefly to let the sensor calibrate, then scan your scene. CLAHE will pull detail out of near-black regions."},
+    ],
+    modes:[
+      {icon:"🟢",title:"NVG — Night Vision Green",body:"Classic phosphor image amplification. Green channel pushed 1.2×, red and blue near zero. CLAHE applied to 6×6 tile grid for dark detail recovery. Best for general low-light surveillance."},
+      {icon:"🔴",title:"THERMAL — FLIR Iron-Bow",body:"Calibrated 256-entry LUT maps luminance to heat color: black→purple→red→orange→yellow→white. Brighter = hotter. Hot-spot marker shows peak temperature in °C. Not a real IR sensor — uses visible light brightness as heat proxy."},
+      {icon:"🔵",title:"RAINBOW / FUSION",body:"Alternative false-color IR palettes. RAINBOW maps cold→blue→green→yellow→red→hot. FUSION goes purple→orange→white. Useful for scene contrast when THERMAL is too saturated."},
+      {icon:"⬜",title:"ARCTIC / WHT-HOT",body:"ARCTIC boosts blue channel for cold-scene IR simulation. WHT-HOT is high-contrast grayscale with 3.0× brightness and 2.4× contrast — good for fog, smoke, and haze environments."},
+    ],
+    motion:[
+      {icon:"🎯",title:"MOTION DETECTION",body:"Frame-differencing compares each pixel to the previous frame. Threshold set by SENS slider — higher = more sensitive (picks up small movement), lower = ignores minor changes like foliage."},
+      {icon:"🔲",title:"LOCK-ON + AI CLASSIFY",body:"BFS blob-labeling groups moving pixels into up to 8 distinct targets. Each gets a bracket box labeled TGT-01 through TGT-08. AI classifier reads blob aspect ratio, area, and position to guess PERSON 🧍, VEHICLE 🚗, DRONE 🦅, ANIMAL 🐾, or SMALL OBJ."},
+      {icon:"📐",title:"RANGEFINDER",body:"Distance shown under each target box (~Xm). Uses pinhole camera model: blob height in pixels + estimated real height (1.7m for person, 1.5m for vehicle) + 60° VFOV → distance in meters. Accurate to ±20% for human targets."},
+      {icon:"🎯",title:"AUTO-CAPTURE",body:"Enable AUTO-CAP. When a blob exceeds 0.8% of frame area, a 600ms countdown starts. Camera flashes white and saves a PNG to Gallery. 3-second cooldown per camera. Works independently on REAR and FRONT in DUAL mode."},
+      {icon:"⚡",title:"TRIPWIRE ZONES",body:"Tap WIRE to open the editor. Tap + DRAW, tap points on the canvas to lay a line, tap ✓ DONE. When a target blob crosses the wire, it flashes red, logs to Timeline, and resets after 3 seconds. Draw multiple zones."},
+    ],
+    sync:[
+      {icon:"💻",title:"CROSS-DEVICE (LAPTOP + PHONE)",body:"The easiest way: open the same Vercel URL on both devices in Chrome. Each shows its own camera feed independently. No pairing needed — just two windows."},
+      {icon:"🔗",title:"SHARE THE URL",body:"URL: https://night-vision-git-master-cloudygetty-ais-projects.vercel.app — send it to anyone. They open it on their device and get their own NVS feed. Useful for covering multiple angles simultaneously."},
+      {icon:"📡",title:"SYNC BUTTON (SAME DEVICE ONLY)",body:"The SYNC button uses BroadcastChannel — this only works between tabs or windows on the SAME device. Open NVS in two Chrome tabs on your laptop: both will see each other's motion alerts in real time. NOT cross-network."},
+      {icon:"📺",title:"DUAL CAMERA MODE",body:"On a phone with front + rear camera, tap DUAL. Both cameras activate simultaneously in split view. Each runs its own motion detector, auto-capture, and processing pipeline independently."},
+      {icon:"🌐",title:"REAL-TIME NETWORK SYNC (COMING)",body:"True cross-device WebRTC streaming (phone → laptop) requires a signaling server. This is not yet built into NVS-7.5. Planned for NVS-8.0. For now, use the shared URL approach above."},
+    ],
+    features:[
+      {icon:"🔬",title:"EDGE DETECTION",body:"Toggle EDGE to run Sobel gradient detection. Outlines object boundaries in mode-matched color (green for NVG, blue for ARCTIC, white for thermal). Very useful at high zoom levels."},
+      {icon:"🔇",title:"NOISE REDUCTION",body:"NR blends each frame with the previous at 78% alpha. Smooths out sensor noise. Best for static scenes. Disable if you need max sensitivity to fast small motion."},
+      {icon:"💓",title:"rPPG HEART RATE",body:"Toggle rPPG then point the FRONT camera at your face in good light. Samples mean green channel from center 20% of frame. Peak detection over 60 frames estimates BPM. Requires 5-10 seconds to stabilize. Works best in NVG or WHT-HOT mode."},
+      {icon:"🔊",title:"AUDIO SPIKE DETECTION",body:"Toggle the mic button 🎙. Sets a rolling ambient baseline. If audio spikes above 2.2× baseline, triggers AUDIO SPIKE alert and logs to Timeline. Useful for detecting door slams, gunshots, or voices off-camera."},
+      {icon:"🗺",title:"GPS MAP",body:"Allow location when prompted. Tap MAP to open the OSM tile map. Drag to pan, +/− to zoom, ◎ CTR to snap back to your position. Motion events with GPS coords appear as orange pins. Map uses OpenStreetMap tiles with NVG tint."},
+      {icon:"⏱",title:"TIMELINE",body:"Every event logs here: motion detections, captures, audio spikes, tripwire breaches, and peer alerts. Tap LOG to open. Left pane = event list, right pane = detail view. Captures show image preview with download button."},
+      {icon:"📹",title:"RECORDING",body:"Tap ● REC to start. Records the processed canvas (with NVG filter applied) as WebM video. Tap ■ STOP — file auto-downloads. Works only on the REAR camera output."},
+      {icon:"🔆",title:"GAIN + ZOOM",body:"GAIN: 5-bar brightness from −1.5 to +1.5 applied to the processing pipeline. ZOOM: 1× to 12×. Above 4× uses pixel-sharp rendering. Combine high zoom with EDGE for maximum target definition at distance."},
+    ],
+  };
+
+  return(
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.98)",zIndex:300,
+      display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease"}}>
+      {/* Header */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+        padding:"10px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0}}>
+        <span style={{fontFamily:"'Cinzel',serif",fontSize:11,fontWeight:900,
+          color,letterSpacing:4,textShadow:`0 0 12px ${color}40`}}>
+          NVS-7 // OPERATOR MANUAL
+        </span>
+        <button onClick={onClose} style={{padding:"4px 12px",background:"transparent",
+          border:`1px solid ${color}30`,borderRadius:2,color:`${color}70`,
+          fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:2,cursor:"pointer"}}>
+          ✕ CLOSE
+        </button>
+      </div>
+      {/* Tab bar */}
+      <div style={{display:"flex",gap:2,padding:"6px 10px",
+        borderBottom:`1px solid ${color}10`,flexShrink:0,overflowX:"auto"}}>
+        {Object.entries(tabs).map(([k,v])=>(
+          <button key={k} onClick={()=>setTab(k)} style={{
+            padding:"5px 10px",background:tab===k?`${color}15`:"transparent",
+            border:`1px solid ${tab===k?color:`${color}15`}`,
+            borderRadius:2,fontSize:7,color:tab===k?color:`${color}45`,
+            letterSpacing:1,cursor:"pointer",whiteSpace:"nowrap",
+            fontFamily:"'DM Mono',monospace",transition:"all 0.12s"}}>
+            {v}
+          </button>
+        ))}
+      </div>
+      {/* Content */}
+      <div style={{flex:1,overflowY:"auto",padding:"12px 14px"}}>
+        {content[tab].map((s,i)=>(
+          <div key={i} style={{display:"flex",gap:12,marginBottom:14,
+            padding:"10px 12px",border:`1px solid ${color}12`,
+            borderRadius:3,background:`${color}03`}}>
+            <span style={{fontSize:20,flexShrink:0,marginTop:2}}>{s.icon}</span>
+            <div>
+              <div style={{fontFamily:"'DM Mono',monospace",fontSize:9,color,
+                letterSpacing:2,marginBottom:5}}>{s.title}</div>
+              <div style={{fontFamily:"'DM Mono',monospace",fontSize:8,
+                color:`${color}65`,lineHeight:1.7,letterSpacing:.4}}>{s.body}</div>
+            </div>
+          </div>
+        ))}
+        {tab==="sync"&&(
+          <div style={{padding:"10px 12px",border:`1px solid ${color}30`,borderRadius:3,
+            background:`${color}08`,marginTop:4}}>
+            <div style={{fontFamily:"'DM Mono',monospace",fontSize:8,color,letterSpacing:2,marginBottom:6}}>
+              📋 QUICK SYNC STEPS — PHONE + LAPTOP
+            </div>
+            {[
+              "1. On your phone — open Chrome, go to the Vercel URL",
+              "2. On your laptop — open Chrome, go to the same Vercel URL",
+              "3. Both devices now run independent NVS feeds",
+              "4. Allow camera on each device when prompted",
+              "5. Position phone facing one direction, laptop another",
+              "6. Both feeds monitor simultaneously — no pairing needed",
+            ].map((s,i)=>(
+              <div key={i} style={{fontFamily:"'DM Mono',monospace",fontSize:8,
+                color:`${color}80`,padding:"3px 0",
+                borderBottom:i<5?`1px solid ${color}08`:"none",letterSpacing:.5}}>
+                {s}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+      {/* Footer */}
+      <div style={{padding:"6px 14px",borderTop:`1px solid ${color}08`,
+        display:"flex",justifyContent:"space-between",flexShrink:0}}>
+        <span style={{fontFamily:"'DM Mono',monospace",fontSize:6,color:`${color}25`,letterSpacing:1}}>
+          CLOUDYGETTY-AI // ENTROPY-ZERO // NVS-7.5
+        </span>
+        <span style={{fontFamily:"'DM Mono',monospace",fontSize:6,color:`${color}25`,letterSpacing:1}}>
+          ALL RIGHTS RESERVED
+        </span>
+      </div>
+    </div>
+  );
+}
+
 // Tile helpers for OSM slippy map
 function latLonToTile(lat,lon,z){
   const n=Math.pow(2,z);
@@ -1341,6 +1474,7 @@ export default function NightVisionCamera(){
       {modal==="map"&&<GPSMap pos={gps} events={events} color={color} onClose={()=>setModal(null)}/>}
       {modal==="timeline"&&<TimelineModal events={events} captures={captures} color={color} onClose={()=>setModal(null)}/>}
       {modal==="tripwire"&&<TripwireEditor tripwires={tripwires} onUpdate={setTripwires} color={color} onClose={()=>setModal(null)}/>}
+      {modal==="manual"&&<InstructionsModal color={color} onClose={()=>setModal(null)}/>}
 
       <div style={{width:"100%",height:"100%",display:"flex",flexDirection:"column",background:"#000",border:`1px solid ${color}18`,animation:"fade-in 0.4s ease",overflow:"hidden"}}>
 
@@ -1482,6 +1616,7 @@ export default function NightVisionCamera(){
               {l:"🗺 MAP",m:"map",c:gps?"#00ccff":undefined},
               {l:`⏱ ${newEventCount>0?`(${newEventCount})`:"LOG"}`,m:"timeline",c:newEventCount>0?"#cc44ff":undefined},
               {l:`⚡ WIRE${tripwires.length?` (${tripwires.length})`:""}`,m:"tripwire",c:hasTripwire?"#ffcc00":tripwires.length>0?"#ffcc0080":undefined},
+              {l:"? HELP",m:"manual",c:undefined},
             ].map(({l,m,c})=>(
               <button key={m} onClick={()=>setModal(m)} style={{flex:1,padding:"6px 2px",
                 background:modal===m?`${c||color}10`:"transparent",
