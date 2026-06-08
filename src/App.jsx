@@ -1,513 +1,1014 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import{useState,useEffect,useRef,useCallback,useMemo}from"react";
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// PALETTES & LUTS
+// LUT BUILDER
 // ═══════════════════════════════════════════════════════════════════════════════
-
-function buildLUT(fn) {
-  const lut = new Uint8Array(256 * 3);
-  for (let i = 0; i < 256; i++) {
-    const [r, g, b] = fn(i / 255);
-    lut[i * 3] = Math.min(255, Math.max(0, Math.round(r)));
-    lut[i * 3 + 1] = Math.min(255, Math.max(0, Math.round(g)));
-    lut[i * 3 + 2] = Math.min(255, Math.max(0, Math.round(b)));
+function buildLUT(fn){
+  const l=new Uint8Array(256*3);
+  for(let i=0;i<256;i++){
+    const[r,g,b]=fn(i/255);
+    l[i*3]=Math.min(255,Math.max(0,Math.round(r)));
+    l[i*3+1]=Math.min(255,Math.max(0,Math.round(g)));
+    l[i*3+2]=Math.min(255,Math.max(0,Math.round(b)));
   }
-  return lut;
+  return l;
 }
-
-const LUTS = {
-  THERMAL: buildLUT(t => {
-    if (t < 0.20) return [0, 0, t / 0.20 * 180];
-    if (t < 0.40) { const s = (t - 0.20) / 0.20; return [s * 160, 0, 180 - s * 180]; }
-    if (t < 0.60) { const s = (t - 0.40) / 0.20; return [160 + s * 95, s * 60, 0]; }
-    if (t < 0.80) { const s = (t - 0.60) / 0.20; return [255, 60 + s * 140, 0]; }
-    const s = (t - 0.80) / 0.20; return [255, 200 + s * 55, s * 255];
+const LUTS={
+  THERMAL:buildLUT(t=>{
+    if(t<.2)return[0,0,t/.2*180];
+    if(t<.4){const s=(t-.2)/.2;return[s*160,0,180-s*180];}
+    if(t<.6){const s=(t-.4)/.2;return[160+s*95,s*60,0];}
+    if(t<.8){const s=(t-.6)/.2;return[255,60+s*140,0];}
+    const s=(t-.8)/.2;return[255,200+s*55,s*255];
   }),
-  RAINBOW: buildLUT(t => {
-    if (t < 0.25) return [0, t / 0.25 * 255, 255];
-    if (t < 0.50) { const s = (t - 0.25) / 0.25; return [0, 255, 255 - s * 255]; }
-    if (t < 0.75) { const s = (t - 0.50) / 0.25; return [s * 255, 255, 0]; }
-    const s = (t - 0.75) / 0.25; return [255, 255 - s * 255, 0];
+  RAINBOW:buildLUT(t=>{
+    if(t<.25)return[0,t/.25*255,255];
+    if(t<.5){const s=(t-.25)/.25;return[0,255,255-s*255];}
+    if(t<.75){const s=(t-.5)/.25;return[s*255,255,0];}
+    const s=(t-.75)/.25;return[255,255-s*255,0];
   }),
-  FUSION: buildLUT(t => {
-    if (t < 0.33) { const s = t / 0.33; return [s * 80, 0, 80 + s * 175]; }
-    if (t < 0.66) { const s = (t - 0.33) / 0.33; return [80 + s * 175, s * 100, 255 - s * 200]; }
-    const s = (t - 0.66) / 0.34; return [255, 100 + s * 155, 55 + s * 200];
+  FUSION:buildLUT(t=>{
+    if(t<.33){const s=t/.33;return[s*80,0,80+s*175];}
+    if(t<.66){const s=(t-.33)/.33;return[80+s*175,s*100,255-s*200];}
+    const s=(t-.66)/.34;return[255,100+s*155,55+s*200];
   }),
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// IMAGE PROCESSING ENGINE
+// IMAGE PROCESSING
 // ═══════════════════════════════════════════════════════════════════════════════
-
-// Sobel edge detection → writes edge strength into alpha channel temp
-function sobelEdges(data, w, h) {
-  const edges = new Float32Array(w * h);
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
-      const lum = (i) => {
-        const idx = i * 4;
-        return 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
-      };
-      const tl = lum((y-1)*w+(x-1)), t = lum((y-1)*w+x), tr = lum((y-1)*w+(x+1));
-      const ml = lum(y*w+(x-1)),                           mr = lum(y*w+(x+1));
-      const bl = lum((y+1)*w+(x-1)), b = lum((y+1)*w+x), br = lum((y+1)*w+(x+1));
-      const gx = -tl - 2*ml - bl + tr + 2*mr + br;
-      const gy = -tl - 2*t - tr + bl + 2*b + br;
-      edges[y * w + x] = Math.min(255, Math.sqrt(gx*gx + gy*gy) * 0.5);
-    }
+function sobelEdges(data,w,h){
+  const e=new Float32Array(w*h);
+  for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){
+    const L=i=>{const d=i*4;return 0.299*data[d]+0.587*data[d+1]+0.114*data[d+2];};
+    const tl=L((y-1)*w+(x-1)),t=L((y-1)*w+x),tr=L((y-1)*w+(x+1));
+    const ml=L(y*w+(x-1)),mr=L(y*w+(x+1));
+    const bl=L((y+1)*w+(x-1)),b=L((y+1)*w+x),br=L((y+1)*w+(x+1));
+    const gx=-tl-2*ml-bl+tr+2*mr+br,gy=-tl-2*t-tr+bl+2*b+br;
+    e[y*w+x]=Math.min(255,Math.sqrt(gx*gx+gy*gy)*.5);
   }
-  return edges;
+  return e;
 }
-
-// CLAHE — 6×6 tile grid, clip=3.5
-function applyCLAHE(data, w, h, tiles = 6, clip = 3.5) {
-  const tW = Math.floor(w / tiles), tH = Math.floor(h / tiles);
-  for (let ty = 0; ty < tiles; ty++) {
-    for (let tx = 0; tx < tiles; tx++) {
-      const x0 = tx * tW, y0 = ty * tH;
-      const x1 = tx === tiles-1 ? w : x0 + tW;
-      const y1 = ty === tiles-1 ? h : y0 + tH;
-      const hist = new Float32Array(256);
-      let count = 0;
-      for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
-        const idx = (y * w + x) * 4;
-        hist[Math.round(0.299*data[idx] + 0.587*data[idx+1] + 0.114*data[idx+2])]++;
-        count++;
-      }
-      const lim = (count / 256) * clip;
-      let ex = 0;
-      for (let i = 0; i < 256; i++) { if (hist[i] > lim) { ex += hist[i] - lim; hist[i] = lim; } }
-      const add = ex / 256;
-      for (let i = 0; i < 256; i++) hist[i] += add;
-      const cdf = new Float32Array(256);
-      cdf[0] = hist[0];
-      for (let i = 1; i < 256; i++) cdf[i] = cdf[i-1] + hist[i];
-      const cMin = cdf[0];
-      for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
-        const idx = (y * w + x) * 4;
-        const lum = Math.round(0.299*data[idx] + 0.587*data[idx+1] + 0.114*data[idx+2]);
-        const eq = Math.round((cdf[lum] - cMin) / Math.max(1, count - cMin) * 255);
-        const sc = lum > 2 ? eq / lum : 1;
-        data[idx]   = Math.min(255, data[idx]   * sc);
-        data[idx+1] = Math.min(255, data[idx+1] * sc);
-        data[idx+2] = Math.min(255, data[idx+2] * sc);
-      }
+function applyCLAHE(data,w,h,tiles=6,clip=3.5){
+  const tW=Math.floor(w/tiles),tH=Math.floor(h/tiles);
+  for(let ty=0;ty<tiles;ty++)for(let tx=0;tx<tiles;tx++){
+    const x0=tx*tW,y0=ty*tH,x1=tx===tiles-1?w:x0+tW,y1=ty===tiles-1?h:y0+tH;
+    const hist=new Float32Array(256);let count=0;
+    for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){
+      const i=(y*w+x)*4;
+      hist[Math.round(0.299*data[i]+0.587*data[i+1]+0.114*data[i+2])]++;count++;
+    }
+    const lim=(count/256)*clip;let ex=0;
+    for(let i=0;i<256;i++){if(hist[i]>lim){ex+=hist[i]-lim;hist[i]=lim;}}
+    const add=ex/256;for(let i=0;i<256;i++)hist[i]+=add;
+    const cdf=new Float32Array(256);cdf[0]=hist[0];
+    for(let i=1;i<256;i++)cdf[i]=cdf[i-1]+hist[i];
+    const cMin=cdf[0];
+    for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){
+      const i=(y*w+x)*4;
+      const lum=Math.round(0.299*data[i]+0.587*data[i+1]+0.114*data[i+2]);
+      const eq=Math.round((cdf[lum]-cMin)/Math.max(1,count-cMin)*255);
+      const sc=lum>2?eq/lum:1;
+      data[i]=Math.min(255,data[i]*sc);data[i+1]=Math.min(255,data[i+1]*sc);data[i+2]=Math.min(255,data[i+2]*sc);
     }
   }
 }
-
-// Temporal noise reduction — blend with previous N frames
-function temporalBlend(data, history, alpha = 0.72) {
-  if (!history || history.length !== data.length) return;
-  for (let i = 0; i < data.length; i += 4) {
-    data[i]   = data[i]   * alpha + history[i]   * (1 - alpha);
-    data[i+1] = data[i+1] * alpha + history[i+1] * (1 - alpha);
-    data[i+2] = data[i+2] * alpha + history[i+2] * (1 - alpha);
+function temporalBlend(data,history,alpha=0.75){
+  if(!history||history.length!==data.length)return;
+  for(let i=0;i<data.length;i+=4){
+    data[i]=data[i]*alpha+history[i]*(1-alpha);
+    data[i+1]=data[i+1]*alpha+history[i+1]*(1-alpha);
+    data[i+2]=data[i+2]*alpha+history[i+2]*(1-alpha);
   }
 }
+function findBlobs(motionMap,w,h,minSize=60){
+  const visited=new Uint8Array(w*h);const blobs=[];
+  for(let start=0;start<motionMap.length;start++){
+    if(!motionMap[start]||visited[start])continue;
+    const queue=[start];visited[start]=1;
+    let minX=w,minY=h,maxX=0,maxY=0,size=0;
+    while(queue.length){
+      const idx=queue.pop();size++;
+      const x=idx%w,y=Math.floor(idx/w);
+      if(x<minX)minX=x;if(x>maxX)maxX=x;if(y<minY)minY=y;if(y>maxY)maxY=y;
+      for(const[dx,dy]of[[-1,0],[1,0],[0,-1],[0,1]]){
+        const nx=x+dx,ny=y+dy;
+        if(nx>=0&&nx<w&&ny>=0&&ny<h){const ni=ny*w+nx;if(motionMap[ni]&&!visited[ni]){visited[ni]=1;queue.push(ni);}}
+      }
+    }
+    if(size>=minSize)blobs.push({x:minX,y:minY,w:maxX-minX,h:maxY-minY,size,cx:(minX+maxX)/2,cy:(minY+maxY)/2});
+  }
+  return blobs.sort((a,b)=>b.size-a.size).slice(0,8);
+}
 
-// Connected component labeling — find distinct motion blobs
-function findBlobs(motionMap, w, h, minSize = 80) {
-  const visited = new Uint8Array(w * h);
-  const blobs = [];
-  for (let start = 0; start < motionMap.length; start++) {
-    if (!motionMap[start] || visited[start]) continue;
-    // BFS
-    const queue = [start]; visited[start] = 1;
-    let minX = w, minY = h, maxX = 0, maxY = 0, size = 0;
-    while (queue.length) {
-      const idx = queue.pop(); size++;
-      const x = idx % w, y = Math.floor(idx / w);
-      if (x < minX) minX = x; if (x > maxX) maxX = x;
-      if (y < minY) minY = y; if (y > maxY) maxY = y;
-      for (const [dx, dy] of [[-1,0],[1,0],[0,-1],[0,1]]) {
-        const nx = x+dx, ny = y+dy;
-        if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-          const ni = ny*w+nx;
-          if (motionMap[ni] && !visited[ni]) { visited[ni] = 1; queue.push(ni); }
+// AI Object classification (heuristic-based, no ML model needed)
+function classifyBlob(blob,sw,sh){
+  const aspect=blob.w/(blob.h||1);
+  const area=(blob.w*blob.h)/(sw*sh);
+  const cy=blob.cy/sh;
+  if(area>0.25)return{label:"VEHICLE",conf:88,icon:"🚗"};
+  if(aspect>1.8&&area>0.05)return{label:"VEHICLE",conf:75,icon:"🚗"};
+  if(aspect>0.5&&aspect<2.2&&area>0.02&&cy>0.3)return{label:"PERSON",conf:82,icon:"🧍"};
+  if(area<0.005)return{label:"SMALL OBJ",conf:60,icon:"◈"};
+  if(aspect>2.5)return{label:"ANIMAL",conf:55,icon:"🐾"};
+  if(cy<0.25&&area>0.01)return{label:"DRONE/BIRD",conf:65,icon:"🦅"};
+  return{label:"UNKNOWN",conf:50,icon:"?"};
+}
+
+// Distance estimation (pinhole camera model approximation)
+function estimateDistance(blobHeightPx,canvasH,mode){
+  // Assume avg human height 1.7m, typical phone VFOV ~60deg
+  const vfovRad=60*(Math.PI/180);
+  const focalPx=canvasH/(2*Math.tan(vfovRad/2));
+  const realH=mode==="PERSON"?1.7:mode==="VEHICLE"?1.5:0.5;
+  if(blobHeightPx<5)return null;
+  const dist=(realH*focalPx)/blobHeightPx;
+  return Math.max(0.5,Math.min(500,dist));
+}
+
+// rPPG heart-rate: sample green channel mean from face region over time
+function extractRPPG(data,w,h){
+  // sample center 20% of frame (face region when selfie)
+  const cx=Math.floor(w*0.4),cy=Math.floor(h*0.3);
+  const rw=Math.floor(w*0.2),rh=Math.floor(h*0.2);
+  let sum=0,count=0;
+  for(let y=cy;y<cy+rh&&y<h;y+=2)for(let x=cx;x<cx+rw&&x<w;x+=2){
+    const i=(y*w+x)*4;sum+=data[i+1];count++;
+  }
+  return count>0?sum/count:0;
+}
+
+function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
+  const{mode,brightness,sensitivity,edgeOverlay,noiseReduction,lutName,tripwires,showRPPG}=cfg;
+  const sw=video.videoWidth,sh=video.videoHeight;
+  if(!sw||!sh||video.readyState<2)return null;
+  rawCanvas.width=sw;rawCanvas.height=sh;dispCanvas.width=sw;dispCanvas.height=sh;
+  const rawCtx=rawCanvas.getContext("2d",{willReadFrequently:true});
+  rawCtx.drawImage(video,0,0,sw,sh);
+  const imageData=rawCtx.getImageData(0,0,sw,sh);
+  const data=imageData.data;
+  if(noiseReduction&&refs.prev.current)temporalBlend(data,refs.prev.current,0.78);
+  refs.prev.current=new Uint8ClampedArray(data);
+  const motionThresh=Math.round(15+(1-sensitivity)*40);
+  const motionMap=new Uint8Array(sw*sh);let motionPixels=0;
+  if(refs.motion.current&&refs.motion.current.length===data.length){
+    for(let i=0;i<data.length;i+=4){
+      const d=(Math.abs(data[i]-refs.motion.current[i])+Math.abs(data[i+1]-refs.motion.current[i+1])+Math.abs(data[i+2]-refs.motion.current[i+2]))/3;
+      if(d>motionThresh){motionMap[i/4]=255;motionPixels++;}
+    }
+  }
+  refs.motion.current=new Uint8ClampedArray(data);
+
+  // rPPG sample
+  const rppgVal=showRPPG?extractRPPG(data,sw,sh):0;
+
+  let edges=null;
+  if(edgeOverlay)edges=sobelEdges(data,sw,sh);
+  if(mode==="NVG"||mode==="WHITE"||mode==="FUSION")applyCLAHE(data,sw,sh,6,3.5);
+
+  const bri=(mode==="NVG"?2.8:mode==="WHITE"?3.0:2.0)+brightness;
+  const con=mode==="NVG"?1.9:mode==="WHITE"?2.4:2.1;
+  const mid=128;
+  const lut=LUTS[lutName]||null;
+  const tempSamples=[];
+
+  for(let i=0;i<data.length;i+=4){
+    const r=data[i],g=data[i+1],b=data[i+2];
+    const lum=0.299*r+0.587*g+0.114*b;
+    const boosted=Math.max(0,Math.min(255,(lum*bri-mid)*con+mid));
+    const pIdx=i/4;
+    if(mode==="NVG"){
+      data[i]=Math.min(255,boosted*0.06);data[i+1]=Math.min(255,boosted*1.05+g*0.12);data[i+2]=Math.min(255,boosted*0.05);
+      const n=(Math.random()-.5)*5;data[i+1]=Math.max(0,Math.min(255,data[i+1]+n));
+    }else if(mode==="THERMAL"||mode==="RAINBOW"||mode==="FUSION"){
+      const al=lut||LUTS.THERMAL;const li=Math.min(255,Math.round(boosted));
+      data[i]=al[li*3];data[i+1]=al[li*3+1];data[i+2]=al[li*3+2];
+      const px=pIdx%sw,py=Math.floor(pIdx/sw);
+      if(px%8===0&&py%8===0)tempSamples.push({lum,px,py});
+    }else if(mode==="BLUE"){
+      data[i]=Math.min(255,boosted*0.12);data[i+1]=Math.min(255,boosted*0.32);data[i+2]=Math.min(255,boosted*1.15+b*0.25);
+      const n=(Math.random()-.5)*7;data[i+2]=Math.max(0,Math.min(255,data[i+2]+n));
+    }else{const w2=Math.min(255,boosted);data[i]=data[i+1]=data[i+2]=w2;}
+
+    if(edgeOverlay&&edges){
+      const e=edges[pIdx];
+      if(e>40){
+        const ef=(e-40)/215;
+        const ec=mode==="NVG"?[0,255,80]:mode==="BLUE"?[0,160,255]:[255,255,200];
+        data[i]=Math.min(255,data[i]*(1-ef)+ec[0]*ef);
+        data[i+1]=Math.min(255,data[i+1]*(1-ef)+ec[1]*ef);
+        data[i+2]=Math.min(255,data[i+2]*(1-ef)+ec[2]*ef);
+      }
+    }
+    if(motionMap[pIdx]){
+      data[i]=Math.min(255,data[i]*0.4+255*0.6);
+      data[i+1]=Math.min(255,data[i+1]*0.4+100*0.6);
+      data[i+2]=Math.min(255,data[i+2]*0.1);
+    }
+  }
+
+  rawCtx.putImageData(imageData,0,0);
+  const dCtx=dispCanvas.getContext("2d");
+  dCtx.drawImage(rawCanvas,0,0);
+  dCtx.fillStyle="rgba(0,0,0,0.04)";
+  for(let y=0;y<sh;y+=3)dCtx.fillRect(0,y,sw,1);
+  const vg=dCtx.createRadialGradient(sw/2,sh/2,sh*0.1,sw/2,sh/2,sh*0.9);
+  vg.addColorStop(0,"rgba(0,0,0,0)");vg.addColorStop(.7,"rgba(0,0,0,0)");vg.addColorStop(1,"rgba(0,0,0,0.75)");
+  dCtx.fillStyle=vg;dCtx.fillRect(0,0,sw,sh);
+
+  // Draw tripwires on canvas
+  if(tripwires&&tripwires.length){
+    for(const tw of tripwires){
+      if(tw.points.length<2)continue;
+      dCtx.beginPath();
+      dCtx.moveTo(tw.points[0].x/100*sw,tw.points[0].y/100*sh);
+      for(let i=1;i<tw.points.length;i++)dCtx.lineTo(tw.points[i].x/100*sw,tw.points[i].y/100*sh);
+      dCtx.strokeStyle=tw.triggered?"rgba(255,30,30,0.9)":"rgba(255,200,0,0.7)";
+      dCtx.lineWidth=2;dCtx.setLineDash([6,4]);dCtx.stroke();dCtx.setLineDash([]);
+      // label
+      const lx=tw.points[0].x/100*sw,ly=tw.points[0].y/100*sh;
+      dCtx.fillStyle=tw.triggered?"#ff2222":"#ffcc00";
+      dCtx.font="bold 9px DM Mono, monospace";
+      dCtx.fillText(tw.label,lx+4,ly-4);
+    }
+  }
+
+  let tempData=null;
+  if(tempSamples.length>0){
+    let hot=-Infinity,cold=Infinity,sum=0,hotPx=50,hotPy=50;
+    for(const{lum,px,py}of tempSamples){
+      const t=18+(lum/255)*22;
+      if(t>hot){hot=t;hotPx=px/sw*100;hotPy=py/sh*100;}
+      if(t<cold)cold=t;sum+=t;
+    }
+    tempData={hot,cold,avg:sum/tempSamples.length,hotX:hotPx,hotY:hotPy};
+  }
+
+  const blobs=motionPixels>20?findBlobs(motionMap,sw,sh,60):[];
+  // Classify and add distance to each blob
+  const enrichedBlobs=blobs.map(b=>{
+    const cls=classifyBlob(b,sw,sh);
+    const dist=estimateDistance(b.h,sh,cls.label);
+    return{...b,...cls,dist};
+  });
+
+  // Check tripwire intersections
+  const triggeredWires=[];
+  if(tripwires&&blobs.length){
+    for(const tw of tripwires){
+      if(tw.points.length<2)continue;
+      for(const blob of blobs){
+        const bx=blob.cx/sw*100,by=blob.cy/sh*100;
+        // Simple: check if blob center is near any wire segment
+        for(let i=0;i<tw.points.length-1;i++){
+          const p1=tw.points[i],p2=tw.points[i+1];
+          const dx=p2.x-p1.x,dy=p2.y-p1.y;
+          const len=Math.sqrt(dx*dx+dy*dy);
+          if(len<0.1)continue;
+          const t=Math.max(0,Math.min(1,((bx-p1.x)*dx+(by-p1.y)*dy)/(len*len)));
+          const cx2=p1.x+t*dx,cy2=p1.y+t*dy;
+          const dist2=Math.sqrt((bx-cx2)**2+(by-cy2)**2);
+          if(dist2<4)triggeredWires.push(tw.id);
         }
       }
     }
-    if (size >= minSize) blobs.push({ x: minX, y: minY, w: maxX-minX, h: maxY-minY, size, cx: (minX+maxX)/2, cy: (minY+maxY)/2 });
-  }
-  return blobs.sort((a, b) => b.size - a.size).slice(0, 6);
-}
-
-// ─── Main frame processor ──────────────────────────────────────────────────────
-function processFrame(video, rawCanvas, displayCanvas, settings, refs) {
-  const { mode, brightness, sensitivity, edgeOverlay, noiseReduction, lutName } = settings;
-  const sw = video.videoWidth, sh = video.videoHeight;
-  if (!sw || !sh || video.readyState < 2) return null;
-
-  rawCanvas.width = sw; rawCanvas.height = sh;
-  displayCanvas.width = sw; displayCanvas.height = sh;
-
-  const rawCtx = rawCanvas.getContext("2d", { willReadFrequently: true });
-  rawCtx.drawImage(video, 0, 0, sw, sh);
-  const imageData = rawCtx.getImageData(0, 0, sw, sh);
-  const data = imageData.data;
-
-  // ── Temporal noise reduction ──────────────────────────────────────────────
-  if (noiseReduction && refs.prevFrame.current) {
-    temporalBlend(data, refs.prevFrame.current, 0.78);
-  }
-  refs.prevFrame.current = new Uint8ClampedArray(data);
-
-  // ── Motion detection ──────────────────────────────────────────────────────
-  const motionThresh = Math.round(15 + (1 - sensitivity) * 40);
-  const motionMap = new Uint8Array(sw * sh);
-  let motionPixels = 0;
-  if (refs.motionRef.current && refs.motionRef.current.length === data.length) {
-    for (let i = 0; i < data.length; i += 4) {
-      const d = (Math.abs(data[i] - refs.motionRef.current[i]) +
-                 Math.abs(data[i+1] - refs.motionRef.current[i+1]) +
-                 Math.abs(data[i+2] - refs.motionRef.current[i+2])) / 3;
-      if (d > motionThresh) { motionMap[i/4] = 255; motionPixels++; }
-    }
-  }
-  refs.motionRef.current = new Uint8ClampedArray(data);
-
-  // ── Sobel edge detection ──────────────────────────────────────────────────
-  let edges = null;
-  if (edgeOverlay) edges = sobelEdges(data, sw, sh);
-
-  // ── CLAHE ─────────────────────────────────────────────────────────────────
-  if (mode === "NVG" || mode === "WHITE" || mode === "FUSION") {
-    applyCLAHE(data, sw, sh, 6, 3.5);
   }
 
-  // ── Per-pixel color transform ─────────────────────────────────────────────
-  const bri = (mode === "NVG" ? 2.8 : mode === "WHITE" ? 3.0 : 2.0) + brightness;
-  const con = mode === "NVG" ? 1.9 : mode === "WHITE" ? 2.4 : 2.1;
-  const mid = 128;
-  const lut = LUTS[lutName] || null;
-
-  // For thermal temp sampling
-  const tempSamples = [];
-
-  for (let i = 0; i < data.length; i += 4) {
-    const r = data[i], g = data[i+1], b = data[i+2];
-    const lum = 0.299*r + 0.587*g + 0.114*b;
-    const boosted = Math.max(0, Math.min(255, (lum * bri - mid) * con + mid));
-    const pIdx = i / 4;
-
-    if (mode === "NVG") {
-      data[i]   = Math.min(255, boosted * 0.06);
-      data[i+1] = Math.min(255, boosted * 1.05 + g * 0.12);
-      data[i+2] = Math.min(255, boosted * 0.05);
-      const n = (Math.random() - 0.5) * 5;
-      data[i+1] = Math.max(0, Math.min(255, data[i+1] + n));
-    } else if (mode === "THERMAL" || mode === "RAINBOW" || mode === "FUSION") {
-      const activeLut = lut || LUTS.THERMAL;
-      const li = Math.min(255, Math.round(boosted));
-      data[i]   = activeLut[li * 3];
-      data[i+1] = activeLut[li * 3 + 1];
-      data[i+2] = activeLut[li * 3 + 2];
-      // Sample center region for temp
-      const px = pIdx % sw, py = Math.floor(pIdx / sw);
-      if (px % 8 === 0 && py % 8 === 0) tempSamples.push({ lum, px, py });
-    } else if (mode === "BLUE") {
-      data[i]   = Math.min(255, boosted * 0.12);
-      data[i+1] = Math.min(255, boosted * 0.32);
-      data[i+2] = Math.min(255, boosted * 1.15 + b * 0.25);
-      const n = (Math.random() - 0.5) * 7;
-      data[i+2] = Math.max(0, Math.min(255, data[i+2] + n));
-    } else { // WHITE
-      const w = Math.min(255, boosted);
-      data[i] = data[i+1] = data[i+2] = w;
-    }
-
-    // Sobel edge overlay (bright white edges)
-    if (edgeOverlay && edges) {
-      const e = edges[pIdx];
-      if (e > 40) {
-        const ef = (e - 40) / 215;
-        const ec = mode === "NVG" ? [0, 255, 80] : mode === "BLUE" ? [0, 160, 255] : [255, 255, 200];
-        data[i]   = Math.min(255, data[i]   * (1 - ef) + ec[0] * ef);
-        data[i+1] = Math.min(255, data[i+1] * (1 - ef) + ec[1] * ef);
-        data[i+2] = Math.min(255, data[i+2] * (1 - ef) + ec[2] * ef);
-      }
-    }
-
-    // Motion highlight — bright orange-red bloom
-    if (motionMap[pIdx]) {
-      data[i]   = Math.min(255, data[i]   * 0.4 + 255 * 0.6);
-      data[i+1] = Math.min(255, data[i+1] * 0.4 + 120 * 0.6);
-      data[i+2] = Math.min(255, data[i+2] * 0.1);
-    }
-  }
-
-  rawCtx.putImageData(imageData, 0, 0);
-
-  // ── Composite to display canvas ───────────────────────────────────────────
-  const dCtx = displayCanvas.getContext("2d");
-  dCtx.drawImage(rawCanvas, 0, 0);
-
-  // Scanlines
-  dCtx.fillStyle = "rgba(0,0,0,0.04)";
-  for (let y = 0; y < sh; y += 3) dCtx.fillRect(0, y, sw, 1);
-
-  // Vignette
-  const vg = dCtx.createRadialGradient(sw/2, sh/2, sh*0.1, sw/2, sh/2, sh*0.9);
-  vg.addColorStop(0, "rgba(0,0,0,0)");
-  vg.addColorStop(0.7, "rgba(0,0,0,0)");
-  vg.addColorStop(1, "rgba(0,0,0,0.75)");
-  dCtx.fillStyle = vg;
-  dCtx.fillRect(0, 0, sw, sh);
-
-  // Compute temp stats
-  let tempData = null;
-  if (tempSamples.length > 0) {
-    let hot = -Infinity, cold = Infinity, sum = 0;
-    let hotPx = 0.5, hotPy = 0.5;
-    for (const { lum, px, py } of tempSamples) {
-      const t = 18 + (lum / 255) * 22;
-      if (t > hot) { hot = t; hotPx = px / sw * 100; hotPy = py / sh * 100; }
-      if (t < cold) cold = t;
-      sum += t;
-    }
-    tempData = { hot, cold, avg: sum / tempSamples.length, hotX: hotPx, hotY: hotPy };
-  }
-
-  // Find motion blobs
-  const blobs = motionPixels > 20 ? findBlobs(motionMap, sw, sh, 60) : [];
-  const motionFrac = motionPixels / (sw * sh);
-
-  return { motionFrac, blobs, tempData, sw, sh };
+  return{motionFrac:motionPixels/(sw*sh),blobs:enrichedBlobs,tempData,sw,sh,triggeredWires,rppgVal};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // HOOKS
 // ═══════════════════════════════════════════════════════════════════════════════
-
-function useCameraStream(facing) {
-  const [stream, setStream] = useState(null);
-  const [error, setError] = useState(null);
-  const [ready, setReady] = useState(false);
-  useEffect(() => {
-    let active = true;
-    setReady(false); setError(null);
-    navigator.mediaDevices?.getUserMedia({
-      video: { facingMode: facing, width: { ideal: 1920 }, height: { ideal: 1080 } },
-      audio: false,
-    }).then(s => {
-      if (!active) { s.getTracks().forEach(t => t.stop()); return; }
-      setStream(s); setReady(true);
-    }).catch(e => { if (active) setError(e.message || "Camera unavailable"); });
-    return () => { active = false; };
-  }, [facing]);
-  useEffect(() => () => stream?.getTracks().forEach(t => t.stop()), [stream]);
-  return { stream, error, ready };
-}
-
-function useClock() {
-  const [t, setT] = useState(new Date());
-  useEffect(() => { const id = setInterval(() => setT(new Date()), 1000); return () => clearInterval(id); }, []);
+function useClock(){
+  const[t,setT]=useState(new Date());
+  useEffect(()=>{const id=setInterval(()=>setT(new Date()),1000);return()=>clearInterval(id);},[]);
   return t;
 }
-
-function useDeviceOrientation() {
-  const [heading, setHeading] = useState(null);
-  useEffect(() => {
-    const handler = e => { if (e.alpha !== null) setHeading(Math.round(e.alpha)); };
-    window.addEventListener("deviceorientationabsolute", handler, true);
-    window.addEventListener("deviceorientation", handler, true);
-    return () => {
-      window.removeEventListener("deviceorientationabsolute", handler, true);
-      window.removeEventListener("deviceorientation", handler, true);
+function useDeviceOrientation(){
+  const[h,setH]=useState(null);
+  useEffect(()=>{
+    const fn=e=>{if(e.alpha!==null)setH(Math.round(e.alpha));};
+    window.addEventListener("deviceorientationabsolute",fn,true);
+    window.addEventListener("deviceorientation",fn,true);
+    return()=>{window.removeEventListener("deviceorientationabsolute",fn,true);window.removeEventListener("deviceorientation",fn,true);};
+  },[]);
+  return h;
+}
+function useGPS(){
+  const[pos,setPos]=useState(null);
+  useEffect(()=>{
+    if(!navigator.geolocation)return;
+    const id=navigator.geolocation.watchPosition(
+      p=>setPos({lat:p.coords.latitude,lon:p.coords.longitude,acc:p.coords.accuracy}),
+      ()=>{},
+      {enableHighAccuracy:true,maximumAge:5000}
+    );
+    return()=>navigator.geolocation.clearWatch(id);
+  },[]);
+  return pos;
+}
+function useMicrophone(enabled){
+  const[level,setLevel]=useState(0);
+  const[spike,setSpike]=useState(false);
+  const ctxRef=useRef(null);
+  const analyserRef=useRef(null);
+  const rafRef=useRef(null);
+  const baselineRef=useRef(50);
+  useEffect(()=>{
+    if(!enabled){setLevel(0);setSpike(false);return;}
+    let active=true;
+    navigator.mediaDevices?.getUserMedia({audio:true,video:false}).then(stream=>{
+      if(!active)return;
+      const ctx=new(window.AudioContext||window.webkitAudioContext)();
+      const analyser=ctx.createAnalyser();
+      analyser.fftSize=256;
+      const src=ctx.createMediaStreamSource(stream);
+      src.connect(analyser);
+      ctxRef.current=ctx;analyserRef.current=analyser;
+      const buf=new Uint8Array(analyser.frequencyBinCount);
+      const tick=()=>{
+        if(!active)return;
+        analyser.getByteFrequencyData(buf);
+        const avg=buf.reduce((s,v)=>s+v,0)/buf.length;
+        setLevel(Math.round(avg));
+        baselineRef.current=baselineRef.current*0.98+avg*0.02;
+        setSpike(avg>baselineRef.current*2.2&&avg>35);
+        rafRef.current=requestAnimationFrame(tick);
+      };
+      rafRef.current=requestAnimationFrame(tick);
+    }).catch(()=>{});
+    return()=>{
+      active=false;
+      cancelAnimationFrame(rafRef.current);
+      ctxRef.current?.close();
     };
-  }, []);
-  return heading;
+  },[enabled]);
+  return{level,spike};
+}
+function useRPPG(samples){
+  const[hr,setHr]=useState(null);
+  const bufRef=useRef([]);
+  useEffect(()=>{
+    if(!samples)return;
+    const buf=bufRef.current;
+    buf.push({v:samples,t:Date.now()});
+    if(buf.length>180)buf.shift();
+    if(buf.length<60)return;
+    // Peak detection on green channel signal
+    const vals=buf.map(b=>b.v);
+    const mean=vals.reduce((s,v)=>s+v,0)/vals.length;
+    const norm=vals.map(v=>v-mean);
+    let peaks=0;
+    for(let i=1;i<norm.length-1;i++){
+      if(norm[i]>norm[i-1]&&norm[i]>norm[i+1]&&norm[i]>2)peaks++;
+    }
+    const seconds=(buf[buf.length-1].t-buf[0].t)/1000;
+    if(seconds>2){const bpm=Math.round((peaks/seconds)*60);if(bpm>40&&bpm<180)setHr(bpm);}
+  },[samples]);
+  return hr;
+}
+function useCameraStream(constraints,enabled=true){
+  const[stream,setStream]=useState(null);
+  const[error,setError]=useState(null);
+  const[ready,setReady]=useState(false);
+  const key=JSON.stringify(constraints)+String(enabled);
+  useEffect(()=>{
+    if(!enabled){setStream(s=>{s?.getTracks().forEach(t=>t.stop());return null;});setReady(false);return;}
+    let active=true;setReady(false);setError(null);
+    navigator.mediaDevices?.getUserMedia({video:{...constraints,width:{ideal:1920},height:{ideal:1080}},audio:false})
+      .then(s=>{if(!active){s.getTracks().forEach(t=>t.stop());return;}setStream(s);setReady(true);})
+      .catch(e=>{if(active)setError(e.message||"Camera unavailable");});
+    return()=>{active=false;};
+  // eslint-disable-next-line
+  },[key]);
+  useEffect(()=>()=>stream?.getTracks().forEach(t=>t.stop()),[stream]);
+  return{stream,error,ready};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// HUD COMPONENTS
+// MULTI-DEVICE SYNC (WebRTC signaling via BroadcastChannel + PeerJS-less peer)
+// Uses localStorage as simple signaling bus for same-device tabs
 // ═══════════════════════════════════════════════════════════════════════════════
-
-function Corners({ color, size = 20, thickness = 2 }) {
-  const s = { position: "absolute", width: size, height: size, opacity: 0.8 };
-  return (
-    <>
-      <div style={{ ...s, top: 10, left: 10, borderTop: `${thickness}px solid ${color}`, borderLeft: `${thickness}px solid ${color}` }} />
-      <div style={{ ...s, top: 10, right: 10, borderTop: `${thickness}px solid ${color}`, borderRight: `${thickness}px solid ${color}` }} />
-      <div style={{ ...s, bottom: 10, left: 10, borderBottom: `${thickness}px solid ${color}`, borderLeft: `${thickness}px solid ${color}` }} />
-      <div style={{ ...s, bottom: 10, right: 10, borderBottom: `${thickness}px solid ${color}`, borderRight: `${thickness}px solid ${color}` }} />
-    </>
-  );
+function useMultiSync(enabled,myId){
+  const[peers,setPeers]=useState([]);
+  const[alerts,setAlerts]=useState([]);
+  const chRef=useRef(null);
+  useEffect(()=>{
+    if(!enabled||typeof BroadcastChannel==="undefined")return;
+    const ch=new BroadcastChannel("nvs7_sync");
+    chRef.current=ch;
+    ch.onmessage=e=>{
+      const{type,from,payload}=e.data;
+      if(from===myId)return;
+      if(type==="HEARTBEAT")setPeers(p=>{const exists=p.find(x=>x.id===from);if(exists)return p.map(x=>x.id===from?{...x,ts:Date.now()}:x);return[...p,{id:from,ts:Date.now(),label:payload?.label||from}];});
+      if(type==="MOTION_ALERT")setAlerts(a=>[{from,payload,ts:Date.now()},...a].slice(0,20));
+    };
+    const beat=setInterval(()=>ch.postMessage({type:"HEARTBEAT",from:myId,payload:{label:`NVS-${myId.slice(-4)}`}})
+    ,3000);
+    const prune=setInterval(()=>setPeers(p=>p.filter(x=>Date.now()-x.ts<10000)),5000);
+    return()=>{ch.close();clearInterval(beat);clearInterval(prune);};
+  },[enabled,myId]);
+  const broadcast=useCallback((type,payload)=>{
+    chRef.current?.postMessage({type,from:myId,payload});
+  },[myId]);
+  return{peers,alerts,broadcast};
 }
 
-function Reticle({ color }) {
-  return (
-    <svg width={64} height={64} viewBox="0 0 64 64" style={{
-      position: "absolute", top: "50%", left: "50%",
-      transform: "translate(-50%,-50%)", pointerEvents: "none", zIndex: 15,
-    }}>
-      <circle cx={32} cy={32} r={20} fill="none" stroke={color} strokeWidth={0.8} opacity={0.45} />
-      <circle cx={32} cy={32} r={8} fill="none" stroke={color} strokeWidth={0.5} strokeDasharray="2 3" opacity={0.4} />
-      <circle cx={32} cy={32} r={1.8} fill={color} opacity={0.9} />
-      {[[32,4,32,16],[32,48,32,60],[4,32,16,32],[48,32,60,32]].map(([x1,y1,x2,y2],i) =>
-        <line key={i} x1={x1} y1={y1} x2={x2} y2={y2} stroke={color} strokeWidth={1} opacity={0.5}/>
-      )}
-      <circle cx={32} cy={32} r={30} fill="none" stroke={color} strokeWidth={0.4} strokeDasharray="3 8" opacity={0.2} />
-    </svg>
-  );
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIMELINE STORE
+// ═══════════════════════════════════════════════════════════════════════════════
+function useTimeline(){
+  const[events,setEvents]=useState([]);
+  const add=useCallback((type,data)=>setEvents(e=>[{id:Date.now(),type,data,ts:Date.now()},...e].slice(0,200)),[]);
+  return{events,add};
 }
 
-// Multi-target blob boxes with ID + threat classification
-function TargetBoxes({ blobs, cw, ch, color }) {
-  if (!blobs || !blobs.length) return null;
-  const THREAT = ["CRITICAL", "HIGH", "MED", "LOW", "TRACE", "TRACK"];
-  const TCOL   = ["#ff2222", "#ff5500", "#ffaa00", "#ffdd00", "#aaffaa", color];
-  return (
-    <div style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 22 }}>
-      {blobs.map((b, i) => {
-        const x = (b.x / cw) * 100, y = (b.y / ch) * 100;
-        const w = (b.w / cw) * 100, h = (b.h / ch) * 100;
-        const pad = 1.5;
-        const tc = TCOL[Math.min(i, TCOL.length-1)];
-        const thr = THREAT[Math.min(i, THREAT.length-1)];
-        return (
-          <div key={i} style={{ position: "absolute", left: `${x - pad}%`, top: `${y - pad}%`,
-            width: `${w + pad*2}%`, height: `${h + pad*2}%`, border: `1px solid ${tc}`,
-            boxShadow: `0 0 8px ${tc}40`, boxSizing: "border-box" }}>
-            {/* Corners */}
-            {[[-1,-1],[1,-1],[1,1],[-1,1]].map(([sx,sy],ci) => (
-              <div key={ci} style={{
-                position:"absolute", width:8, height:8,
-                top: sy < 0 ? -1 : "auto", bottom: sy > 0 ? -1 : "auto",
-                left: sx < 0 ? -1 : "auto", right: sx > 0 ? -1 : "auto",
-                borderTop:    sy<0?`2px solid ${tc}`:"none",
-                borderBottom: sy>0?`2px solid ${tc}`:"none",
-                borderLeft:   sx<0?`2px solid ${tc}`:"none",
-                borderRight:  sx>0?`2px solid ${tc}`:"none",
-              }}/>
-            ))}
-            {/* Label */}
-            <div style={{
-              position:"absolute", top:-14, left:0,
-              display:"flex", gap:4, alignItems:"center",
-            }}>
-              <span style={{ fontFamily:"'DM Mono',monospace", fontSize:7, color:tc,
-                letterSpacing:1, background:"rgba(0,0,0,0.7)", padding:"1px 3px", borderRadius:1 }}>
-                TGT-{String(i+1).padStart(2,"0")}
-              </span>
-              <span style={{ fontFamily:"'DM Mono',monospace", fontSize:6, color:tc, opacity:0.8,
-                background:"rgba(0,0,0,0.5)", padding:"1px 3px", borderRadius:1, letterSpacing:1 }}>
-                {thr}
-              </span>
-            </div>
-            {/* Size indicator */}
-            <div style={{
-              position:"absolute", bottom:-13, right:0,
-              fontFamily:"'DM Mono',monospace", fontSize:6,
-              color:`${tc}90`, letterSpacing:1,
-              background:"rgba(0,0,0,0.5)", padding:"1px 3px", borderRadius:1,
-            }}>{b.size}px</div>
-            {/* Center pip */}
-            <div style={{
-              position:"absolute", top:"50%", left:"50%",
-              width:4, height:4, borderRadius:"50%",
-              transform:"translate(-50%,-50%)",
-              background:tc, boxShadow:`0 0 6px ${tc}`,
-              animation:"tgt-pulse 1.2s ease-in-out infinite",
-            }}/>
-          </div>
-        );
-      })}
+// ═══════════════════════════════════════════════════════════════════════════════
+// GPS MAP MODAL
+// ═══════════════════════════════════════════════════════════════════════════════
+function GPSMap({pos,events,color,onClose}){
+  const canvasRef=useRef(null);
+  const[pins,setPins]=useState([]);
+  useEffect(()=>{
+    const motEvents=events.filter(e=>e.type==="motion"&&e.data?.lat).slice(0,50);
+    setPins(motEvents.map(e=>({lat:e.data.lat,lon:e.data.lon,ts:e.ts,label:e.data.label||"MOT"})));
+  },[events]);
+
+  useEffect(()=>{
+    const c=canvasRef.current;if(!c)return;
+    const ctx=c.getContext("2d");
+    const w=c.width=c.offsetWidth||300,h=c.height=c.offsetHeight||300;
+    ctx.fillStyle="#050a05";ctx.fillRect(0,0,w,h);
+    // Grid
+    ctx.strokeStyle="rgba(0,255,80,0.08)";ctx.lineWidth=1;
+    for(let x=0;x<w;x+=30){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke();}
+    for(let y=0;y<h;y+=30){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
+    if(!pos){
+      ctx.fillStyle=color;ctx.font="10px DM Mono, monospace";
+      ctx.textAlign="center";ctx.fillText("GPS ACQUIRING...",w/2,h/2);
+      return;
+    }
+    // Center = current pos
+    const toXY=(lat,lon)=>{
+      const scale=2000;
+      const x=w/2+(lon-pos.lon)*scale;
+      const y=h/2-(lat-pos.lat)*scale;
+      return{x,y};
+    };
+    // Compass ring
+    ctx.beginPath();ctx.arc(w/2,h/2,60,0,Math.PI*2);
+    ctx.strokeStyle="rgba(0,255,80,0.15)";ctx.lineWidth=1;ctx.stroke();
+    ctx.beginPath();ctx.arc(w/2,h/2,120,0,Math.PI*2);
+    ctx.strokeStyle="rgba(0,255,80,0.08)";ctx.stroke();
+    // My position
+    ctx.beginPath();ctx.arc(w/2,h/2,6,0,Math.PI*2);
+    ctx.fillStyle=color;ctx.fill();
+    ctx.beginPath();ctx.arc(w/2,h/2,12,0,Math.PI*2);
+    ctx.strokeStyle=`${color}80`;ctx.lineWidth=1.5;ctx.stroke();
+    // Accuracy ring
+    if(pos.acc){
+      const r=Math.min(100,pos.acc/2);
+      ctx.beginPath();ctx.arc(w/2,h/2,r,0,Math.PI*2);
+      ctx.strokeStyle="rgba(0,255,80,0.2)";ctx.lineWidth=1;ctx.setLineDash([3,4]);ctx.stroke();ctx.setLineDash([]);
+    }
+    // Pins
+    for(const pin of pins){
+      const{x,y}=toXY(pin.lat,pin.lon);
+      if(x<0||x>w||y<0||y>h)continue;
+      ctx.beginPath();ctx.arc(x,y,4,0,Math.PI*2);
+      ctx.fillStyle="#ff5500";ctx.fill();
+      ctx.fillStyle="rgba(255,85,0,0.8)";ctx.font="7px DM Mono, monospace";
+      ctx.fillText(pin.label,x+6,y-2);
+    }
+    // Coords
+    ctx.fillStyle="rgba(0,255,80,0.6)";ctx.font="8px DM Mono, monospace";
+    ctx.textAlign="left";
+    ctx.fillText(`${pos.lat.toFixed(5)}°N`,8,h-20);
+    ctx.fillText(`${pos.lon.toFixed(5)}°W`,8,h-10);
+    ctx.textAlign="center";
+    ctx.fillStyle="rgba(0,255,80,0.4)";ctx.font="7px DM Mono, monospace";
+    ctx.fillText("N",w/2,h/2-65);ctx.fillText("S",w/2,h/2+72);
+    ctx.fillText("W",w/2-67,h/2+3);ctx.fillText("E",w/2+67,h/2+3);
+  },[pos,pins,color]);
+
+  return(
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.97)",zIndex:200,
+      display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+        padding:"10px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0}}>
+        <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>
+          GPS TACTICAL MAP
+        </span>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          {pos&&<span style={{fontSize:8,color:`${color}70`,fontFamily:"'DM Mono',monospace",letterSpacing:1}}>
+            ACC ±{pos.acc?.toFixed(0)}m
+          </span>}
+          <button onClick={onClose} style={{padding:"4px 10px",background:"transparent",
+            border:`1px solid ${color}30`,borderRadius:2,color:`${color}70`,
+            fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:2,cursor:"pointer"}}>
+            CLOSE
+          </button>
+        </div>
+      </div>
+      <canvas ref={canvasRef} style={{flex:1,width:"100%"}}/>
+      <div style={{padding:"6px 14px",borderTop:`1px solid ${color}10`,
+        fontFamily:"'DM Mono',monospace",fontSize:7,color:`${color}40`,letterSpacing:1}}>
+        ORANGE PINS = MOTION EVENTS • {pins.length} LOGGED
+      </div>
     </div>
   );
 }
 
-function ThermalOverlay({ tempData, mode }) {
-  if (!tempData || (mode !== "THERMAL" && mode !== "RAINBOW" && mode !== "FUSION")) return null;
-  const { hot, cold, avg, hotX, hotY } = tempData;
-  const gradMap = {
-    THERMAL: "linear-gradient(90deg,#000080,#800080,#ff0000,#ff8800,#ffff00,#fff)",
-    RAINBOW: "linear-gradient(90deg,#0000ff,#00ffff,#00ff00,#ffff00,#ff0000)",
-    FUSION:  "linear-gradient(90deg,#1400ff,#8800ff,#ff4400,#ff8800,#ffe0c0)",
-  };
-  return (
-    <div style={{ position:"absolute", inset:0, pointerEvents:"none", zIndex:24 }}>
-      {/* Hot spot */}
-      <div style={{
-        position:"absolute", left:`${hotX}%`, top:`${hotY}%`,
-        transform:"translate(-50%,-50%)", zIndex:25,
-        display:"flex", flexDirection:"column", alignItems:"center", gap:2,
-        animation:"tgt-pulse 1s ease-in-out infinite",
-      }}>
-        <div style={{ width:12, height:12, borderRadius:"50%",
-          border:"2px solid #fff", boxShadow:"0 0 16px #ff5500, 0 0 6px #fff" }}/>
-        <span style={{ fontFamily:"'DM Mono',monospace", fontSize:8, color:"#fff",
-          background:"rgba(0,0,0,0.75)", padding:"1px 4px", borderRadius:2,
-          letterSpacing:1, whiteSpace:"nowrap" }}>{hot.toFixed(1)}°C ▲</span>
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIMELINE MODAL
+// ═══════════════════════════════════════════════════════════════════════════════
+function TimelineModal({events,captures,color,onClose}){
+  const[selected,setSelected]=useState(null);
+  const allEvents=useMemo(()=>[
+    ...events.map(e=>({...e,kind:"event"})),
+    ...captures.map(c=>({id:c.ts,ts:c.ts,type:"capture",data:c,kind:"capture"})),
+  ].sort((a,b)=>b.ts-a.ts),[events,captures]);
+
+  const typeColor={motion:"#ff5500",capture:"#00ff50",audio:"#00ccff",tripwire:"#ffcc00",peer:"#cc44ff"};
+  const typeIcon={motion:"🎯",capture:"📷",audio:"🔊",tripwire:"⚠️",peer:"📡"};
+
+  return(
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.97)",zIndex:200,
+      display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+        padding:"10px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0}}>
+        <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>
+          TIMELINE — {allEvents.length} EVENTS
+        </span>
+        <button onClick={onClose} style={{padding:"4px 10px",background:"transparent",
+          border:`1px solid ${color}30`,borderRadius:2,color:`${color}70`,
+          fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:2,cursor:"pointer"}}>
+          CLOSE
+        </button>
       </div>
-      {/* Legend bar */}
-      <div style={{ position:"absolute", bottom:14, left:"50%", transform:"translateX(-50%)",
-        display:"flex", flexDirection:"column", alignItems:"center", gap:2 }}>
-        <div style={{ width:100, height:7, borderRadius:3, border:"1px solid rgba(255,255,255,0.15)",
-          background: gradMap[mode] || gradMap.THERMAL }}/>
-        <div style={{ display:"flex", justifyContent:"space-between", width:100 }}>
-          <span style={{ fontSize:7, color:"rgba(255,255,255,0.55)", fontFamily:"'DM Mono',monospace" }}>{cold.toFixed(0)}°C</span>
-          <span style={{ fontSize:7, color:"rgba(255,255,255,0.7)", fontFamily:"'DM Mono',monospace" }}>~{avg.toFixed(1)}°</span>
-          <span style={{ fontSize:7, color:"#ff8800", fontFamily:"'DM Mono',monospace" }}>{hot.toFixed(0)}°C</span>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",flex:1,overflow:"hidden"}}>
+        {/* Event list */}
+        <div style={{overflowY:"auto",borderRight:`1px solid ${color}10`,padding:8}}>
+          {allEvents.length===0&&(
+            <div style={{textAlign:"center",padding:30,fontFamily:"'DM Mono',monospace",
+              fontSize:8,color:`${color}35`,letterSpacing:1}}>NO EVENTS YET</div>
+          )}
+          {allEvents.map(ev=>{
+            const tc=typeColor[ev.type]||color;
+            const ti=typeIcon[ev.type]||"●";
+            const t=new Date(ev.ts).toLocaleTimeString("en-US",{hour12:false});
+            return(
+              <div key={ev.id} onClick={()=>setSelected(ev)}
+                style={{display:"flex",gap:6,padding:"5px 6px",marginBottom:3,
+                  background:selected?.id===ev.id?`${tc}12`:"transparent",
+                  border:`1px solid ${selected?.id===ev.id?tc:`${tc}15`}`,
+                  borderRadius:2,cursor:"pointer"}}>
+                <span style={{fontSize:11,flexShrink:0}}>{ti}</span>
+                <div style={{display:"flex",flexDirection:"column",gap:1,flex:1,minWidth:0}}>
+                  <span style={{fontSize:7,color:tc,letterSpacing:1,fontFamily:"'DM Mono',monospace"}}>
+                    {ev.type.toUpperCase()}{ev.data?.label?` — ${ev.data.label}`:""}
+                  </span>
+                  <span style={{fontSize:6,color:`${tc}60`,fontFamily:"'DM Mono',monospace"}}>{t}</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        {/* Detail pane */}
+        <div style={{overflowY:"auto",padding:10}}>
+          {!selected&&(
+            <div style={{textAlign:"center",padding:30,fontFamily:"'DM Mono',monospace",
+              fontSize:8,color:`${color}30`,letterSpacing:1}}>SELECT EVENT</div>
+          )}
+          {selected&&(
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+              {selected.kind==="capture"&&selected.data?.url&&(
+                <img src={selected.data.url} style={{width:"100%",borderRadius:2,
+                  border:`1px solid ${color}20`}} alt="event"/>
+              )}
+              <div style={{fontFamily:"'DM Mono',monospace",fontSize:7,color:`${color}80`,letterSpacing:1}}>
+                {Object.entries(selected.data||{}).filter(([k])=>k!=="url"&&k!=="icon").map(([k,v])=>(
+                  <div key={k} style={{display:"flex",justifyContent:"space-between",
+                    padding:"2px 0",borderBottom:`1px solid ${color}08`}}>
+                    <span style={{color:`${color}50`}}>{k.toUpperCase()}</span>
+                    <span style={{color:`${color}90`,maxWidth:"60%",textAlign:"right",
+                      overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                      {String(v).slice(0,40)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              {selected.kind==="capture"&&selected.data?.url&&(
+                <a href={selected.data.url} download={`nvs7-${selected.ts}.png`}
+                  style={{textAlign:"center",padding:"5px",background:`${color}08`,
+                    border:`1px solid ${color}25`,borderRadius:2,color,
+                    fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:2,textDecoration:"none"}}>
+                  ↓ SAVE IMAGE
+                </a>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>
   );
 }
 
-function CompassHUD({ heading, color }) {
-  const dirs = ["N","NE","E","SE","S","SW","W","NW"];
-  const dir = heading !== null ? dirs[Math.round(heading / 45) % 8] : "---";
-  return (
-    <div style={{ position:"absolute", top:14, left:"50%", transform:"translateX(-50%)",
-      zIndex:20, display:"flex", flexDirection:"column", alignItems:"center", gap:1 }}>
-      <div style={{ fontFamily:"'DM Mono',monospace", fontSize:8, color, letterSpacing:2 }}>
-        {heading !== null ? `${String(heading).padStart(3,"0")}°` : "---"}
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRIPWIRE EDITOR
+// ═══════════════════════════════════════════════════════════════════════════════
+function TripwireEditor({tripwires,onUpdate,color,onClose}){
+  const[drawing,setDrawing]=useState(false);
+  const[current,setCurrent]=useState([]);
+  const svgRef=useRef(null);
+  const handleSVGClick=e=>{
+    if(!drawing)return;
+    const rect=svgRef.current.getBoundingClientRect();
+    const x=((e.clientX-rect.left)/rect.width)*100;
+    const y=((e.clientY-rect.top)/rect.height)*100;
+    setCurrent(p=>[...p,{x,y}]);
+  };
+  const finishWire=()=>{
+    if(current.length<2){setDrawing(false);setCurrent([]);return;}
+    const id=Date.now().toString();
+    onUpdate([...tripwires,{id,label:`ZONE-${tripwires.length+1}`,points:current,triggered:false}]);
+    setDrawing(false);setCurrent([]);
+  };
+  return(
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.97)",zIndex:200,
+      display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+        padding:"10px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0}}>
+        <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>
+          TRIPWIRE EDITOR
+        </span>
+        <div style={{display:"flex",gap:6}}>
+          {!drawing?(
+            <button onClick={()=>setDrawing(true)} style={{padding:"4px 10px",background:`${color}10`,
+              border:`1px solid ${color}`,borderRadius:2,color,
+              fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:1,cursor:"pointer"}}>
+              + DRAW
+            </button>
+          ):(
+            <button onClick={finishWire} style={{padding:"4px 10px",background:"rgba(0,255,80,0.15)",
+              border:"1px solid #00ff50",borderRadius:2,color:"#00ff50",
+              fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:1,cursor:"pointer"}}>
+              ✓ DONE ({current.length}pts)
+            </button>
+          )}
+          {tripwires.length>0&&(
+            <button onClick={()=>onUpdate([])} style={{padding:"4px 10px",background:"transparent",
+              border:"1px solid rgba(255,50,50,0.4)",borderRadius:2,color:"rgba(255,50,50,0.7)",
+              fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:1,cursor:"pointer"}}>
+              CLR ALL
+            </button>
+          )}
+          <button onClick={onClose} style={{padding:"4px 10px",background:"transparent",
+            border:`1px solid ${color}30`,borderRadius:2,color:`${color}70`,
+            fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:2,cursor:"pointer"}}>
+            CLOSE
+          </button>
+        </div>
       </div>
-      <div style={{ fontFamily:"'DM Mono',monospace", fontSize:7, color:`${color}70`, letterSpacing:1 }}>{dir}</div>
+      <div style={{flex:1,position:"relative",background:"#0a0f0a"}}>
+        <svg ref={svgRef} onClick={handleSVGClick}
+          style={{width:"100%",height:"100%",cursor:drawing?"crosshair":"default"}}>
+          {/* Grid */}
+          <defs>
+            <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+              <path d="M 40 0 L 0 0 0 40" fill="none" stroke="rgba(0,255,80,0.06)" strokeWidth="1"/>
+            </pattern>
+          </defs>
+          <rect width="100%" height="100%" fill="url(#grid)"/>
+          {/* Existing wires */}
+          {tripwires.map(tw=>(
+            <g key={tw.id}>
+              {tw.points.length>1&&(
+                <polyline
+                  points={tw.points.map(p=>`${p.x}%,${p.y}%`).join(" ")}
+                  fill="none" stroke={tw.triggered?"#ff2222":"#ffcc00"} strokeWidth="2"
+                  strokeDasharray="6,4"/>
+              )}
+              {tw.points.map((p,i)=>(
+                <circle key={i} cx={`${p.x}%`} cy={`${p.y}%`} r="4"
+                  fill={tw.triggered?"#ff2222":"#ffcc00"} opacity="0.8"/>
+              ))}
+              {tw.points.length>0&&(
+                <text x={`${tw.points[0].x}%`} y={`${tw.points[0].y - 2}%`}
+                  fill="#ffcc00" fontSize="9" fontFamily="DM Mono, monospace">{tw.label}</text>
+              )}
+            </g>
+          ))}
+          {/* Current drawing */}
+          {current.length>1&&(
+            <polyline points={current.map(p=>`${p.x}%,${p.y}%`).join(" ")}
+              fill="none" stroke={`${color}90`} strokeWidth="2" strokeDasharray="4,3"/>
+          )}
+          {current.map((p,i)=>(
+            <circle key={i} cx={`${p.x}%`} cy={`${p.y}%`} r="4" fill={color} opacity="0.9"/>
+          ))}
+        </svg>
+        {drawing&&(
+          <div style={{position:"absolute",bottom:14,left:"50%",transform:"translateX(-50%)",
+            fontFamily:"'DM Mono',monospace",fontSize:8,color:`${color}80`,letterSpacing:2,
+            background:"rgba(0,0,0,0.7)",padding:"4px 10px",borderRadius:2}}>
+            TAP TO ADD POINTS → TAP ✓ DONE WHEN FINISHED
+          </div>
+        )}
+      </div>
+      <div style={{padding:"8px 14px",borderTop:`1px solid ${color}10`,
+        display:"flex",gap:6,overflowX:"auto"}}>
+        {tripwires.map(tw=>(
+          <div key={tw.id} style={{display:"flex",alignItems:"center",gap:4,flexShrink:0,
+            padding:"3px 8px",border:`1px solid ${tw.triggered?"#ff2222":"#ffcc0040"}`,
+            borderRadius:2,background:tw.triggered?"rgba(255,34,34,0.1)":"transparent"}}>
+            <span style={{fontSize:7,fontFamily:"'DM Mono',monospace",
+              color:tw.triggered?"#ff2222":"#ffcc00",letterSpacing:1}}>{tw.label}</span>
+            <button onClick={()=>onUpdate(tripwires.filter(t=>t.id!==tw.id))}
+              style={{background:"transparent",border:"none",color:"rgba(255,50,50,0.6)",
+                fontSize:9,cursor:"pointer",lineHeight:1,padding:0}}>×</button>
+          </div>
+        ))}
+        {!tripwires.length&&<span style={{fontSize:7,color:`${color}30`,fontFamily:"'DM Mono',monospace",letterSpacing:1}}>
+          NO TRIPWIRES — TAP + DRAW
+        </span>}
+      </div>
     </div>
   );
 }
 
-function SignalBars({ level = 0.7, color }) {
-  return (
-    <div style={{ display:"flex", gap:1, alignItems:"flex-end", height:12 }}>
-      {[0.2,0.4,0.6,0.8,1.0].map((t,i) => (
-        <div key={i} style={{
-          width:3, height:3 + i * 2, borderRadius:0.5,
-          background: level >= t ? color : `${color}20`,
-        }}/>
+// ═══════════════════════════════════════════════════════════════════════════════
+// BIOMETRIC HUD
+// ═══════════════════════════════════════════════════════════════════════════════
+function BiometricHUD({hr,audioLevel,audioSpike,color}){
+  const hrColor=!hr?"#444":hr<60?"#0088ff":hr<100?"#00ff50":hr<140?"#ffaa00":"#ff3333";
+  const hrLabel=!hr?"--":hr<60?"BRADYCARDIA":hr<100?"NORMAL":hr<140?"ELEVATED":"TACHYCARDIA";
+  return(
+    <div style={{
+      position:"absolute",bottom:50,left:"50%",transform:"translateX(-50%)",
+      zIndex:26,display:"flex",gap:10,alignItems:"flex-end",
+    }}>
+      {/* HR */}
+      <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:1,
+        padding:"4px 8px",background:"rgba(0,0,0,0.75)",border:`1px solid ${hrColor}30`,
+        borderRadius:3}}>
+        <span style={{fontSize:6,color:`${hrColor}80`,letterSpacing:1,fontFamily:"'DM Mono',monospace"}}>rPPG HR</span>
+        <span style={{fontSize:16,color:hrColor,fontFamily:"'DM Mono',monospace",fontWeight:700,lineHeight:1,
+          textShadow:`0 0 8px ${hrColor}60`}}>
+          {hr||"--"}
+        </span>
+        <span style={{fontSize:5,color:`${hrColor}70`,letterSpacing:1,fontFamily:"'DM Mono',monospace"}}>{hrLabel}</span>
+      </div>
+      {/* Audio */}
+      <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:2,
+        padding:"4px 8px",background:"rgba(0,0,0,0.75)",
+        border:`1px solid ${audioSpike?"#ff2222":"rgba(0,204,255,0.2)"}`,
+        borderRadius:3,animation:audioSpike?"rec-blink 0.3s step-end infinite":"none"}}>
+        <span style={{fontSize:6,color:"rgba(0,204,255,0.7)",letterSpacing:1,fontFamily:"'DM Mono',monospace"}}>
+          {audioSpike?"⚡ SPIKE":"AUDIO"}
+        </span>
+        <div style={{display:"flex",gap:1,alignItems:"flex-end",height:14}}>
+          {Array.from({length:8},(_,i)=>(
+            <div key={i} style={{
+              width:3,height:2+i*1.5,borderRadius:.5,
+              background:(audioLevel/255)*8>i?(audioSpike?"#ff2222":"#00ccff"):"rgba(0,204,255,0.15)",
+            }}/>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMMON HUD COMPONENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+function Corners({color}){
+  const s={position:"absolute",width:20,height:20,opacity:.8};
+  return(<>
+    <div style={{...s,top:10,left:10,borderTop:`2px solid ${color}`,borderLeft:`2px solid ${color}`}}/>
+    <div style={{...s,top:10,right:10,borderTop:`2px solid ${color}`,borderRight:`2px solid ${color}`}}/>
+    <div style={{...s,bottom:10,left:10,borderBottom:`2px solid ${color}`,borderLeft:`2px solid ${color}`}}/>
+    <div style={{...s,bottom:10,right:10,borderBottom:`2px solid ${color}`,borderRight:`2px solid ${color}`}}/>
+  </>);
+}
+function Reticle({color}){
+  return(
+    <svg width={64} height={64} viewBox="0 0 64 64" style={{position:"absolute",top:"50%",left:"50%",transform:"translate(-50%,-50%)",pointerEvents:"none",zIndex:15}}>
+      <circle cx={32} cy={32} r={20} fill="none" stroke={color} strokeWidth={.8} opacity={.45}/>
+      <circle cx={32} cy={32} r={8} fill="none" stroke={color} strokeWidth={.5} strokeDasharray="2 3" opacity={.4}/>
+      <circle cx={32} cy={32} r={1.8} fill={color} opacity={.9}/>
+      {[[32,4,32,16],[32,48,32,60],[4,32,16,32],[48,32,60,32]].map(([x1,y1,x2,y2],i)=>
+        <line key={i} x1={x1} y1={y1} x2={x2} y2={y2} stroke={color} strokeWidth={1} opacity={.5}/>
+      )}
+    </svg>
+  );
+}
+function SignalBars({level=.8,color}){
+  return(
+    <div style={{display:"flex",gap:1,alignItems:"flex-end",height:12}}>
+      {[.2,.4,.6,.8,1].map((t,i)=>(
+        <div key={i} style={{width:3,height:3+i*2,borderRadius:.5,background:level>=t?color:`${color}20`}}/>
       ))}
     </div>
   );
 }
 
-function MotionAlert({ level, color }) {
-  if (level < 0.004) return null;
-  const high = level > 0.025;
-  return (
-    <div style={{
-      position:"absolute", top:14, left:"50%", transform:"translateX(-50%)",
-      zIndex:30, display:"flex", alignItems:"center", gap:5,
-      padding:"3px 8px",
-      background: high ? "rgba(255,30,30,0.18)" : "rgba(255,165,0,0.12)",
-      border:`1px solid ${high?"#ff2222":"#ffaa00"}`,
-      borderRadius:2,
-      animation: high ? "rec-blink 0.4s step-end infinite" : "none",
-    }}>
-      <div style={{ width:5, height:5, borderRadius:"50%",
-        background: high ? "#ff2222" : "#ffaa00",
-        boxShadow:`0 0 8px ${high?"#ff2222":"#ffaa00"}` }}/>
-      <span style={{ fontFamily:"'DM Mono',monospace", fontSize:8, letterSpacing:2,
-        color: high?"#ff2222":"#ffaa00" }}>
-        {high ? "⚠ MOTION ALERT" : "● MOTION"}
-      </span>
-      <span style={{ fontFamily:"'DM Mono',monospace", fontSize:7,
-        color:`${high?"#ff2222":"#ffaa00"}80` }}>
-        {(level * 100).toFixed(1)}%
-      </span>
+// AI Object boxes
+const THREAT_L=["CRITICAL","HIGH","MED","LOW","TRACE","TRACK","--","--"];
+const THREAT_C=["#ff2222","#ff5500","#ffaa00","#ffdd00","#aaffaa","#00ffcc","#00ccff","#aaaaaa"];
+function TargetBoxes({blobs,cw,ch,color,autoCapPending}){
+  if(!blobs||!blobs.length)return null;
+  return(
+    <div style={{position:"absolute",inset:0,pointerEvents:"none",zIndex:22}}>
+      {blobs.map((b,i)=>{
+        const x=(b.x/cw)*100,y=(b.y/ch)*100,bw=(b.w/cw)*100,bh=(b.h/ch)*100,pad=1.2;
+        const tc=THREAT_C[Math.min(i,7)],thr=THREAT_L[Math.min(i,7)];
+        const isMain=i===0;
+        return(
+          <div key={i} style={{position:"absolute",left:`${x-pad}%`,top:`${y-pad}%`,
+            width:`${bw+pad*2}%`,height:`${bh+pad*2}%`,
+            border:`${isMain?"2px":"1px"} solid ${tc}`,
+            boxShadow:`0 0 ${isMain?10:4}px ${tc}${isMain?"50":"25"}`,
+            boxSizing:"border-box",
+            animation:isMain&&autoCapPending?"lock-flash 0.3s step-end infinite":"none"}}>
+            {[[-1,-1],[1,-1],[1,1],[-1,1]].map(([sx,sy],ci)=>(
+              <div key={ci} style={{position:"absolute",width:7,height:7,
+                top:sy<0?-1:"auto",bottom:sy>0?-1:"auto",
+                left:sx<0?-1:"auto",right:sx>0?-1:"auto",
+                borderTop:sy<0?`2px solid ${tc}`:"none",borderBottom:sy>0?`2px solid ${tc}`:"none",
+                borderLeft:sx<0?`2px solid ${tc}`:"none",borderRight:sx>0?`2px solid ${tc}`:"none"}}/>
+            ))}
+            {/* AI label */}
+            <div style={{position:"absolute",top:-28,left:0,display:"flex",gap:2,flexDirection:"column"}}>
+              <div style={{display:"flex",gap:2,alignItems:"center"}}>
+                <span style={{fontSize:7,color:tc,letterSpacing:1,background:"rgba(0,0,0,0.8)",
+                  padding:"1px 3px",borderRadius:1,fontFamily:"'DM Mono',monospace"}}>
+                  {b.icon} {b.label}
+                </span>
+                <span style={{fontSize:6,color:`${tc}90`,background:"rgba(0,0,0,0.7)",
+                  padding:"1px 3px",borderRadius:1,fontFamily:"'DM Mono',monospace"}}>
+                  {b.conf}%
+                </span>
+                {isMain&&autoCapPending&&(
+                  <span style={{fontSize:6,color:"#fff",background:"rgba(255,34,34,0.85)",
+                    padding:"1px 3px",borderRadius:1,animation:"rec-blink 0.3s step-end infinite",
+                    fontFamily:"'DM Mono',monospace"}}>📷</span>
+                )}
+              </div>
+              {b.dist&&(
+                <span style={{fontSize:6,color:`${tc}80`,background:"rgba(0,0,0,0.7)",
+                  padding:"1px 3px",borderRadius:1,fontFamily:"'DM Mono',monospace",letterSpacing:1}}>
+                  ~{b.dist<10?b.dist.toFixed(1):Math.round(b.dist)}m
+                </span>
+              )}
+            </div>
+            <div style={{position:"absolute",top:"50%",left:"50%",width:4,height:4,borderRadius:"50%",
+              transform:"translate(-50%,-50%)",background:tc,boxShadow:`0 0 6px ${tc}`,
+              animation:"tgt-pulse 1.2s ease-in-out infinite"}}/>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+function ThermalOverlay({tempData,mode}){
+  if(!tempData||(mode!=="THERMAL"&&mode!=="RAINBOW"&&mode!=="FUSION"))return null;
+  const{hot,cold,avg,hotX,hotY}=tempData;
+  const gm={THERMAL:"linear-gradient(90deg,#000080,#800080,#ff0000,#ff8800,#ffff00,#fff)",RAINBOW:"linear-gradient(90deg,#0000ff,#00ffff,#00ff00,#ffff00,#ff0000)",FUSION:"linear-gradient(90deg,#1400ff,#8800ff,#ff4400,#ff8800,#ffe0c0)"};
+  return(
+    <div style={{position:"absolute",inset:0,pointerEvents:"none",zIndex:24}}>
+      <div style={{position:"absolute",left:`${hotX}%`,top:`${hotY}%`,transform:"translate(-50%,-50%)",zIndex:25,
+        display:"flex",flexDirection:"column",alignItems:"center",gap:2,animation:"tgt-pulse 1s ease-in-out infinite"}}>
+        <div style={{width:12,height:12,borderRadius:"50%",border:"2px solid #fff",boxShadow:"0 0 16px #ff5500,0 0 6px #fff"}}/>
+        <span style={{fontFamily:"'DM Mono',monospace",fontSize:8,color:"#fff",background:"rgba(0,0,0,0.75)",
+          padding:"1px 4px",borderRadius:2,letterSpacing:1,whiteSpace:"nowrap"}}>{hot.toFixed(1)}°C ▲</span>
+      </div>
+      <div style={{position:"absolute",bottom:14,left:"50%",transform:"translateX(-50%)",
+        display:"flex",flexDirection:"column",alignItems:"center",gap:2}}>
+        <div style={{width:100,height:7,borderRadius:3,border:"1px solid rgba(255,255,255,0.15)",background:gm[mode]||gm.THERMAL}}/>
+        <div style={{display:"flex",justifyContent:"space-between",width:100}}>
+          <span style={{fontSize:7,color:"rgba(255,255,255,0.55)",fontFamily:"'DM Mono',monospace"}}>{cold.toFixed(0)}°C</span>
+          <span style={{fontSize:7,color:"rgba(255,255,255,0.7)",fontFamily:"'DM Mono',monospace"}}>~{avg.toFixed(1)}°</span>
+          <span style={{fontSize:7,color:"#ff8800",fontFamily:"'DM Mono',monospace"}}>{hot.toFixed(0)}°C</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CAMERA PANEL
+// ═══════════════════════════════════════════════════════════════════════════════
+function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeOverlay,
+  noiseReduction,color,zoom,showReticle,motionEnabled,autoCapture,tripwires,showRPPG,
+  onCapture,onMotionEvent,onTripwireHit,onRPPG,compact=false}){
+  const videoRef=useRef(null),rawRef=useRef(null),dispRef=useRef(null),rafRef=useRef(null);
+  const prevRef=useRef(null),motRef=useRef(null),cooldown=useRef(0),fpsRef=useRef({frames:0,last:performance.now()});
+  const[blobs,setBlobs]=useState([]);const[motionLevel,setMotionLevel]=useState(0);
+  const[tempData,setTempData]=useState(null);const[cameraSize,setCameraSize]=useState({w:1280,h:720});
+  const[fps,setFps]=useState(0);const[flash,setFlash]=useState(false);const[autoCapPending,setAutoCapPending]=useState(false);
+  const MODE_LUT={NVG:null,THERMAL:"THERMAL",RAINBOW:"RAINBOW",FUSION:"FUSION",BLUE:null,WHITE:null};
+
+  useEffect(()=>{
+    if(!videoRef.current||!stream)return;
+    videoRef.current.srcObject=stream;videoRef.current.play().catch(()=>{});
+  },[stream]);
+
+  const renderLoop=useCallback(()=>{
+    const video=videoRef.current,raw=rawRef.current,disp=dispRef.current;
+    if(video&&raw&&disp){
+      const result=processFrame(video,raw,disp,
+        {mode,brightness,sensitivity,edgeOverlay,noiseReduction,lutName:MODE_LUT[mode]||null,tripwires,showRPPG},
+        {prev:prevRef,motion:motRef}
+      );
+      if(result){
+        setCameraSize({w:result.sw,h:result.sh});
+        if(motionEnabled){
+          setMotionLevel(result.motionFrac);setBlobs(result.blobs);
+          const now=Date.now();
+          if(autoCapture&&result.blobs.length>0&&result.motionFrac>0.008&&now-cooldown.current>3000){
+            cooldown.current=now;setAutoCapPending(true);
+            onMotionEvent&&onMotionEvent(result.blobs[0],label);
+            setTimeout(()=>{
+              if(disp){setFlash(true);setTimeout(()=>setFlash(false),400);
+                onCapture&&onCapture(disp.toDataURL("image/png"),label,result.blobs.length,true);}
+              setAutoCapPending(false);
+            },600);
+          }
+          if(result.triggeredWires.length)onTripwireHit&&onTripwireHit(result.triggeredWires,label);
+        }
+        if(result.tempData)setTempData(result.tempData);
+        if(showRPPG&&result.rppgVal)onRPPG&&onRPPG(result.rppgVal);
+        const fc=fpsRef.current;fc.frames++;
+        const n=performance.now();if(n-fc.last>=1000){setFps(fc.frames);fc.frames=0;fc.last=n;}
+      }
+    }
+    rafRef.current=requestAnimationFrame(renderLoop);
+  // eslint-disable-next-line
+  },[mode,brightness,sensitivity,edgeOverlay,noiseReduction,motionEnabled,autoCapture,showRPPG,JSON.stringify(tripwires)]);
+
+  useEffect(()=>{rafRef.current=requestAnimationFrame(renderLoop);return()=>cancelAnimationFrame(rafRef.current);},[renderLoop]);
+
+  return(
+    <div style={{position:"relative",width:"100%",aspectRatio:compact?"1/1":"4/3",background:"#010801",overflow:"hidden",border:`1px solid ${color}12`}}>
+      <video ref={videoRef} muted playsInline autoPlay style={{position:"absolute",opacity:0,pointerEvents:"none",width:1,height:1}}/>
+      <canvas ref={rawRef} style={{display:"none"}}/>
+      <canvas ref={dispRef} data-primary={label==="REAR"?"true":undefined} style={{width:"100%",height:"100%",display:"block",
+        transform:`scale(${zoom})`,transformOrigin:"center",transition:"transform 0.15s ease",
+        imageRendering:zoom>=4?"pixelated":"auto"}}/>
+      <div style={{position:"absolute",inset:0,pointerEvents:"none",zIndex:10,overflow:"hidden"}}>
+        <div style={{position:"absolute",left:0,right:0,height:2,
+          background:`linear-gradient(180deg,transparent,${color}12,transparent)`,
+          animation:"nvg-scan 6s linear infinite"}}/>
+      </div>
+      {flash&&<div style={{position:"absolute",inset:0,zIndex:50,pointerEvents:"none",
+        background:"rgba(255,255,255,0.38)",animation:"flash-out 0.4s ease-out forwards"}}/>}
+      {ready&&(
+        <>
+          <Corners color={color}/>
+          {showReticle&&!blobs.length&&<Reticle color={color}/>}
+          <TargetBoxes blobs={blobs} cw={cameraSize.w} ch={cameraSize.h} color={color} autoCapPending={autoCapPending}/>
+          <ThermalOverlay tempData={tempData} mode={mode}/>
+          <div style={{position:"absolute",top:8,left:8,zIndex:20,display:"flex",flexDirection:"column",gap:2}}>
+            <div style={{fontSize:7,color,letterSpacing:2,padding:"1px 4px",border:`1px solid ${color}30`,background:`${color}08`,borderRadius:1}}>{label}</div>
+            <div style={{fontSize:6,color:`${color}45`,letterSpacing:1,paddingLeft:2}}>{fps}fps</div>
+            {blobs.length>0&&<div style={{fontSize:7,color:"#ff5500",letterSpacing:1,animation:"rec-blink 0.8s step-end infinite",paddingLeft:2}}>{blobs.length} TGT{blobs.length>1?"S":""}</div>}
+            {autoCapPending&&<div style={{fontSize:7,color:"#ffdd00",letterSpacing:1,paddingLeft:2,animation:"rec-blink 0.3s step-end infinite"}}>📷AUTO</div>}
+          </div>
+          {motionLevel>0.004&&(
+            <div style={{position:"absolute",bottom:8,left:8,zIndex:20,display:"flex",alignItems:"center",gap:3,
+              padding:"2px 5px",background:motionLevel>0.025?"rgba(255,30,30,0.18)":"rgba(255,165,0,0.12)",
+              border:`1px solid ${motionLevel>0.025?"#ff2222":"#ffaa00"}`,borderRadius:1}}>
+              <div style={{width:4,height:4,borderRadius:"50%",background:motionLevel>0.025?"#ff2222":"#ffaa00"}}/>
+              <span style={{fontSize:6,letterSpacing:1,fontFamily:"'DM Mono',monospace",color:motionLevel>0.025?"#ff2222":"#ffaa00"}}>
+                {motionLevel>0.025?"ALERT":"MOT"} {(motionLevel*100).toFixed(1)}%
+              </span>
+            </div>
+          )}
+          {tempData&&(mode==="THERMAL"||mode==="RAINBOW"||mode==="FUSION")&&(
+            <div style={{position:"absolute",bottom:8,right:8,zIndex:20}}>
+              <span style={{fontSize:7,color:"#ff8800",fontFamily:"'DM Mono',monospace",letterSpacing:1}}>▲{tempData.hot.toFixed(1)}°C</span>
+            </div>
+          )}
+        </>
+      )}
+      {!ready&&!error&&(
+        <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:8,zIndex:30}}>
+          <div style={{width:22,height:22,borderRadius:"50%",border:`2px solid ${color}20`,borderTop:`2px solid ${color}`,animation:"spin 1s linear infinite"}}/>
+          <span style={{fontSize:8,color:`${color}60`,letterSpacing:2}}>INIT {label}</span>
+        </div>
+      )}
+      {error&&(
+        <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:6,zIndex:30,background:"rgba(0,0,0,0.92)"}}>
+          <span style={{fontSize:14}}>📷</span>
+          <span style={{fontFamily:"'DM Mono',monospace",fontSize:7,color:"#ff4444",letterSpacing:2}}>{label} OFFLINE</span>
+          <span style={{fontSize:6,color:"rgba(255,100,100,0.5)",textAlign:"center",maxWidth:180,letterSpacing:.5}}>
+            {error.toLowerCase().includes("denied")?"PERMISSION REQUIRED":error.slice(0,50).toUpperCase()}
+          </span>
+        </div>
+      )}
     </div>
   );
 }
@@ -515,450 +1016,344 @@ function MotionAlert({ level, color }) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
-
-const MODE_META = {
-  NVG:     { label:"NVG",     desc:"Night Vision Green", color:"#00ff50", lut:null },
-  THERMAL: { label:"THERMAL", desc:"FLIR Iron-Bow",      color:"#ff5500", lut:"THERMAL" },
-  RAINBOW: { label:"RAINBOW", desc:"Rainbow IR",         color:"#00ccff", lut:"RAINBOW" },
-  FUSION:  { label:"FUSION",  desc:"Fusion IR",          color:"#cc44ff", lut:"FUSION" },
-  BLUE:    { label:"ARCTIC",  desc:"Arctic Blue",        color:"#0088ff", lut:null },
-  WHITE:   { label:"WHT-HOT", desc:"White Hot",          color:"#dddddd", lut:null },
+const MODE_META={
+  NVG:{label:"NVG",color:"#00ff50"},THERMAL:{label:"THERMAL",color:"#ff5500"},
+  RAINBOW:{label:"RAINBOW",color:"#00ccff"},FUSION:{label:"FUSION",color:"#cc44ff"},
+  BLUE:{label:"ARCTIC",color:"#0088ff"},WHITE:{label:"WHT-HOT",color:"#dddddd"},
 };
-const MODE_KEYS = Object.keys(MODE_META);
-const ZOOM_STEPS = [1, 1.5, 2, 3, 4, 6, 8, 12];
+const MODE_KEYS=Object.keys(MODE_META);
+const ZOOM_STEPS=[1,1.5,2,3,4,6,8,12];
+const PEER_ID=Math.random().toString(36).slice(2,10);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // MAIN APP
 // ═══════════════════════════════════════════════════════════════════════════════
+export default function NightVisionCamera(){
+  const[mode,setMode]=useState("NVG");
+  const[zoom,setZoom]=useState(1);
+  const[brightness,setBrightness]=useState(0);
+  const[sensitivity,setSensitivity]=useState(0.6);
+  const[edgeOverlay,setEdgeOverlay]=useState(false);
+  const[noiseReduction,setNoiseReduction]=useState(true);
+  const[motionEnabled,setMotionEnabled]=useState(true);
+  const[autoCapture,setAutoCapture]=useState(false);
+  const[showReticle,setShowReticle]=useState(true);
+  const[dualMode,setDualMode]=useState(false);
+  const[recording,setRecording]=useState(false);
+  const[captures,setCaptures]=useState([]);
+  const[tripwires,setTripwires]=useState([]);
+  const[showRPPG,setShowRPPG]=useState(false);
+  const[audioEnabled,setAudioEnabled]=useState(false);
+  const[multiSync,setMultiSync]=useState(false);
+  const[modal,setModal]=useState(null); // "map"|"timeline"|"tripwire"|"gallery"|"manual"
+  const[rppgSample,setRppgSample]=useState(0);
+  const mediaRecRef=useRef(null);
 
-export default function NightVisionCamera() {
-  const [mode, setMode]           = useState("NVG");
-  const [facing, setFacing]       = useState("environment");
-  const [brightness, setBrightness] = useState(0);
-  const [zoom, setZoom]           = useState(1);
-  const [sensitivity, setSensitivity] = useState(0.6);
-  const [showReticle, setShowReticle] = useState(true);
-  const [motionEnabled, setMotionEnabled] = useState(true);
-  const [edgeOverlay, setEdgeOverlay]     = useState(false);
-  const [noiseReduction, setNoiseReduction] = useState(true);
-  const [recording, setRecording]   = useState(false);
-  const [snapshot, setSnapshot]     = useState(null);
-  const [showSnapshot, setShowSnapshot] = useState(false);
-  const [blobs, setBlobs]           = useState([]);
-  const [motionLevel, setMotionLevel] = useState(0);
-  const [tempData, setTempData]     = useState(null);
-  const [cameraSize, setCameraSize] = useState({ w: 1280, h: 720 });
-  const [fps, setFps]               = useState(0);
-  const [showSettings, setShowSettings] = useState(false);
+  const clock=useClock();
+  const heading=useDeviceOrientation();
+  const gps=useGPS();
+  const{level:audioLevel,spike:audioSpike}=useMicrophone(audioEnabled);
+  const hr=useRPPG(showRPPG?rppgSample:null);
+  const{peers,alerts:syncAlerts,broadcast}=useMultiSync(multiSync,PEER_ID);
+  const{events,add:addEvent}=useTimeline();
 
-  const videoRef      = useRef(null);
-  const rawCanvasRef  = useRef(null);
-  const dispCanvasRef = useRef(null);
-  const rafRef        = useRef(null);
-  const prevFrameRef  = useRef(null);
-  const motionRef     = useRef(null);
-  const mediaRecRef   = useRef(null);
-  const fpsCountRef   = useRef({ frames: 0, last: performance.now() });
+  const rear=useCameraStream({facingMode:"environment"},true);
+  const front=useCameraStream({facingMode:"user"},dualMode);
 
-  const clock   = useClock();
-  const heading = useDeviceOrientation();
-  const { stream, error, ready } = useCameraStream(facing);
+  const color=MODE_META[mode].color;
+  const timeStr=clock.toLocaleTimeString("en-US",{hour12:false});
+  const dateStr=clock.toLocaleDateString("en-US",{day:"2-digit",month:"short",year:"numeric"}).toUpperCase();
+  const dirs=["N","NE","E","SE","S","SW","W","NW"];
+  const compassDir=heading!==null?dirs[Math.round(heading/45)%8]:"--";
 
-  const meta  = MODE_META[mode];
-  const color = meta.color;
+  // Handle captures
+  const handleCapture=useCallback((url,label,targets,auto=false)=>{
+    if(!url||url==="data:,")return;
+    const now=new Date();
+    const entry={url,label,targets,auto,time:now.toLocaleTimeString("en-US",{hour12:false}),ts:now.getTime()};
+    setCaptures(p=>[entry,...p].slice(0,50));
+    addEvent("capture",{label,targets,auto,url,time:entry.time});
+  },[addEvent]);
 
-  useEffect(() => {
-    if (!videoRef.current || !stream) return;
-    videoRef.current.srcObject = stream;
-    videoRef.current.play().catch(() => {});
-  }, [stream]);
+  // Handle motion events → timeline + GPS pin + multicast
+  const handleMotionEvent=useCallback((blob,label)=>{
+    const evt={label:`${label} ${blob.label||"MOTION"}`,conf:blob.conf,lat:gps?.lat,lon:gps?.lon,icon:blob.icon||"🎯"};
+    addEvent("motion",evt);
+    broadcast("MOTION_ALERT",evt);
+  },[addEvent,broadcast,gps]);
 
-  const renderLoop = useCallback(() => {
-    const video = videoRef.current;
-    const raw   = rawCanvasRef.current;
-    const disp  = dispCanvasRef.current;
-    if (video && raw && disp) {
-      const result = processFrame(video, raw, disp, {
-        mode, brightness, sensitivity,
-        edgeOverlay, noiseReduction,
-        lutName: meta.lut,
-      }, { prevFrame: prevFrameRef, motionRef });
+  // Handle tripwire hits
+  const handleTripwireHit=useCallback((ids,label)=>{
+    setTripwires(tw=>tw.map(t=>ids.includes(t.id)?{...t,triggered:true}:t));
+    ids.forEach(id=>{
+      const tw=tripwires.find(t=>t.id===id);
+      addEvent("tripwire",{label:`${label} CROSSED ${tw?.label||id}`});
+    });
+    // Auto-reset trigger after 3s
+    setTimeout(()=>setTripwires(tw=>tw.map(t=>({...t,triggered:false}))),3000);
+  },[addEvent,tripwires]);
 
-      if (result) {
-        setCameraSize({ w: result.sw, h: result.sh });
-        if (motionEnabled) {
-          setMotionLevel(result.motionFrac);
-          setBlobs(result.blobs);
-        }
-        if (result.tempData) setTempData(result.tempData);
+  // Audio spike events
+  useEffect(()=>{
+    if(audioSpike)addEvent("audio",{label:"AUDIO SPIKE",level:audioLevel});
+  },[audioSpike]);// eslint-disable-line
 
-        // FPS counter
-        const fc = fpsCountRef.current;
-        fc.frames++;
-        const now = performance.now();
-        if (now - fc.last >= 1000) {
-          setFps(fc.frames);
-          fc.frames = 0; fc.last = now;
-        }
-      }
+  // Sync alerts → timeline
+  useEffect(()=>{
+    if(syncAlerts.length){
+      const a=syncAlerts[0];
+      addEvent("peer",{label:`PEER ${a.from.slice(-4)}: ${a.payload?.label||"MOTION"}`});
     }
-    rafRef.current = requestAnimationFrame(renderLoop);
-  }, [mode, brightness, sensitivity, edgeOverlay, noiseReduction, motionEnabled, meta.lut]);
+  },[syncAlerts]);// eslint-disable-line
 
-  useEffect(() => {
-    rafRef.current = requestAnimationFrame(renderLoop);
-    return () => cancelAnimationFrame(rafRef.current);
-  }, [renderLoop]);
-
-  const flipCamera = () => {
-    setFacing(f => f === "environment" ? "user" : "environment");
-    prevFrameRef.current = null; motionRef.current = null;
-    setBlobs([]); setMotionLevel(0);
+  const manualSnap=()=>{
+    const c=document.querySelector("canvas[data-primary='true']");
+    if(c)handleCapture(c.toDataURL("image/png"),"REAR",0,false);
   };
 
-  const takeSnapshot = () => {
-    const canvas = dispCanvasRef.current;
-    if (!canvas) return;
-    setSnapshot(canvas.toDataURL("image/png"));
-    setShowSnapshot(true);
+  const toggleRecord=()=>{
+    const c=document.querySelector("canvas[data-primary='true']");
+    if(!c)return;
+    if(!recording){
+      const cs=c.captureStream(30);
+      const rec=new MediaRecorder(cs,{mimeType:"video/webm"});
+      const chunks=[];
+      rec.ondataavailable=e=>chunks.push(e.data);
+      rec.onstop=()=>{const b=new Blob(chunks,{type:"video/webm"});const u=URL.createObjectURL(b);const a=document.createElement("a");a.href=u;a.download=`nvs7-${Date.now()}.webm`;a.click();};
+      rec.start();mediaRecRef.current=rec;setRecording(true);
+    }else{mediaRecRef.current?.stop();setRecording(false);}
   };
 
-  const toggleRecord = () => {
-    const canvas = dispCanvasRef.current;
-    if (!canvas) return;
-    if (!recording) {
-      const stream = canvas.captureStream(30);
-      const rec = new MediaRecorder(stream, { mimeType: "video/webm" });
-      const chunks = [];
-      rec.ondataavailable = e => chunks.push(e.data);
-      rec.onstop = () => {
-        const blob = new Blob(chunks, { type: "video/webm" });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url; a.download = `nvs7-${Date.now()}.webm`; a.click();
-      };
-      rec.start();
-      mediaRecRef.current = rec;
-      setRecording(true);
-    } else {
-      mediaRecRef.current?.stop();
-      setRecording(false);
-    }
-  };
+  const newCapCount=captures.length;
+  const newEventCount=events.length;
+  const hasTripwire=tripwires.some(t=>t.triggered);
 
-  const timeStr = clock.toLocaleTimeString("en-US", { hour12: false });
-  const dateStr = clock.toLocaleDateString("en-US", { day:"2-digit", month:"short", year:"numeric" }).toUpperCase();
-
-  return (
-    <div style={{ minHeight:"100vh", background:"#000", display:"flex",
-      alignItems:"center", justifyContent:"center", fontFamily:"'DM Mono',monospace" }}>
-      <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  return(
+    <div style={{minHeight:"100vh",background:"#000",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'DM Mono',monospace",overflowY:"auto"}}>
+      <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet"/>
       <style>{`
-        @keyframes nvg-scan { 0%{top:-3px;opacity:0} 5%{opacity:0.9} 95%{opacity:0.5} 100%{top:100%;opacity:0} }
-        @keyframes rec-blink { 0%,49%{opacity:1} 50%,100%{opacity:0} }
-        @keyframes tgt-pulse { 0%,100%{opacity:1;transform:translate(-50%,-50%) scale(1)} 50%{opacity:0.35;transform:translate(-50%,-50%) scale(1.8)} }
-        @keyframes fade-in { from{opacity:0;transform:scale(0.97)} to{opacity:1;transform:scale(1)} }
-        @keyframes sweep { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
-        * { box-sizing:border-box; } button { font-family:"DM Mono",monospace; cursor:pointer; }
-        ::-webkit-scrollbar { display:none; }
+        @keyframes nvg-scan{0%{top:-3px;opacity:0}5%{opacity:.9}95%{opacity:.5}100%{top:100%;opacity:0}}
+        @keyframes rec-blink{0%,49%{opacity:1}50%,100%{opacity:0}}
+        @keyframes tgt-pulse{0%,100%{opacity:1;transform:translate(-50%,-50%) scale(1)}50%{opacity:.3;transform:translate(-50%,-50%) scale(1.9)}}
+        @keyframes fade-in{from{opacity:0;transform:scale(.97)}to{opacity:1;transform:scale(1)}}
+        @keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
+        @keyframes flash-out{0%{opacity:.38}100%{opacity:0}}
+        @keyframes lock-flash{0%,49%{border-color:#ff220088}50%,100%{border-color:#ff2200}}
+        *{box-sizing:border-box}button{font-family:"DM Mono",monospace;cursor:pointer}
+        ::-webkit-scrollbar{display:none}
       `}</style>
 
-      {/* Snapshot lightbox */}
-      {showSnapshot && snapshot && (
-        <div onClick={() => setShowSnapshot(false)} style={{
-          position:"fixed", inset:0, background:"rgba(0,0,0,0.92)", zIndex:100,
-          display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:12,
-          animation:"fade-in 0.2s ease",
-        }}>
-          <img src={snapshot} style={{ maxWidth:"90vw", maxHeight:"75vh", border:`1px solid ${color}30`, borderRadius:2 }} alt="snapshot"/>
-          <div style={{ display:"flex", gap:10 }}>
-            <a href={snapshot} download={`nvs7-${Date.now()}.png`} onClick={e => e.stopPropagation()}
-              style={{ padding:"6px 16px", border:`1px solid ${color}50`, borderRadius:2, color,
-                fontFamily:"'DM Mono',monospace", fontSize:9, letterSpacing:2, textDecoration:"none" }}>
-              SAVE
-            </a>
-            <button onClick={() => setShowSnapshot(false)} style={{
-              padding:"6px 16px", border:"1px solid rgba(255,100,100,0.4)", borderRadius:2,
-              color:"rgba(255,100,100,0.8)", background:"transparent", fontSize:9, letterSpacing:2 }}>
-              CLOSE
-            </button>
-          </div>
-        </div>
-      )}
+      {modal==="map"&&<GPSMap pos={gps} events={events} color={color} onClose={()=>setModal(null)}/>}
+      {modal==="timeline"&&<TimelineModal events={events} captures={captures} color={color} onClose={()=>setModal(null)}/>}
+      {modal==="tripwire"&&<TripwireEditor tripwires={tripwires} onUpdate={setTripwires} color={color} onClose={()=>setModal(null)}/>}
 
-      <div style={{ width:"100%", maxWidth:480, display:"flex", flexDirection:"column",
-        background:"#000", border:`1px solid ${color}18`, animation:"fade-in 0.4s ease" }}>
+      <div style={{width:"100%",maxWidth:dualMode?560:480,display:"flex",flexDirection:"column",background:"#000",border:`1px solid ${color}18`,animation:"fade-in 0.4s ease"}}>
 
-        {/* ── HEADER ── */}
-        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
-          padding:"8px 14px", borderBottom:`1px solid ${color}15` }}>
-          <div style={{ display:"flex", alignItems:"center", gap:8 }}>
-            <div style={{ width:6, height:6, borderRadius:"50%", background:color,
-              boxShadow:`0 0 10px ${color}`, animation:"rec-blink 2s step-end infinite" }}/>
-            <span style={{ fontFamily:"'Cinzel',serif", fontSize:10, fontWeight:900,
-              color, letterSpacing:4, textShadow:`0 0 10px ${color}40` }}>NVS-7</span>
+        {/* HEADER */}
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 14px",borderBottom:`1px solid ${color}15`}}>
+          <div style={{display:"flex",alignItems:"center",gap:7}}>
+            <div style={{width:6,height:6,borderRadius:"50%",background:color,boxShadow:`0 0 10px ${color}`,animation:"rec-blink 2s step-end infinite"}}/>
+            <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4,textShadow:`0 0 10px ${color}40`}}>NVS-7</span>
+            {multiSync&&peers.length>0&&<span style={{fontSize:7,color:"#cc44ff",letterSpacing:1,border:"1px solid #cc44ff30",padding:"1px 4px",borderRadius:1}}>{peers.length}P</span>}
+            {hasTripwire&&<span style={{fontSize:7,color:"#ffcc00",letterSpacing:1,animation:"rec-blink 0.4s step-end infinite",border:"1px solid #ffcc0050",padding:"1px 4px",borderRadius:1}}>⚠WIRE</span>}
+            {audioSpike&&<span style={{fontSize:7,color:"#ff2222",letterSpacing:1,animation:"rec-blink 0.3s step-end infinite"}}>🔊!</span>}
           </div>
-          <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:0 }}>
-            <span style={{ fontSize:7, color:`${color}50`, letterSpacing:1 }}>{dateStr}</span>
-            <span style={{ fontSize:10, color, letterSpacing:2 }}>{timeStr}</span>
+          <div style={{display:"flex",flexDirection:"column",alignItems:"center"}}>
+            <span style={{fontSize:6,color:`${color}45`,letterSpacing:1}}>{dateStr}</span>
+            <span style={{fontSize:10,color,letterSpacing:2}}>{timeStr}</span>
           </div>
-          <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:1 }}>
-            <span style={{ fontSize:7, color:`${color}60`, letterSpacing:1 }}>{meta.desc}</span>
-            <div style={{ display:"flex", alignItems:"center", gap:4 }}>
-              <SignalBars level={0.8} color={color}/>
-              <span style={{ fontSize:7, color:`${color}50` }}>{fps}fps</span>
+          <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:1}}>
+            {heading!==null&&<span style={{fontSize:7,color:`${color}55`,letterSpacing:1}}>{String(heading).padStart(3,"0")}° {compassDir}</span>}
+            {gps&&<span style={{fontSize:6,color:`${color}40`,letterSpacing:.5}}>{gps.lat.toFixed(3)}°N</span>}
+            <div style={{display:"flex",gap:4,alignItems:"center"}}>
+              <SignalBars level={.8} color={color}/>
+              {autoCapture&&<span style={{fontSize:6,color:"#ffdd00",animation:"rec-blink 1.5s step-end infinite"}}>AUTO</span>}
+              {recording&&<span style={{fontSize:6,color:"#ff2222",animation:"rec-blink 1s step-end infinite"}}>●REC</span>}
             </div>
           </div>
         </div>
 
-        {/* ── VIEWPORT ── */}
-        <div style={{ position:"relative", width:"100%", aspectRatio:"4/3",
-          background:"#010801", overflow:"hidden" }}>
-
-          {/* Hidden elements */}
-          <video ref={videoRef} muted playsInline autoPlay
-            style={{ position:"absolute", opacity:0, pointerEvents:"none", width:1, height:1 }}/>
-          <canvas ref={rawCanvasRef} style={{ display:"none" }}/>
-
-          {/* Display canvas */}
-          <canvas ref={dispCanvasRef} style={{
-            width:"100%", height:"100%", display:"block",
-            transform:`scale(${zoom}) ${facing==="user"?"scaleX(-1)":""}`,
-            transformOrigin:"center",
-            transition:"transform 0.15s ease",
-            imageRendering: zoom >= 4 ? "pixelated" : "auto",
-          }}/>
-
-          {/* Scanline sweep */}
-          <div style={{ position:"absolute", inset:0, pointerEvents:"none", zIndex:10, overflow:"hidden" }}>
-            <div style={{
-              position:"absolute", left:0, right:0, height:2,
-              background:`linear-gradient(180deg,transparent,${color}12,transparent)`,
-              animation:"nvg-scan 6s linear infinite",
-            }}/>
+        {/* CAMERAS */}
+        {dualMode?(
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:1,background:`${color}08`}}>
+            <CameraPanel stream={rear.stream} ready={rear.ready} error={rear.error} label="REAR"
+              mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
+              noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
+              motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
+              showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
+              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={true}/>
+            <CameraPanel stream={front.stream} ready={front.ready} error={front.error} label="FRONT"
+              mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
+              noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
+              motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
+              showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
+              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={true}/>
           </div>
+        ):(
+          <div style={{position:"relative"}}>
+            <CameraPanel stream={rear.stream} ready={rear.ready} error={rear.error} label="REAR"
+              mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
+              noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
+              motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
+              showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
+              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={false}/>
+            {(showRPPG||audioEnabled)&&(
+              <BiometricHUD hr={hr} audioLevel={audioLevel} audioSpike={audioSpike} color={color}/>
+            )}
+          </div>
+        )}
 
-          {ready && (
-            <>
-              <Corners color={color}/>
-              {showReticle && !blobs.length && <Reticle color={color}/>}
-              <TargetBoxes blobs={blobs} cw={cameraSize.w} ch={cameraSize.h} color={color}/>
-              <ThermalOverlay tempData={tempData} mode={mode}/>
-              {motionEnabled && blobs.length === 0 && <MotionAlert level={motionLevel} color={color}/>}
-              <CompassHUD heading={heading} color={color}/>
-
-              {/* TOP-LEFT */}
-              <div style={{ position:"absolute", top:12, left:12, zIndex:20,
-                display:"flex", flexDirection:"column", gap:2 }}>
-                <div style={{ fontSize:8, color, letterSpacing:2, padding:"2px 5px",
-                  border:`1px solid ${color}30`, background:`${color}06`, borderRadius:2 }}>
-                  {mode}
-                </div>
-                <div style={{ fontSize:7, color:`${color}55`, letterSpacing:1, paddingLeft:2 }}>
-                  {zoom}× ZOOM
-                </div>
-                {blobs.length > 0 && (
-                  <div style={{ fontSize:7, color:"#ff5500", letterSpacing:1,
-                    animation:"rec-blink 0.8s step-end infinite", paddingLeft:2 }}>
-                    {blobs.length} TGT{blobs.length>1?"S":""}
-                  </div>
-                )}
-                {edgeOverlay && (
-                  <div style={{ fontSize:7, color:`${color}70`, letterSpacing:1, paddingLeft:2 }}>EDGE:ON</div>
-                )}
-                {noiseReduction && (
-                  <div style={{ fontSize:7, color:`${color}50`, letterSpacing:1, paddingLeft:2 }}>NR:ON</div>
-                )}
-              </div>
-
-              {/* TOP-RIGHT */}
-              <div style={{ position:"absolute", top:12, right:12, zIndex:20,
-                display:"flex", flexDirection:"column", alignItems:"flex-end", gap:2 }}>
-                {recording && (
-                  <div style={{ display:"flex", alignItems:"center", gap:4 }}>
-                    <div style={{ width:6, height:6, borderRadius:"50%", background:"#ff2222",
-                      boxShadow:"0 0 8px #ff2222", animation:"rec-blink 1s step-end infinite" }}/>
-                    <span style={{ fontSize:8, color:"#ff2222", letterSpacing:2 }}>REC</span>
-                  </div>
-                )}
-                <div style={{ fontSize:7, color:`${color}45`, letterSpacing:1 }}>
-                  {motionLevel > 0.004 ? `▲ ${(motionLevel*100).toFixed(1)}%` : "CLEAR"}
-                </div>
-                {tempData && (mode==="THERMAL"||mode==="RAINBOW"||mode==="FUSION") && (
-                  <div style={{ fontSize:7, color:"#ff8800", letterSpacing:1 }}>
-                    ▲{tempData.hot.toFixed(1)}°C
-                  </div>
-                )}
-              </div>
-
-              {/* BOTTOM-RIGHT: GAIN */}
-              <div style={{ position:"absolute", bottom:14, right:12, zIndex:20,
-                display:"flex", flexDirection:"column", alignItems:"flex-end", gap:2 }}>
-                <span style={{ fontSize:6, color:`${color}45`, letterSpacing:1 }}>GAIN</span>
-                <div style={{ display:"flex", gap:2 }}>
-                  {[-2,-1,0,1,2].map((v,i) => (
-                    <div key={i} onClick={() => setBrightness(v * 0.75)} style={{
-                      width:7, height:12+i*2, borderRadius:1,
-                      background: brightness >= v * 0.75 ? color : `${color}18`,
-                      cursor:"pointer", transition:"background 0.1s",
-                    }}/>
-                  ))}
-                </div>
-              </div>
-
-              {/* BOTTOM-LEFT: coords */}
-              <div style={{ position:"absolute", bottom:14, left:12, zIndex:20,
-                display:"flex", flexDirection:"column", gap:1 }}>
-                <span style={{ fontSize:7, color:`${color}45`, letterSpacing:1 }}>40°44′N 74°00′W</span>
-                <span style={{ fontSize:6, color:`${color}30`, letterSpacing:1 }}>ALT:12m • {facing==="environment"?"REAR":"FRONT"}</span>
-              </div>
-            </>
-          )}
-
-          {/* INIT */}
-          {!ready && !error && (
-            <div style={{ position:"absolute", inset:0, display:"flex",
-              flexDirection:"column", alignItems:"center", justifyContent:"center", gap:10, zIndex:30 }}>
-              <div style={{ width:32, height:32, borderRadius:"50%",
-                border:`2px solid ${color}20`, borderTop:`2px solid ${color}`,
-                animation:"sweep 1s linear infinite" }}/>
-              <span style={{ fontSize:9, color:`${color}70`, letterSpacing:3 }}>INITIALIZING SENSOR</span>
-            </div>
-          )}
-
-          {/* ERROR */}
-          {error && (
-            <div style={{ position:"absolute", inset:0, display:"flex", flexDirection:"column",
-              alignItems:"center", justifyContent:"center", gap:10, zIndex:30, background:"rgba(0,0,0,0.92)" }}>
-              <span style={{ fontSize:22 }}>📷</span>
-              <span style={{ fontFamily:"'Cinzel',serif", fontSize:10, color:"#ff4444", letterSpacing:3 }}>
-                SENSOR OFFLINE
-              </span>
-              <span style={{ fontSize:8, color:"rgba(255,100,100,0.5)", textAlign:"center", maxWidth:240, letterSpacing:1 }}>
-                {error.toLowerCase().includes("denied") ? "CAMERA PERMISSION REQUIRED" : error.toUpperCase()}
-              </span>
-              <button onClick={() => window.location.reload()} style={{
-                padding:"5px 14px", background:"transparent",
-                border:"1px solid rgba(255,100,100,0.35)", borderRadius:2,
-                color:"rgba(255,100,100,0.7)", fontSize:8, letterSpacing:2 }}>
-                RETRY
-              </button>
-            </div>
-          )}
-        </div>
-
-        {/* ── CONTROLS ── */}
-        <div style={{ padding:"10px 12px", borderTop:`1px solid ${color}10`,
-          display:"flex", flexDirection:"column", gap:7 }}>
+        {/* CONTROLS */}
+        <div style={{padding:"10px 12px",borderTop:`1px solid ${color}10`,display:"flex",flexDirection:"column",gap:6}}>
 
           {/* MODE */}
-          <div style={{ display:"flex", gap:4 }}>
-            {MODE_KEYS.map(m => {
-              const mc = MODE_META[m].color;
-              return (
-                <button key={m} onClick={() => setMode(m)} style={{
-                  flex:1, padding:"5px 1px",
-                  background: mode===m ? `${mc}12` : "transparent",
-                  border:`1px solid ${mode===m ? mc : `${mc}18`}`,
-                  borderRadius:2, fontSize:6,
-                  color: mode===m ? mc : `${mc}40`,
-                  letterSpacing:1, transition:"all 0.12s",
-                }}>{MODE_META[m].label}</button>
-              );
-            })}
+          <div style={{display:"flex",gap:4}}>
+            {MODE_KEYS.map(m=>{const mc=MODE_META[m].color;return(
+              <button key={m} onClick={()=>setMode(m)} style={{flex:1,padding:"5px 1px",
+                background:mode===m?`${mc}12`:"transparent",border:`1px solid ${mode===m?mc:`${mc}18`}`,
+                borderRadius:2,fontSize:6,color:mode===m?mc:`${mc}38`,letterSpacing:.5,transition:"all 0.12s"}}>
+                {MODE_META[m].label}
+              </button>
+            );})}
           </div>
 
           {/* ZOOM */}
-          <div style={{ display:"flex", gap:3 }}>
-            {ZOOM_STEPS.map(z => (
-              <button key={z} onClick={() => setZoom(z)} style={{
-                flex:1, padding:"4px 1px",
-                background: zoom===z ? `${color}10` : "transparent",
-                border:`1px solid ${zoom===z ? color : `${color}12`}`,
-                borderRadius:2, fontSize:6,
-                color: zoom===z ? color : `${color}35`,
-                transition:"all 0.1s",
-              }}>{z}×</button>
+          <div style={{display:"flex",gap:3}}>
+            {ZOOM_STEPS.map(z=>(
+              <button key={z} onClick={()=>setZoom(z)} style={{flex:1,padding:"4px 1px",
+                background:zoom===z?`${color}10`:"transparent",border:`1px solid ${zoom===z?color:`${color}12`}`,
+                borderRadius:2,fontSize:6,color:zoom===z?color:`${color}32`,transition:"all 0.1s"}}>
+                {z}×
+              </button>
             ))}
           </div>
 
-          {/* SENSITIVITY slider */}
-          <div style={{ display:"flex", alignItems:"center", gap:8 }}>
-            <span style={{ fontSize:7, color:`${color}50`, letterSpacing:1, whiteSpace:"nowrap" }}>SENS</span>
+          {/* SENS + GAIN */}
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <span style={{fontSize:6,color:`${color}45`,letterSpacing:1,whiteSpace:"nowrap"}}>SENS</span>
             <input type="range" min="0" max="1" step="0.05" value={sensitivity}
-              onChange={e => setSensitivity(parseFloat(e.target.value))}
-              style={{ flex:1, accentColor:color, height:2 }}/>
-            <span style={{ fontSize:7, color:`${color}70`, letterSpacing:1, minWidth:24 }}>
-              {Math.round(sensitivity*100)}%
-            </span>
+              onChange={e=>setSensitivity(parseFloat(e.target.value))}
+              style={{flex:1,accentColor:color}}/>
+            <span style={{fontSize:6,color:`${color}60`,minWidth:22}}>{Math.round(sensitivity*100)}%</span>
+            <span style={{fontSize:6,color:`${color}45`,letterSpacing:1,whiteSpace:"nowrap"}}>GAIN</span>
+            {[-2,-1,0,1,2].map((v,i)=>(
+              <div key={i} onClick={()=>setBrightness(v*0.75)} style={{width:6,height:8+i*2,borderRadius:1,cursor:"pointer",
+                background:brightness>=v*0.75?color:`${color}18`,transition:"background 0.1s"}}/>
+            ))}
           </div>
 
-          {/* ACTION ROW 1 */}
-          <div style={{ display:"flex", gap:5 }}>
-            <button onClick={flipCamera} style={{
-              padding:"7px 10px", background:"transparent",
-              border:`1px solid ${color}18`, borderRadius:2, color:`${color}55`, fontSize:13 }}>⇄</button>
-
-            <button onClick={() => setShowReticle(r=>!r)} style={{
-              padding:"7px 9px",
-              background: showReticle ? `${color}08` : "transparent",
-              border:`1px solid ${showReticle ? color : `${color}18`}`,
-              borderRadius:2, color: showReticle ? color : `${color}30`, fontSize:12 }}>⊕</button>
-
-            <button onClick={() => setEdgeOverlay(e=>!e)} style={{
-              flex:1, padding:"7px 4px",
-              background: edgeOverlay ? `${color}08` : "transparent",
-              border:`1px solid ${edgeOverlay ? color : `${color}18`}`,
-              borderRadius:2, fontSize:7, letterSpacing:1,
-              color: edgeOverlay ? color : `${color}30` }}>EDGE</button>
-
-            <button onClick={() => setNoiseReduction(n=>!n)} style={{
-              flex:1, padding:"7px 4px",
-              background: noiseReduction ? `${color}08` : "transparent",
-              border:`1px solid ${noiseReduction ? color : `${color}18`}`,
-              borderRadius:2, fontSize:7, letterSpacing:1,
-              color: noiseReduction ? color : `${color}30` }}>NR</button>
-
-            <button onClick={() => { setMotionEnabled(m=>!m); setBlobs([]); setMotionLevel(0); }} style={{
-              flex:1, padding:"7px 4px",
-              background: motionEnabled ? "rgba(255,165,0,0.07)" : "transparent",
-              border:`1px solid ${motionEnabled ? "#ffaa00" : "rgba(255,165,0,0.15)"}`,
-              borderRadius:2, fontSize:7, letterSpacing:1,
-              color: motionEnabled ? "#ffaa00" : "rgba(255,165,0,0.25)" }}>MOT</button>
+          {/* TOGGLE ROW 1 */}
+          <div style={{display:"flex",gap:4}}>
+            {[
+              {l:"EDGE",v:edgeOverlay,f:()=>setEdgeOverlay(e=>!e)},
+              {l:"NR",v:noiseReduction,f:()=>setNoiseReduction(n=>!n)},
+              {l:"MOT",v:motionEnabled,f:()=>setMotionEnabled(m=>!m)},
+              {l:"DUAL",v:dualMode,f:()=>setDualMode(d=>!d)},
+              {l:"⊕",v:showReticle,f:()=>setShowReticle(r=>!r),big:true},
+              {l:"rPPG",v:showRPPG,f:()=>setShowRPPG(r=>!r)},
+              {l:"🎙",v:audioEnabled,f:()=>setAudioEnabled(a=>!a),big:true},
+              {l:"SYNC",v:multiSync,f:()=>setMultiSync(s=>!s)},
+            ].map(({l,v,f,big})=>(
+              <button key={l} onClick={f} style={{flex:1,padding:"5px 1px",
+                background:v?`${color}10`:"transparent",border:`1px solid ${v?color:`${color}15`}`,
+                borderRadius:2,fontSize:big?10:6,letterSpacing:.3,color:v?color:`${color}30`,transition:"all 0.12s"}}>
+                {l}
+              </button>
+            ))}
           </div>
 
-          {/* ACTION ROW 2 */}
-          <div style={{ display:"flex", gap:5 }}>
-            <button onClick={takeSnapshot} style={{
-              flex:1, padding:"7px 4px",
-              background:"transparent",
-              border:`1px solid ${color}20`,
-              borderRadius:2, fontSize:7, letterSpacing:1, color:`${color}60` }}>📷 SNAP</button>
-
-            <button onClick={toggleRecord} style={{
-              flex:1, padding:"7px 4px",
-              background: recording ? "rgba(255,34,34,0.10)" : "transparent",
-              border:`1px solid ${recording ? "#ff2222" : "rgba(255,34,34,0.18)"}`,
-              borderRadius:2, fontSize:7, letterSpacing:1,
-              color: recording ? "#ff2222" : "rgba(255,34,34,0.35)" }}>
-              {recording ? "■ STOP" : "● REC"}
+          {/* ACTION ROW */}
+          <div style={{display:"flex",gap:4}}>
+            <button onClick={()=>setAutoCapture(a=>!a)} style={{flex:2,padding:"7px 4px",
+              background:autoCapture?"rgba(255,221,0,0.10)":"transparent",
+              border:`1px solid ${autoCapture?"#ffdd00":"rgba(255,221,0,0.18)"}`,
+              borderRadius:2,fontSize:7,letterSpacing:1,color:autoCapture?"#ffdd00":"rgba(255,221,0,0.35)",transition:"all 0.12s"}}>
+              🎯 AUTO {autoCapture?"ON":"OFF"}
             </button>
-
-            <button onClick={() => { setBlobs([]); setMotionLevel(0); }} style={{
-              flex:1, padding:"7px 4px",
-              background:"transparent",
-              border:`1px solid rgba(255,136,0,0.18)`,
-              borderRadius:2, fontSize:7, letterSpacing:1, color:"rgba(255,136,0,0.4)" }}>CLR TGT</button>
+            <button onClick={manualSnap} style={{flex:1,padding:"7px 4px",background:"transparent",
+              border:`1px solid ${color}18`,borderRadius:2,fontSize:7,color:`${color}55`}}>📷</button>
+            <button onClick={toggleRecord} style={{flex:1,padding:"7px 4px",
+              background:recording?"rgba(255,34,34,0.10)":"transparent",
+              border:`1px solid ${recording?"#ff2222":"rgba(255,34,34,0.18)"}`,
+              borderRadius:2,fontSize:7,color:recording?"#ff2222":"rgba(255,34,34,0.35)"}}>
+              {recording?"■":"●"}REC
+            </button>
           </div>
+
+          {/* MODAL ROW */}
+          <div style={{display:"flex",gap:4}}>
+            {[
+              {l:`📁 ${newCapCount>0?`(${newCapCount})`:"GAL"}`,m:"gallery",c:newCapCount>0?color:undefined},
+              {l:"🗺 MAP",m:"map",c:gps?"#00ccff":undefined},
+              {l:`⏱ ${newEventCount>0?`(${newEventCount})`:"LOG"}`,m:"timeline",c:newEventCount>0?"#cc44ff":undefined},
+              {l:`⚡ WIRE${tripwires.length?` (${tripwires.length})`:""}`,m:"tripwire",c:hasTripwire?"#ffcc00":tripwires.length>0?"#ffcc0080":undefined},
+            ].map(({l,m,c})=>(
+              <button key={m} onClick={()=>setModal(m)} style={{flex:1,padding:"6px 2px",
+                background:modal===m?`${c||color}10`:"transparent",
+                border:`1px solid ${c||color}${modal===m?"":"25"}`,
+                borderRadius:2,fontSize:7,color:c||`${color}45`,letterSpacing:.3,transition:"all 0.12s"}}>
+                {l}
+              </button>
+            ))}
+          </div>
+
+          {/* PEER STATUS */}
+          {multiSync&&(
+            <div style={{padding:"5px 8px",border:`1px solid #cc44ff25`,borderRadius:2,background:"rgba(204,68,255,0.04)"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span style={{fontSize:7,color:"#cc44ff",letterSpacing:1,fontFamily:"'DM Mono',monospace"}}>SYNC — ID:{PEER_ID.slice(-4)}</span>
+                <span style={{fontSize:6,color:"rgba(204,68,255,0.6)",letterSpacing:1}}>{peers.length} PEER{peers.length!==1?"S":""}</span>
+              </div>
+              {syncAlerts.slice(0,2).map((a,i)=>(
+                <div key={i} style={{fontSize:6,color:"rgba(204,68,255,0.7)",marginTop:2,letterSpacing:.5}}>
+                  ↳ {a.from.slice(-4)}: {a.payload?.label||"ALERT"}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
-        {/* ── FOOTER ── */}
-        <div style={{ padding:"5px 12px", borderTop:`1px solid ${color}08`,
-          display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-          <span style={{ fontSize:6, color:`${color}20`, letterSpacing:1 }}>CLOUDYGETTY-AI // ENTROPY-ZERO</span>
-          <span style={{ fontSize:6, color:`${color}20`, letterSpacing:1 }}>NVS-7.3 // CLASSIFIED</span>
+        {/* FOOTER */}
+        <div style={{padding:"4px 12px",borderTop:`1px solid ${color}08`,display:"flex",justifyContent:"space-between"}}>
+          <span style={{fontSize:6,color:`${color}18`,letterSpacing:1}}>CLOUDYGETTY-AI // ENTROPY-ZERO</span>
+          <span style={{fontSize:6,color:`${color}18`,letterSpacing:1}}>NVS-7.5 // CLASSIFIED</span>
         </div>
       </div>
+
+      {/* Gallery modal inline */}
+      {modal==="gallery"&&(
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.97)",zIndex:200,
+          display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease",overflowY:"auto"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+            padding:"10px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0}}>
+            <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>
+              CAPTURE LOG — {captures.length}
+            </span>
+            <button onClick={()=>setModal(null)} style={{padding:"4px 10px",background:"transparent",
+              border:`1px solid ${color}30`,borderRadius:2,color:`${color}70`,
+              fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:2,cursor:"pointer"}}>CLOSE</button>
+          </div>
+          <div style={{padding:10,display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,overflowY:"auto"}}>
+            {captures.length===0&&(
+              <div style={{gridColumn:"1/-1",textAlign:"center",padding:40,fontFamily:"'DM Mono',monospace",fontSize:9,color:`${color}35`,letterSpacing:1}}>
+                NO CAPTURES — ENABLE AUTO-CAP OR TAP 📷
+              </div>
+            )}
+            {captures.map((c,i)=>(
+              <div key={i} style={{display:"flex",flexDirection:"column",gap:3}}>
+                <img src={c.url} style={{width:"100%",borderRadius:2,border:`1px solid ${color}18`,display:"block"}} alt="cap"/>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <div>
+                    <div style={{fontSize:7,color:`${color}70`,fontFamily:"'DM Mono',monospace",letterSpacing:1}}>{c.label} {c.auto?"[AUTO]":"[SNAP]"}</div>
+                    <div style={{fontSize:6,color:`${color}40`,fontFamily:"'DM Mono',monospace"}}>{c.time}{c.targets>0?` • ${c.targets}TGT`:""}</div>
+                  </div>
+                  <a href={c.url} download={`nvs7-${c.ts}.png`} style={{fontSize:8,color,textDecoration:"none",border:`1px solid ${color}30`,padding:"2px 6px",borderRadius:1,fontFamily:"'DM Mono',monospace"}}>↓</a>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
