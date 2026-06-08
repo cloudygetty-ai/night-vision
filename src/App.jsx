@@ -373,15 +373,48 @@ function useCameraStream(constraints,enabled=true){
   const[error,setError]=useState(null);
   const[ready,setReady]=useState(false);
   const key=JSON.stringify(constraints)+String(enabled);
-  useEffect(()=>{
-    if(!enabled){setStream(s=>{s?.getTracks().forEach(t=>t.stop());return null;});setReady(false);return;}
-    let active=true;setReady(false);setError(null);
-    navigator.mediaDevices?.getUserMedia({video:{...constraints,width:{ideal:1920},height:{ideal:1080}},audio:false})
-      .then(s=>{if(!active){s.getTracks().forEach(t=>t.stop());return;}setStream(s);setReady(true);})
-      .catch(e=>{if(active)setError(e.message||"Camera unavailable");});
-    return()=>{active=false;};
+  const acquire=useCallback((active,onStream,onErr)=>{
+    navigator.mediaDevices?.getUserMedia({video:{...constraints,width:{ideal:1280},height:{ideal:720}},audio:false})
+      .then(s=>{if(!active())return s.getTracks().forEach(t=>t.stop());onStream(s);})
+      .catch(e=>{if(active())onErr(e.message||"Camera unavailable");});
   // eslint-disable-next-line
   },[key]);
+
+  useEffect(()=>{
+    if(!enabled){setStream(s=>{s?.getTracks().forEach(t=>t.stop());return null;});setReady(false);return;}
+    let live=true;
+    const isLive=()=>live;
+    setReady(false);setError(null);
+
+    const start=()=>acquire(isLive,s=>{
+      setStream(s);setReady(true);
+      // track ended = OS killed camera, restart
+      s.getVideoTracks().forEach(t=>{
+        t.onended=()=>{if(live){setReady(false);setTimeout(()=>start(),800);}};
+      });
+    },e=>setError(e));
+    start();
+
+    // visibilitychange: resume when tab comes back
+    const onVisible=()=>{
+      if(document.visibilityState==="visible"&&live){
+        setStream(s=>{
+          if(s){
+            const t=s.getVideoTracks()[0];
+            if(t&&t.readyState==="live")return s;
+            s.getTracks().forEach(t=>t.stop());
+          }
+          return null;
+        });
+        setReady(false);
+        setTimeout(()=>start(),300);
+      }
+    };
+    document.addEventListener("visibilitychange",onVisible);
+    return()=>{live=false;document.removeEventListener("visibilitychange",onVisible);};
+  // eslint-disable-next-line
+  },[key,acquire]);
+
   useEffect(()=>()=>stream?.getTracks().forEach(t=>t.stop()),[stream]);
   return{stream,error,ready};
 }
@@ -1059,7 +1092,23 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
 
   useEffect(()=>{
     if(!videoRef.current||!stream)return;
-    videoRef.current.srcObject=stream;videoRef.current.play().catch(()=>{});
+    const v=videoRef.current;
+    v.srcObject=stream;
+    v.play().catch(()=>{});
+    // stall watchdog: if currentTime doesn't advance for 2.5s, replay
+    let lastTime=-1,stallCount=0;
+    const watchdog=setInterval(()=>{
+      if(!v.srcObject)return;
+      if(v.currentTime===lastTime&&v.readyState>=2){
+        stallCount++;
+        if(stallCount>=2){
+          stallCount=0;
+          v.play().catch(()=>{});
+        }
+      } else { stallCount=0; }
+      lastTime=v.currentTime;
+    },2500);
+    return()=>clearInterval(watchdog);
   },[stream]);
 
   const renderLoop=useCallback(()=>{
