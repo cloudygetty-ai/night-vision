@@ -73,12 +73,85 @@ function applyCLAHE(data,w,h,tiles=6,clip=3.5){
     }
   }
 }
+
+// NVG-specific extreme CLAHE — 10x10 tiles, high clip, on green channel only
+function applyNVGCLAHE(data,w,h){
+  const tiles=10,clip=8.0;
+  const tW=Math.floor(w/tiles),tH=Math.floor(h/tiles);
+  // Extract green channel into temp array, equalize it, write back
+  const green=new Uint8Array(w*h);
+  for(let i=0;i<data.length;i+=4) green[i/4]=data[i+1];
+  for(let ty=0;ty<tiles;ty++)for(let tx=0;tx<tiles;tx++){
+    const x0=tx*tW,y0=ty*tH,x1=tx===tiles-1?w:x0+tW,y1=ty===tiles-1?h:y0+tH;
+    const hist=new Float32Array(256);let count=0;
+    for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){hist[green[y*w+x]]++;count++;}
+    const lim=(count/256)*clip;let ex=0;
+    for(let i=0;i<256;i++){if(hist[i]>lim){ex+=hist[i]-lim;hist[i]=lim;}}
+    const add=ex/256;for(let i=0;i<256;i++)hist[i]+=add;
+    const cdf=new Float32Array(256);cdf[0]=hist[0];
+    for(let i=1;i<256;i++)cdf[i]=cdf[i-1]+hist[i];
+    const cMin=cdf[0],cRange=Math.max(1,count-cMin);
+    for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){
+      green[y*w+x]=Math.round((cdf[green[y*w+x]]-cMin)/cRange*255);
+    }
+  }
+  // Write equalized green back
+  for(let i=0;i<data.length;i+=4) data[i+1]=green[i/4];
+}
+
+// Temporal frame stacking — accumulates N frames, extracts signal from noise
+// Returns blended luminance map
+function stackFrames(data,stackBuf,stackIdx,stackSize){
+  const n=data.length/4;
+  if(!stackBuf.current||stackBuf.current.length!==stackSize*n){
+    stackBuf.current=new Float32Array(stackSize*n);
+    stackIdx.current=0;
+  }
+  const idx=stackIdx.current%stackSize;
+  for(let i=0;i<n;i++){
+    const d=i*4;
+    stackBuf.current[idx*n+i]=0.299*data[d]+0.587*data[d+1]+0.114*data[d+2];
+  }
+  stackIdx.current++;
+  const filled=Math.min(stackIdx.current,stackSize);
+  if(filled<2)return null;
+  // Average across stack
+  const avg=new Float32Array(n);
+  for(let f=0;f<filled;f++) for(let i=0;i<n;i++) avg[i]+=stackBuf.current[f*n+i];
+  for(let i=0;i<n;i++) avg[i]/=filled;
+  return avg;
+}
 function temporalBlend(data,history,alpha=0.75){
   if(!history||history.length!==data.length)return;
   for(let i=0;i<data.length;i+=4){
     data[i]=data[i]*alpha+history[i]*(1-alpha);
     data[i+1]=data[i+1]*alpha+history[i+1]*(1-alpha);
     data[i+2]=data[i+2]*alpha+history[i+2]*(1-alpha);
+  }
+}
+
+// Phosphor bloom: soft-glow on bright green pixels (real NVG has halation)
+function applyPhosphorBloom(data,w,h){
+  // Box-blur the green channel at 4px radius, add back scaled
+  const g=new Float32Array(w*h);
+  for(let i=0;i<data.length;i+=4) g[i/4]=data[i+1];
+  const blurred=new Float32Array(w*h);
+  const r=4;
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+    let sum=0,cnt=0;
+    for(let dy=-r;dy<=r;dy++)for(let dx=-r;dx<=r;dx++){
+      const nx=x+dx,ny=y+dy;
+      if(nx>=0&&nx<w&&ny>=0&&ny<h){sum+=g[ny*w+nx];cnt++;}
+    }
+    blurred[y*w+x]=sum/cnt;
+  }
+  // Add glow: brighter pixels bloom more
+  for(let i=0;i<data.length;i+=4){
+    const pi=i/4;
+    const glow=blurred[pi]*0.35;
+    data[i+1]=Math.min(255,data[i+1]+glow);
+    // Slight red tint at peak brightness (real P43 phosphor characteristic)
+    if(data[i+1]>200) data[i]=Math.min(255,data[i]+data[i+1]*0.04);
   }
 }
 function findBlobs(motionMap,w,h,minSize=60){
@@ -164,13 +237,31 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
 
   let edges=null;
   if(edgeOverlay)edges=sobelEdges(data,sw,sh);
-  if(mode==="NVG"||mode==="WHITE"||mode==="FUSION")applyCLAHE(data,sw,sh,6,3.5);
 
-  const bri=(mode==="NVG"?2.8:mode==="WHITE"?3.0:2.0)+brightness;
-  const con=mode==="NVG"?1.9:mode==="WHITE"?2.4:2.1;
-  const mid=128;
   const lut=LUTS[lutName]||null;
   const tempSamples=[];
+
+  // NVG: extreme processing pipeline
+  let stackedLum=null;
+  if(mode==="NVG"){
+    // Step 1: frame stacking (8 frames) to pull signal from sensor noise
+    stackedLum=stackFrames(data,refs.stackBuf,refs.stackIdx,8);
+    // Step 2: apply stacked luminance back into green channel before CLAHE
+    if(stackedLum){
+      for(let i=0;i<data.length;i+=4){
+        const sl=Math.min(255,stackedLum[i/4]*1.6);
+        data[i]=sl*0.03; data[i+1]=sl; data[i+2]=sl*0.02;
+      }
+    }
+    // Step 3: extreme CLAHE on green channel only
+    applyNVGCLAHE(data,sw,sh);
+  } else if(mode==="WHITE"||mode==="FUSION"){
+    applyCLAHE(data,sw,sh,6,3.5);
+  }
+
+  const bri=(mode==="NVG"?4.5:mode==="WHITE"?3.0:2.0)+brightness*1.5;
+  const con=mode==="NVG"?2.8:mode==="WHITE"?2.4:2.1;
+  const mid=128;
 
   for(let i=0;i<data.length;i+=4){
     const r=data[i],g=data[i+1],b=data[i+2];
@@ -178,8 +269,15 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
     const boosted=Math.max(0,Math.min(255,(lum*bri-mid)*con+mid));
     const pIdx=i/4;
     if(mode==="NVG"){
-      data[i]=Math.min(255,boosted*0.04);data[i+1]=Math.min(255,boosted*1.2);data[i+2]=Math.min(255,boosted*0.03);
-      const n=(Math.random()-.5)*5;data[i+1]=Math.max(0,Math.min(255,data[i+1]+n));
+      // Use boosted luminance → pure green, crush red/blue to near zero
+      const v=Math.min(255,boosted);
+      data[i]=Math.min(255,v*0.03);
+      data[i+1]=Math.min(255,v);
+      data[i+2]=Math.min(255,v*0.02);
+      // Authentic phosphor noise: coarser at low signal, fine at high
+      const noiseAmt=v<80?14:v<160?8:4;
+      const n=(Math.random()-.5)*noiseAmt;
+      data[i+1]=Math.max(0,Math.min(255,data[i+1]+n));
     }else if(mode==="THERMAL"||mode==="RAINBOW"||mode==="FUSION"){
       const al=lut||LUTS.THERMAL;const li=Math.min(255,Math.round(boosted));
       data[i]=al[li*3];data[i+1]=al[li*3+1];data[i+2]=al[li*3+2];
@@ -207,11 +305,29 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
     }
   }
 
+  // Phosphor bloom pass (NVG only) — after pixel processing, before output
+  if(mode==="NVG") applyPhosphorBloom(data,sw,sh);
+
   rawCtx.putImageData(imageData,0,0);
   const dCtx=dispCanvas.getContext("2d");
   dCtx.drawImage(rawCanvas,0,0);
-  dCtx.fillStyle="rgba(0,0,0,0.04)";
-  for(let y=0;y<sh;y+=3)dCtx.fillRect(0,y,sw,1);
+
+  if(mode==="NVG"){
+    // Scanlines: alternating rows dark (real image intensifier tube artifact)
+    dCtx.fillStyle="rgba(0,0,0,0.10)";
+    for(let y=0;y<sh;y+=2)dCtx.fillRect(0,y,sw,1);
+    // Center brightness falloff (tube curvature)
+    const cg=dCtx.createRadialGradient(sw/2,sh/2,sh*0.05,sw/2,sh/2,sh*0.75);
+    cg.addColorStop(0,"rgba(0,20,0,0)");
+    cg.addColorStop(0.7,"rgba(0,10,0,0.1)");
+    cg.addColorStop(1,"rgba(0,0,0,0.55)");
+    dCtx.fillStyle=cg;dCtx.fillRect(0,0,sw,sh);
+    // Subtle green ambient glow overlay
+    dCtx.fillStyle="rgba(0,255,60,0.03)";dCtx.fillRect(0,0,sw,sh);
+  } else {
+    dCtx.fillStyle="rgba(0,0,0,0.04)";
+    for(let y=0;y<sh;y+=3)dCtx.fillRect(0,y,sw,1);
+  }
   const vg=dCtx.createRadialGradient(sw/2,sh/2,sh*0.1,sw/2,sh/2,sh*0.9);
   vg.addColorStop(0,"rgba(0,0,0,0)");vg.addColorStop(.7,"rgba(0,0,0,0)");vg.addColorStop(1,"rgba(0,0,0,0.75)");
   dCtx.fillStyle=vg;dCtx.fillRect(0,0,sw,sh);
@@ -1218,6 +1334,7 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
   onCapture,onMotionEvent,onTripwireHit,onRPPG,compact=false}){
   const videoRef=useRef(null),rawRef=useRef(null),dispRef=useRef(null),rafRef=useRef(null);
   const prevRef=useRef(null),motRef=useRef(null),cooldown=useRef(0),fpsRef=useRef({frames:0,last:performance.now()});
+  const stackBuf=useRef(null),stackIdx=useRef(0);
   const[blobs,setBlobs]=useState([]);const[motionLevel,setMotionLevel]=useState(0);
   const[tempData,setTempData]=useState(null);const[cameraSize,setCameraSize]=useState({w:1280,h:720});
   const[fps,setFps]=useState(0);const[flash,setFlash]=useState(false);const[autoCapPending,setAutoCapPending]=useState(false);
@@ -1249,7 +1366,7 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
     if(video&&raw&&disp){
       const result=processFrame(video,raw,disp,
         {mode,brightness,sensitivity,edgeOverlay,noiseReduction,lutName:MODE_LUT[mode]||null,tripwires,showRPPG},
-        {prev:prevRef,motion:motRef}
+        {prev:prevRef,motion:motRef,stackBuf,stackIdx}
       );
       if(result){
         setCameraSize({w:result.sw,h:result.sh});
