@@ -427,94 +427,240 @@ function useTimeline(){
 // ═══════════════════════════════════════════════════════════════════════════════
 // GPS MAP MODAL
 // ═══════════════════════════════════════════════════════════════════════════════
+// Tile helpers for OSM slippy map
+function latLonToTile(lat,lon,z){
+  const n=Math.pow(2,z);
+  const x=Math.floor((lon+180)/360*n);
+  const y=Math.floor((1-Math.log(Math.tan(lat*Math.PI/180)+1/Math.cos(lat*Math.PI/180))/Math.PI)/2*n);
+  return{x,y,z};
+}
+function tileToLatLon(tx,ty,z){
+  const n=Math.pow(2,z);
+  const lon=tx/n*360-180;
+  const latRad=Math.atan(Math.sinh(Math.PI*(1-2*ty/n)));
+  return{lat:latRad*180/Math.PI,lon};
+}
+
 function GPSMap({pos,events,color,onClose}){
+  const mapRef=useRef(null);
   const canvasRef=useRef(null);
+  const[zoom,setZoom]=useState(16);
+  const[center,setCenter]=useState(null);
   const[pins,setPins]=useState([]);
+  const tileCache=useRef({});
+  const dragging=useRef(null);
+  const centerRef=useRef(null);
+
+  // sync center ref
+  useEffect(()=>{centerRef.current=center;},[center]);
+
+  // init center from GPS
   useEffect(()=>{
-    const motEvents=events.filter(e=>e.type==="motion"&&e.data?.lat).slice(0,50);
-    setPins(motEvents.map(e=>({lat:e.data.lat,lon:e.data.lon,ts:e.ts,label:e.data.label||"MOT"})));
+    if(pos&&!center)setCenter({lat:pos.lat,lon:pos.lon});
+  },[pos]);// eslint-disable-line
+
+  // update pins from events
+  useEffect(()=>{
+    const m=events.filter(e=>e.type==="motion"&&e.data?.lat).slice(0,50);
+    setPins(m.map(e=>({lat:e.data.lat,lon:e.data.lon,label:e.data.label||"MOT"})));
   },[events]);
 
-  useEffect(()=>{
-    const c=canvasRef.current;if(!c)return;
+  const draw=useCallback(()=>{
+    const c=canvasRef.current;
+    if(!c)return;
+    const ctr=centerRef.current;
     const ctx=c.getContext("2d");
-    const w=c.width=c.offsetWidth||300,h=c.height=c.offsetHeight||300;
-    ctx.fillStyle="#050a05";ctx.fillRect(0,0,w,h);
-    // Grid
-    ctx.strokeStyle="rgba(0,255,80,0.08)";ctx.lineWidth=1;
-    for(let x=0;x<w;x+=30){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke();}
-    for(let y=0;y<h;y+=30){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
-    if(!pos){
-      ctx.fillStyle=color;ctx.font="10px DM Mono, monospace";
-      ctx.textAlign="center";ctx.fillText("GPS ACQUIRING...",w/2,h/2);
+    const W=c.parentElement?.clientWidth||window.innerWidth;
+    const H=c.parentElement?.clientHeight||400;
+    c.width=W;c.height=H;
+    ctx.fillStyle="#0a0f0a";ctx.fillRect(0,0,W,H);
+
+    if(!ctr){
+      ctx.fillStyle=color;ctx.font="bold 11px DM Mono,monospace";ctx.textAlign="center";
+      ctx.fillText("GPS ACQUIRING...",W/2,H/2-8);
+      ctx.font="9px DM Mono,monospace";ctx.fillStyle=`${color}60`;
+      ctx.fillText("Allow location permission",W/2,H/2+10);
       return;
     }
-    // Center = current pos
-    const toXY=(lat,lon)=>{
-      const scale=2000;
-      const x=w/2+(lon-pos.lon)*scale;
-      const y=h/2-(lat-pos.lat)*scale;
-      return{x,y};
+
+    // tile size in pixels
+    const TILE=256;
+    const z=zoom;
+    const cTile=latLonToTile(ctr.lat,ctr.lon,z);
+    // pixel offset of center within its tile
+    const n=Math.pow(2,z);
+    const cx_exact=(ctr.lon+180)/360*n;
+    const cy_exact=(1-Math.log(Math.tan(ctr.lat*Math.PI/180)+1/Math.cos(ctr.lat*Math.PI/180))/Math.PI)/2*n;
+    const offX=(cx_exact-cTile.x)*TILE;
+    const offY=(cy_exact-cTile.y)*TILE;
+
+    // how many tiles needed
+    const tilesX=Math.ceil(W/TILE)+2;
+    const tilesY=Math.ceil(H/TILE)+2;
+    const startTX=cTile.x-Math.floor(tilesX/2);
+    const startTY=cTile.y-Math.floor(tilesY/2);
+
+    // draw tiles
+    for(let ty=0;ty<tilesY;ty++){
+      for(let tx=0;tx<tilesX;tx++){
+        const tileX=((startTX+tx)%n+n)%n;
+        const tileY=startTY+ty;
+        if(tileY<0||tileY>=n)continue;
+        const px=W/2-offX+(tx-Math.floor(tilesX/2))*TILE;
+        const py=H/2-offY+(ty-Math.floor(tilesY/2))*TILE;
+        const key=`${z}/${tileX}/${tileY}`;
+        if(tileCache.current[key]&&tileCache.current[key].complete){
+          ctx.drawImage(tileCache.current[key],px,py,TILE,TILE);
+          // NVG green tint over tile
+          ctx.fillStyle="rgba(0,30,0,0.55)";ctx.fillRect(px,py,TILE,TILE);
+          // green channel boost via globalCompositeOperation already applied above
+        } else if(!tileCache.current[key]){
+          const img=new Image();img.crossOrigin="anonymous";
+          img.src=`https://tile.openstreetmap.org/${z}/${tileX}/${tileY}.png`;
+          img.onload=()=>draw();
+          tileCache.current[key]=img;
+          ctx.fillStyle="#0a120a";ctx.fillRect(px,py,TILE,TILE);
+          ctx.strokeStyle="rgba(0,255,80,0.06)";ctx.strokeRect(px,py,TILE,TILE);
+        } else {
+          ctx.fillStyle="#0a120a";ctx.fillRect(px,py,TILE,TILE);
+        }
+      }
+    }
+
+    // Grid overlay
+    ctx.strokeStyle="rgba(0,255,80,0.07)";ctx.lineWidth=1;
+    for(let x=0;x<W;x+=60){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}
+    for(let y=0;y<H;y+=60){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
+
+    // lat/lon to pixel helper
+    const toScreen=(lat,lon)=>{
+      const lx=(lon+180)/360*n;
+      const ly=(1-Math.log(Math.tan(lat*Math.PI/180)+1/Math.cos(lat*Math.PI/180))/Math.PI)/2*n;
+      return{x:W/2+(lx-cx_exact)*TILE,y:H/2+(ly-cy_exact)*TILE};
     };
-    // Compass ring
-    ctx.beginPath();ctx.arc(w/2,h/2,60,0,Math.PI*2);
-    ctx.strokeStyle="rgba(0,255,80,0.15)";ctx.lineWidth=1;ctx.stroke();
-    ctx.beginPath();ctx.arc(w/2,h/2,120,0,Math.PI*2);
-    ctx.strokeStyle="rgba(0,255,80,0.08)";ctx.stroke();
-    // My position
-    ctx.beginPath();ctx.arc(w/2,h/2,6,0,Math.PI*2);
-    ctx.fillStyle=color;ctx.fill();
-    ctx.beginPath();ctx.arc(w/2,h/2,12,0,Math.PI*2);
-    ctx.strokeStyle=`${color}80`;ctx.lineWidth=1.5;ctx.stroke();
-    // Accuracy ring
-    if(pos.acc){
-      const r=Math.min(100,pos.acc/2);
-      ctx.beginPath();ctx.arc(w/2,h/2,r,0,Math.PI*2);
-      ctx.strokeStyle="rgba(0,255,80,0.2)";ctx.lineWidth=1;ctx.setLineDash([3,4]);ctx.stroke();ctx.setLineDash([]);
-    }
-    // Pins
+
+    // Motion pins
     for(const pin of pins){
-      const{x,y}=toXY(pin.lat,pin.lon);
-      if(x<0||x>w||y<0||y>h)continue;
-      ctx.beginPath();ctx.arc(x,y,4,0,Math.PI*2);
+      const{x,y}=toScreen(pin.lat,pin.lon);
+      ctx.beginPath();ctx.arc(x,y,5,0,Math.PI*2);
       ctx.fillStyle="#ff5500";ctx.fill();
-      ctx.fillStyle="rgba(255,85,0,0.8)";ctx.font="7px DM Mono, monospace";
-      ctx.fillText(pin.label,x+6,y-2);
+      ctx.beginPath();ctx.arc(x,y,10,0,Math.PI*2);
+      ctx.strokeStyle="rgba(255,85,0,0.5)";ctx.lineWidth=1;ctx.stroke();
+      ctx.fillStyle="#ff8800";ctx.font="bold 8px DM Mono,monospace";ctx.textAlign="left";
+      ctx.fillText(pin.label,x+7,y+3);
     }
-    // Coords
-    ctx.fillStyle="rgba(0,255,80,0.6)";ctx.font="8px DM Mono, monospace";
-    ctx.textAlign="left";
-    ctx.fillText(`${pos.lat.toFixed(5)}°N`,8,h-20);
-    ctx.fillText(`${pos.lon.toFixed(5)}°W`,8,h-10);
-    ctx.textAlign="center";
-    ctx.fillStyle="rgba(0,255,80,0.4)";ctx.font="7px DM Mono, monospace";
-    ctx.fillText("N",w/2,h/2-65);ctx.fillText("S",w/2,h/2+72);
-    ctx.fillText("W",w/2-67,h/2+3);ctx.fillText("E",w/2+67,h/2+3);
-  },[pos,pins,color]);
+
+    // GPS position dot (live)
+    if(pos){
+      const{x,y}=toScreen(pos.lat,pos.lon);
+      // Accuracy circle
+      if(pos.acc){
+        const metersPerPx=156543.03392*Math.cos(pos.lat*Math.PI/180)/Math.pow(2,z);
+        const r=Math.min(80,(pos.acc/metersPerPx));
+        ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);
+        ctx.fillStyle="rgba(0,255,80,0.07)";ctx.fill();
+        ctx.strokeStyle="rgba(0,255,80,0.25)";ctx.lineWidth=1;ctx.setLineDash([3,4]);ctx.stroke();ctx.setLineDash([]);
+      }
+      // Outer ring pulse
+      ctx.beginPath();ctx.arc(x,y,14,0,Math.PI*2);
+      ctx.strokeStyle=`${color}60`;ctx.lineWidth=1.5;ctx.stroke();
+      // Inner dot
+      ctx.beginPath();ctx.arc(x,y,6,0,Math.PI*2);
+      ctx.fillStyle=color;ctx.shadowColor=color;ctx.shadowBlur=12;ctx.fill();
+      ctx.shadowBlur=0;
+      // You-are-here label
+      ctx.fillStyle=color;ctx.font="bold 8px DM Mono,monospace";ctx.textAlign="center";
+      ctx.fillText("YOU",x,y-18);
+    }
+
+    // Crosshair center
+    ctx.strokeStyle=`${color}30`;ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(W/2-20,H/2);ctx.lineTo(W/2+20,H/2);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(W/2,H/2-20);ctx.lineTo(W/2,H/2+20);ctx.stroke();
+
+    // Coords footer
+    ctx.fillStyle=`${color}80`;ctx.font="9px DM Mono,monospace";ctx.textAlign="left";
+    ctx.fillText(`${ctr.lat.toFixed(5)}°N  ${ctr.lon.toFixed(5)}°W`,8,H-8);
+    ctx.textAlign="right";
+    ctx.fillText(`Z${z}`,W-8,H-8);
+  },[zoom,pins,pos,color]);
+
+  // Redraw on any change
+  useEffect(()=>{draw();},[draw,center]);
+
+  // ResizeObserver so canvas fills container correctly
+  useEffect(()=>{
+    const el=canvasRef.current?.parentElement;
+    if(!el)return;
+    const ro=new ResizeObserver(()=>draw());
+    ro.observe(el);
+    return()=>ro.disconnect();
+  },[draw]);
+
+  // Touch/mouse pan
+  const onPointerDown=e=>{
+    dragging.current={x:e.clientX,y:e.clientY,center:{...centerRef.current}};
+  };
+  const onPointerMove=e=>{
+    if(!dragging.current)return;
+    const dx=e.clientX-dragging.current.x;
+    const dy=e.clientY-dragging.current.y;
+    const n=Math.pow(2,zoom);
+    const metersPerPx=156543.03392*Math.cos(dragging.current.center.lat*Math.PI/180)/Math.pow(2,zoom);
+    const degPerPx=metersPerPx/111320;
+    const newLat=dragging.current.center.lat+dy*degPerPx;
+    const newLon=dragging.current.center.lon-dx*degPerPx*Math.cos(dragging.current.center.lat*Math.PI/180);
+    setCenter({lat:newLat,lon:newLon});
+  };
+  const onPointerUp=()=>{dragging.current=null;};
 
   return(
-    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.97)",zIndex:200,
+    <div style={{position:"fixed",inset:0,background:"#0a0f0a",zIndex:200,
       display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease"}}>
+      {/* Header */}
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
-        padding:"10px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0}}>
+        padding:"8px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0,
+        background:"rgba(0,0,0,0.8)"}}>
         <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>
           GPS TACTICAL MAP
         </span>
         <div style={{display:"flex",gap:8,alignItems:"center"}}>
-          {pos&&<span style={{fontSize:8,color:`${color}70`,fontFamily:"'DM Mono',monospace",letterSpacing:1}}>
-            ACC ±{pos.acc?.toFixed(0)}m
+          {pos&&<span style={{fontSize:7,color:`${color}60`,fontFamily:"'DM Mono',monospace",letterSpacing:1}}>
+            {pos.lat.toFixed(4)}°N {pos.lon.toFixed(4)}°W ±{pos.acc?.toFixed(0)}m
           </span>}
+          {/* Zoom controls */}
+          <button onClick={()=>setZoom(z=>Math.min(19,z+1))} style={{width:24,height:24,background:`${color}15`,
+            border:`1px solid ${color}40`,borderRadius:2,color,fontSize:14,cursor:"pointer",lineHeight:1}}>+</button>
+          <span style={{fontSize:8,color:`${color}70`,fontFamily:"'DM Mono',monospace",minWidth:20,textAlign:"center"}}>Z{zoom}</span>
+          <button onClick={()=>setZoom(z=>Math.max(2,z-1))} style={{width:24,height:24,background:`${color}15`,
+            border:`1px solid ${color}40`,borderRadius:2,color,fontSize:14,cursor:"pointer",lineHeight:1}}>−</button>
+          {pos&&<button onClick={()=>setCenter({lat:pos.lat,lon:pos.lon})} style={{padding:"2px 8px",background:`${color}10`,
+            border:`1px solid ${color}30`,borderRadius:2,color:`${color}90`,
+            fontFamily:"'DM Mono',monospace",fontSize:7,letterSpacing:1,cursor:"pointer"}}>
+            ◎ CTR
+          </button>}
           <button onClick={onClose} style={{padding:"4px 10px",background:"transparent",
             border:`1px solid ${color}30`,borderRadius:2,color:`${color}70`,
             fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:2,cursor:"pointer"}}>
-            CLOSE
+            ✕
           </button>
         </div>
       </div>
-      <canvas ref={canvasRef} style={{flex:1,width:"100%"}}/>
-      <div style={{padding:"6px 14px",borderTop:`1px solid ${color}10`,
-        fontFamily:"'DM Mono',monospace",fontSize:7,color:`${color}40`,letterSpacing:1}}>
-        ORANGE PINS = MOTION EVENTS • {pins.length} LOGGED
+      {/* Map canvas */}
+      <div style={{flex:1,position:"relative",overflow:"hidden",cursor:"grab"}}
+        onPointerDown={onPointerDown} onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp} onPointerLeave={onPointerUp}>
+        <canvas ref={canvasRef} style={{display:"block",width:"100%",height:"100%"}}/>
+      </div>
+      {/* Footer */}
+      <div style={{padding:"5px 14px",borderTop:`1px solid ${color}10`,
+        display:"flex",justifyContent:"space-between",background:"rgba(0,0,0,0.8)",flexShrink:0}}>
+        <span style={{fontFamily:"'DM Mono',monospace",fontSize:7,color:`${color}40`,letterSpacing:1}}>
+          🟠 {pins.length} MOTION PINS • DRAG TO PAN • +/− TO ZOOM
+        </span>
+        <span style={{fontFamily:"'DM Mono',monospace",fontSize:7,color:`${color}25`,letterSpacing:1}}>
+          OSM TILES
+        </span>
       </div>
     </div>
   );
