@@ -178,7 +178,7 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
     const boosted=Math.max(0,Math.min(255,(lum*bri-mid)*con+mid));
     const pIdx=i/4;
     if(mode==="NVG"){
-      data[i]=Math.min(255,boosted*0.06);data[i+1]=Math.min(255,boosted*1.05+g*0.12);data[i+2]=Math.min(255,boosted*0.05);
+      data[i]=Math.min(255,boosted*0.04);data[i+1]=Math.min(255,boosted*1.2);data[i+2]=Math.min(255,boosted*0.03);
       const n=(Math.random()-.5)*5;data[i+1]=Math.max(0,Math.min(255,data[i+1]+n));
     }else if(mode==="THERMAL"||mode==="RAINBOW"||mode==="FUSION"){
       const al=lut||LUTS.THERMAL;const li=Math.min(255,Math.round(boosted));
@@ -952,8 +952,8 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
   useEffect(()=>{rafRef.current=requestAnimationFrame(renderLoop);return()=>cancelAnimationFrame(rafRef.current);},[renderLoop]);
 
   return(
-    <div style={{position:"relative",width:"100%",aspectRatio:compact?"1/1":"4/3",background:"#010801",overflow:"hidden",border:`1px solid ${color}12`}}>
-      <video ref={videoRef} muted playsInline autoPlay style={{position:"absolute",opacity:0,pointerEvents:"none",width:1,height:1}}/>
+    <div style={{position:"relative",width:"100%",flex:1,minHeight:0,background:"#010801",overflow:"hidden",border:`1px solid ${color}12`}}>
+      <video ref={videoRef} muted playsInline autoPlay style={{position:"absolute",opacity:0,pointerEvents:"none",width:"100%",height:"100%",objectFit:"cover"}}/>
       <canvas ref={rawRef} style={{display:"none"}}/>
       <canvas ref={dispRef} data-primary={label==="REAR"?"true":undefined} style={{width:"100%",height:"100%",display:"block",
         transform:`scale(${zoom})`,transformOrigin:"center",transition:"transform 0.15s ease",
@@ -1129,7 +1129,7 @@ export default function NightVisionCamera(){
   const hasTripwire=tripwires.some(t=>t.triggered);
 
   return(
-    <div style={{minHeight:"100vh",background:"#000",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'DM Mono',monospace",overflowY:"auto"}}>
+    <div style={{height:"100dvh",background:"#000",display:"flex",flexDirection:"column",fontFamily:"'DM Mono',monospace",overflow:"hidden"}}>
       <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet"/>
       <style>{`
         @keyframes nvg-scan{0%{top:-3px;opacity:0}5%{opacity:.9}95%{opacity:.5}100%{top:100%;opacity:0}}
@@ -1147,7 +1147,7 @@ export default function NightVisionCamera(){
       {modal==="timeline"&&<TimelineModal events={events} captures={captures} color={color} onClose={()=>setModal(null)}/>}
       {modal==="tripwire"&&<TripwireEditor tripwires={tripwires} onUpdate={setTripwires} color={color} onClose={()=>setModal(null)}/>}
 
-      <div style={{width:"100%",maxWidth:dualMode?560:480,display:"flex",flexDirection:"column",background:"#000",border:`1px solid ${color}18`,animation:"fade-in 0.4s ease"}}>
+      <div style={{width:"100%",height:"100%",display:"flex",flexDirection:"column",background:"#000",border:`1px solid ${color}18`,animation:"fade-in 0.4s ease",overflow:"hidden"}}>
 
         {/* HEADER */}
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 14px",borderBottom:`1px solid ${color}15`}}>
@@ -1175,7 +1175,7 @@ export default function NightVisionCamera(){
 
         {/* CAMERAS */}
         {dualMode?(
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:1,background:`${color}08`}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:1,background:`${color}08`,flex:1,minHeight:0}}>
             <CameraPanel stream={rear.stream} ready={rear.ready} error={rear.error} label="REAR"
               mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
               noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
@@ -1190,7 +1190,7 @@ export default function NightVisionCamera(){
               onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={true}/>
           </div>
         ):(
-          <div style={{position:"relative"}}>
+          <div style={{flex:1,minHeight:0,display:"flex",flexDirection:"column"}}>
             <CameraPanel stream={rear.stream} ready={rear.ready} error={rear.error} label="REAR"
               mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
               noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
