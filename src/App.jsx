@@ -241,9 +241,12 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
   const lut=LUTS[lutName]||null;
   const tempSamples=[];
 
+  // Day vision modes skip NVG/thermal pipeline entirely
+  const isDayMode=mode==="TACT"||mode==="HAZE"||mode==="POLAR";
+
   // NVG: extreme processing pipeline
   let stackedLum=null;
-  if(mode==="NVG"){
+  if(mode==="NVG"&&!isDayMode){
     // Step 1: frame stacking (8 frames) to pull signal from sensor noise
     stackedLum=stackFrames(data,refs.stackBuf,refs.stackIdx,8);
     // Step 2: apply stacked luminance back into green channel before CLAHE
@@ -255,12 +258,12 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
     }
     // Step 3: extreme CLAHE on green channel only
     applyNVGCLAHE(data,sw,sh);
-  } else if(mode==="WHITE"||mode==="FUSION"){
+  } else if((mode==="WHITE"||mode==="FUSION")&&!isDayMode){
     applyCLAHE(data,sw,sh,6,3.5);
   }
 
-  const bri=(mode==="NVG"?4.5:mode==="WHITE"?3.0:2.0)+brightness*1.5;
-  const con=mode==="NVG"?2.8:mode==="WHITE"?2.4:2.1;
+  const bri=isDayMode?1.0:(mode==="NVG"?4.5:mode==="WHITE"?3.0:2.0)+brightness*1.5;
+  const con=isDayMode?1.0:(mode==="NVG"?2.8:mode==="WHITE"?2.4:2.1);
   const mid=128;
 
   for(let i=0;i<data.length;i+=4){
@@ -286,6 +289,9 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
     }else if(mode==="BLUE"){
       data[i]=Math.min(255,boosted*0.12);data[i+1]=Math.min(255,boosted*0.32);data[i+2]=Math.min(255,boosted*1.15+b*0.25);
       const n=(Math.random()-.5)*7;data[i+2]=Math.max(0,Math.min(255,data[i+2]+n));
+    }else if(mode==="TACT"||mode==="HAZE"||mode==="POLAR"){
+      // Day modes: pass-through raw color here, process in bulk below
+      data[i]=r;data[i+1]=g;data[i+2]=b;
     }else{const w2=Math.min(255,boosted);data[i]=data[i+1]=data[i+2]=w2;}
 
     if(edgeOverlay&&edges){
@@ -308,6 +314,11 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
   // Phosphor bloom pass (NVG only) — after pixel processing, before output
   if(mode==="NVG") applyPhosphorBloom(data,sw,sh);
 
+  // Day vision bulk passes (operate on full frame after pixel loop)
+  if(mode==="TACT") applyTactical(data,sw,sh,brightness);
+  if(mode==="HAZE") { applyDehaze(data,sw,sh,0.65); applyUnsharpMask(data,sw,sh,1.2,2); }
+  if(mode==="POLAR") applyPolarize(data,sw,sh);
+
   rawCtx.putImageData(imageData,0,0);
   const dCtx=dispCanvas.getContext("2d");
   dCtx.drawImage(rawCanvas,0,0);
@@ -324,6 +335,28 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
     dCtx.fillStyle=cg;dCtx.fillRect(0,0,sw,sh);
     // Subtle green ambient glow overlay
     dCtx.fillStyle="rgba(0,255,60,0.03)";dCtx.fillRect(0,0,sw,sh);
+  } else if(mode==="TACT"){
+    // Tactical: amber HUD tint + faint grid overlay
+    dCtx.fillStyle="rgba(255,220,50,0.03)";dCtx.fillRect(0,0,sw,sh);
+    dCtx.strokeStyle="rgba(255,220,50,0.05)";dCtx.lineWidth=1;
+    for(let x=0;x<sw;x+=40){dCtx.beginPath();dCtx.moveTo(x,0);dCtx.lineTo(x,sh);dCtx.stroke();}
+    for(let y=0;y<sh;y+=40){dCtx.beginPath();dCtx.moveTo(0,y);dCtx.lineTo(sw,y);dCtx.stroke();}
+    // Sharp vignette
+    const tv=dCtx.createRadialGradient(sw/2,sh/2,sh*0.3,sw/2,sh/2,sh*0.75);
+    tv.addColorStop(0,"rgba(0,0,0,0)");tv.addColorStop(1,"rgba(0,0,0,0.45)");
+    dCtx.fillStyle=tv;dCtx.fillRect(0,0,sw,sh);
+  } else if(mode==="HAZE"){
+    // Dehaze: cool blue clarifying tint
+    dCtx.fillStyle="rgba(80,200,255,0.04)";dCtx.fillRect(0,0,sw,sh);
+    const hv=dCtx.createRadialGradient(sw/2,sh/2,sh*0.4,sw/2,sh/2,sh*0.85);
+    hv.addColorStop(0,"rgba(0,0,0,0)");hv.addColorStop(1,"rgba(0,0,0,0.35)");
+    dCtx.fillStyle=hv;dCtx.fillRect(0,0,sw,sh);
+  } else if(mode==="POLAR"){
+    // Polarize: pink-magenta frame tint
+    dCtx.fillStyle="rgba(255,80,180,0.04)";dCtx.fillRect(0,0,sw,sh);
+    const pv=dCtx.createRadialGradient(sw/2,sh/2,sh*0.35,sw/2,sh/2,sh*0.8);
+    pv.addColorStop(0,"rgba(0,0,0,0)");pv.addColorStop(1,"rgba(0,0,0,0.40)");
+    dCtx.fillStyle=pv;dCtx.fillRect(0,0,sw,sh);
   } else {
     dCtx.fillStyle="rgba(0,0,0,0.04)";
     for(let y=0;y<sh;y+=3)dCtx.fillRect(0,y,sw,1);
@@ -533,6 +566,119 @@ function useCameraStream(constraints,enabled=true){
 
   useEffect(()=>()=>stream?.getTracks().forEach(t=>t.stop()),[stream]);
   return{stream,error,ready};
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DAY VISION PROCESSING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Unsharp mask — sharpens fine detail (tactical clarity enhancement)
+function applyUnsharpMask(data,w,h,amount=1.8,radius=2){
+  const n=w*h;
+  const lum=new Float32Array(n);
+  for(let i=0;i<data.length;i+=4)
+    lum[i/4]=0.299*data[i]+0.587*data[i+1]+0.114*data[i+2];
+  // box blur approximation
+  const blurred=new Float32Array(n);
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+    let sum=0,cnt=0;
+    for(let dy=-radius;dy<=radius;dy++)for(let dx=-radius;dx<=radius;dx++){
+      const nx=x+dx,ny=y+dy;
+      if(nx>=0&&nx<w&&ny>=0&&ny<h){sum+=lum[ny*w+nx];cnt++;}
+    }
+    blurred[y*w+x]=sum/cnt;
+  }
+  // sharpen = original + amount*(original - blurred)
+  for(let i=0;i<data.length;i+=4){
+    const pi=i/4;
+    const diff=lum[pi]-blurred[pi];
+    const scale=lum[pi]>0?(lum[pi]+diff*amount)/lum[pi]:1;
+    data[i]  =Math.max(0,Math.min(255,data[i]  *scale));
+    data[i+1]=Math.max(0,Math.min(255,data[i+1]*scale));
+    data[i+2]=Math.max(0,Math.min(255,data[i+2]*scale));
+  }
+}
+
+// Dark channel prior dehaze — removes atmospheric haze/glare
+function applyDehaze(data,w,h,strength=0.7){
+  const patch=7;
+  const n=w*h;
+  // Compute dark channel
+  const dark=new Float32Array(n);
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+    let minV=255;
+    for(let dy=-patch;dy<=patch;dy++)for(let dx=-patch;dx<=patch;dx++){
+      const nx=x+dx,ny=y+dy;
+      if(nx>=0&&nx<w&&ny>=0&&ny<h){
+        const i=(ny*w+nx)*4;
+        minV=Math.min(minV,data[i],data[i+1],data[i+2]);
+      }
+    }
+    dark[y*w+x]=minV;
+  }
+  // Estimate atmospheric light (top 0.1% brightest dark channel pixels)
+  const sorted=[...dark].sort((a,b)=>b-a);
+  const A=sorted[Math.floor(n*0.001)];
+  // Estimate transmission and recover scene
+  for(let i=0;i<data.length;i+=4){
+    const pi=i/4;
+    const t=Math.max(0.1,1-(strength*dark[pi]/Math.max(1,A)));
+    data[i]  =Math.min(255,Math.max(0,(data[i]  -A)/t+A));
+    data[i+1]=Math.min(255,Math.max(0,(data[i+1]-A)/t+A));
+    data[i+2]=Math.min(255,Math.max(0,(data[i+2]-A)/t+A));
+  }
+}
+
+// Polarize: cut specular highlights, boost saturation (polarized lens simulation)
+function applyPolarize(data,w,h){
+  for(let i=0;i<data.length;i+=4){
+    let r=data[i],g=data[i+1],b=data[i+2];
+    // Convert to HSL, boost S, reduce L on highlights
+    const max=Math.max(r,g,b)/255,min=Math.min(r,g,b)/255;
+    const l=(max+min)/2;
+    const d=max-min;
+    let s=d===0?0:d/(1-Math.abs(2*l-1));
+    // Boost saturation by 60%, crush glare (highlights above 0.85 L)
+    s=Math.min(1,s*1.6);
+    const lAdj=l>0.85?(l-0.85)*0.4+0.85*0.9:l; // compress highlights
+    // Back to RGB
+    const c=(1-Math.abs(2*lAdj-1))*s;
+    const hue=max===min?0:max===r/255?((g-b)/255/d+6)%6:max===g/255?(b-r)/255/d+2:(r-g)/255/d+4;
+    const x=c*(1-Math.abs(hue%2-1));
+    let r2=0,g2=0,b2=0;
+    if(hue<1){r2=c;g2=x;}else if(hue<2){r2=x;g2=c;}
+    else if(hue<3){g2=c;b2=x;}else if(hue<4){g2=x;b2=c;}
+    else if(hue<5){r2=x;b2=c;}else{r2=c;b2=x;}
+    const m=lAdj-c/2;
+    data[i]  =Math.min(255,Math.max(0,Math.round((r2+m)*255)));
+    data[i+1]=Math.min(255,Math.max(0,Math.round((g2+m)*255)));
+    data[i+2]=Math.min(255,Math.max(0,Math.round((b2+m)*255)));
+  }
+}
+
+// Tactical day enhancement: contrast stretch + color fidelity + HUD-safe palette
+function applyTactical(data,w,h,brightness){
+  // Auto-levels: stretch histogram per channel
+  const rMin=new Array(3).fill(255),rMax=new Array(3).fill(0);
+  for(let i=0;i<data.length;i+=4){
+    for(let c=0;c<3;c++){
+      if(data[i+c]<rMin[c])rMin[c]=data[i+c];
+      if(data[i+c]>rMax[c])rMax[c]=data[i+c];
+    }
+  }
+  // Apply levels + brightness boost + slight yellow-green tint (military CMOS filter)
+  const bBoost=1.15+brightness*0.5;
+  for(let i=0;i<data.length;i+=4){
+    const stretch=c=>{
+      const range=Math.max(1,rMax[c]-rMin[c]);
+      return Math.min(255,Math.max(0,Math.round(((data[i+c]-rMin[c])/range)*255*bBoost)));
+    };
+    data[i]  =Math.min(255,stretch(0)*0.88); // slight red reduction
+    data[i+1]=Math.min(255,stretch(1)*1.05); // slight green boost
+    data[i+2]=Math.min(255,stretch(2)*0.92); // slight blue reduction
+  }
+  // Unsharp mask for tactical clarity
+  applyUnsharpMask(data,w,h,1.4,2);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1462,9 +1608,15 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 const MODE_META={
-  NVG:{label:"NVG",color:"#00ff50"},THERMAL:{label:"THERMAL",color:"#ff5500"},
-  RAINBOW:{label:"RAINBOW",color:"#00ccff"},FUSION:{label:"FUSION",color:"#cc44ff"},
-  BLUE:{label:"ARCTIC",color:"#0088ff"},WHITE:{label:"WHT-HOT",color:"#dddddd"},
+  NVG:    {label:"NVG",    color:"#00ff50"},
+  THERMAL:{label:"THERMAL",color:"#ff5500"},
+  RAINBOW:{label:"RAINBOW",color:"#00ccff"},
+  FUSION: {label:"FUSION", color:"#cc44ff"},
+  BLUE:   {label:"ARCTIC", color:"#0088ff"},
+  WHITE:  {label:"WHT-HOT",color:"#dddddd"},
+  TACT:   {label:"TACT",   color:"#f0e060"},
+  HAZE:   {label:"DEHAZE", color:"#60d0ff"},
+  POLAR:  {label:"POLARIZ",color:"#ff60d0"},
 };
 const MODE_KEYS=Object.keys(MODE_META);
 const ZOOM_STEPS=[1,1.5,2,3,4,6,8,12];
