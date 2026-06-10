@@ -242,7 +242,7 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
   const tempSamples=[];
 
   // Day vision modes skip NVG/thermal pipeline entirely
-  const isDayMode=mode==="TACT"||mode==="HAZE"||mode==="POLAR";
+  const isDayMode=mode==="TACT"||mode==="HAZE"||mode==="POLAR"||mode==="RAW";
 
   // NVG: extreme processing pipeline
   let stackedLum=null;
@@ -289,8 +289,8 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
     }else if(mode==="BLUE"){
       data[i]=Math.min(255,boosted*0.12);data[i+1]=Math.min(255,boosted*0.32);data[i+2]=Math.min(255,boosted*1.15+b*0.25);
       const n=(Math.random()-.5)*7;data[i+2]=Math.max(0,Math.min(255,data[i+2]+n));
-    }else if(mode==="TACT"||mode==="HAZE"||mode==="POLAR"){
-      // Day modes: pass-through raw color here, process in bulk below
+    }else if(mode==="TACT"||mode==="HAZE"||mode==="POLAR"||mode==="RAW"){
+      // Day / raw modes: pass-through untouched
       data[i]=r;data[i+1]=g;data[i+2]=b;
     }else{const w2=Math.min(255,boosted);data[i]=data[i+1]=data[i+2]=w2;}
 
@@ -335,6 +335,8 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
     dCtx.fillStyle=cg;dCtx.fillRect(0,0,sw,sh);
     // Subtle green ambient glow overlay
     dCtx.fillStyle="rgba(0,255,60,0.03)";dCtx.fillRect(0,0,sw,sh);
+  } else if(mode==="RAW"){
+    // No overlay — pure passthrough, minimal vignette only
   } else if(mode==="TACT"){
     // Tactical: amber HUD tint + faint grid overlay
     dCtx.fillStyle="rgba(255,220,50,0.03)";dCtx.fillRect(0,0,sw,sh);
@@ -1762,6 +1764,7 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 const MODE_META={
+  RAW:    {label:"RAW",    color:"#ffffff"},
   NVG:    {label:"NVG",    color:"#00ff50"},
   THERMAL:{label:"THERMAL",color:"#ff5500"},
   RAINBOW:{label:"RAINBOW",color:"#00ccff"},
