@@ -2034,166 +2034,234 @@ export default function NightVisionCamera(){
         )}
 
         {/* CONTROLS */}
-        <div style={{padding:"10px 12px",borderTop:`1px solid ${color}10`,display:"flex",flexDirection:"column",gap:6}}>
+        <div style={{
+          padding:"12px 12px 10px",
+          borderTop:`1px solid ${color}18`,
+          display:"flex",flexDirection:"column",gap:10,
+          background:"rgba(0,0,0,0.85)",
+        }}>
 
-          {/* MODE */}
-          <div style={{display:"flex",gap:4}}>
-            {MODE_KEYS.map(m=>{const mc=MODE_META[m].color;return(
-              <button key={m} onClick={()=>setMode(m)} style={{flex:1,padding:"5px 1px",
-                background:mode===m?`${mc}12`:"transparent",border:`1px solid ${mode===m?mc:`${mc}18`}`,
-                borderRadius:2,fontSize:6,color:mode===m?mc:`${mc}38`,letterSpacing:.5,transition:"all 0.12s"}}>
-                {MODE_META[m].label}
-              </button>
-            );})}
+          {/* ── MODE SELECTOR ── */}
+          <div style={{display:"flex",gap:5}}>
+            {MODE_KEYS.map(m=>{
+              const mc=MODE_META[m].color;
+              return(
+                <button key={m} onClick={()=>setMode(m)} style={{
+                  flex:1,padding:"9px 2px",
+                  background:mode===m?`${mc}20`:"rgba(0,0,0,0.4)",
+                  border:`1.5px solid ${mode===m?mc:`${mc}28`}`,
+                  borderRadius:6,fontSize:8,fontWeight:700,
+                  color:mode===m?mc:`${mc}55`,
+                  letterSpacing:.5,transition:"all 0.15s",
+                  boxShadow:mode===m?`0 0 8px ${mc}30`:"none",
+                }}>
+                  {MODE_META[m].label}
+                </button>
+              );
+            })}
           </div>
 
-          {/* ZOOM */}
-          <div style={{display:"flex",gap:3}}>
-            {ZOOM_STEPS.map(z=>(
-              <button key={z} onClick={()=>setZoom(z)} style={{flex:1,padding:"4px 1px",
-                background:zoom===z?`${color}10`:"transparent",border:`1px solid ${zoom===z?color:`${color}12`}`,
-                borderRadius:2,fontSize:6,color:zoom===z?color:`${color}32`,transition:"all 0.1s"}}>
-                {z}×
-              </button>
-            ))}
-          </div>
-          {hardZoom&&hzoomSupported&&(
-            <div style={{display:"flex",alignItems:"center",gap:8}}>
-              <span style={{fontSize:6,color:`${color}45`,letterSpacing:1,whiteSpace:"nowrap"}}>HW-Z</span>
-              <input type="range" min="1" max={maxZoom} step="0.1" value={hzoom}
-                onChange={e=>applyZoom(parseFloat(e.target.value))}
-                style={{flex:1,accentColor:color}}/>
-              <span style={{fontSize:6,color:`${color}60`,minWidth:26}}>{hzoom.toFixed(1)}×</span>
+          {/* ── ZOOM ── */}
+          <div>
+            <div style={{fontSize:9,color:`${color}60`,letterSpacing:2,marginBottom:5}}>ZOOM</div>
+            <div style={{display:"flex",gap:5}}>
+              {ZOOM_STEPS.map(z=>(
+                <button key={z} onClick={()=>setZoom(z)} style={{
+                  flex:1,padding:"10px 2px",
+                  background:zoom===z?`${color}18`:"rgba(0,0,0,0.4)",
+                  border:`1.5px solid ${zoom===z?color:`${color}20`}`,
+                  borderRadius:6,fontSize:9,fontWeight:700,
+                  color:zoom===z?color:`${color}45`,
+                  transition:"all 0.12s",
+                  boxShadow:zoom===z?`0 0 6px ${color}25`:"none",
+                }}>
+                  {z}×
+                </button>
+              ))}
             </div>
-          )}
-
-          {/* SENS + GAIN */}
-          <div style={{display:"flex",gap:8,alignItems:"center"}}>
-            <span style={{fontSize:6,color:`${color}45`,letterSpacing:1,whiteSpace:"nowrap"}}>SENS</span>
-            <input type="range" min="0" max="1" step="0.05" value={sensitivity}
-              onChange={e=>setSensitivity(parseFloat(e.target.value))}
-              style={{flex:1,accentColor:color}}/>
-            <span style={{fontSize:6,color:`${color}60`,minWidth:22}}>{Math.round(sensitivity*100)}%</span>
-            <span style={{fontSize:6,color:`${color}45`,letterSpacing:1,whiteSpace:"nowrap"}}>GAIN</span>
-            {[-2,-1,0,1,2].map((v,i)=>(
-              <div key={i} onClick={()=>setBrightness(v*0.75)} style={{width:6,height:8+i*2,borderRadius:1,cursor:"pointer",
-                background:brightness>=v*0.75?color:`${color}18`,transition:"background 0.1s"}}/>
-            ))}
-          </div>
-
-          {/* TOGGLE ROW 1 */}
-          <div style={{display:"flex",gap:3}}>
-            {[
-              {l:"EDGE",v:edgeOverlay,f:()=>setEdgeOverlay(e=>!e)},
-              {l:"NR",v:noiseReduction,f:()=>setNoiseReduction(n=>!n)},
-              {l:"MOT",v:motionEnabled,f:()=>setMotionEnabled(m=>!m)},
-              {l:"DUAL",v:dualMode,f:()=>setDualMode(d=>!d)},
-              {l:"⊕",v:showReticle,f:()=>setShowReticle(r=>!r),big:true},
-              {l:"FACE",v:faceDetect,f:()=>setFaceDetect(fd=>!fd)},
-              {l:"rPPG",v:showRPPG,f:()=>setShowRPPG(r=>!r)},
-              {l:"🎙",v:audioEnabled,f:()=>setAudioEnabled(a=>!a),big:true},
-            ].map(({l,v,f,big})=>(
-              <button key={l} onClick={f} style={{flex:1,padding:"5px 1px",
-                background:v?`${color}10`:"transparent",border:`1px solid ${v?color:`${color}15`}`,
-                borderRadius:2,fontSize:big?10:6,letterSpacing:.3,color:v?color:`${color}30`,transition:"all 0.12s"}}>
-                {l}
-              </button>
-            ))}
-          </div>
-          {/* TOGGLE ROW 2 */}
-          <div style={{display:"flex",gap:3}}>
-            {[
-              {l:"🔦",v:torchOn,f:toggleTorch,big:true,c:"#ffdd88"},
-              {l:"SHAKE",v:shakeEnabled,f:()=>setShakeEnabled(s=>!s),c:"#ff8844"},
-              {l:"BURST",v:burstMode,f:()=>setBurstMode(b=>!b),c:"#ff44aa"},
-              {l:"HW-Z",v:hardZoom,f:()=>setHardZoom(h=>!h),c:"#44ffcc"},
-              {l:"SYNC",v:multiSync,f:()=>setMultiSync(s=>!s)},
-            ].map(({l,v,f,big,c})=>(
-              <button key={l} onClick={f} style={{flex:1,padding:"5px 1px",
-                background:v?`${c||color}10`:"transparent",border:`1px solid ${v?(c||color):`${c||color}15`}`,
-                borderRadius:2,fontSize:big?10:6,letterSpacing:.3,color:v?(c||color):`${c||color}30`,transition:"all 0.12s"}}>
-                {l}
-              </button>
-            ))}
-          </div>
-
-          {/* ACTION ROW */}
-          <div style={{display:"flex",gap:3}}>
-            <button onClick={()=>setAutoCapture(a=>!a)} style={{flex:2,padding:"6px 2px",
-              background:autoCapture?"rgba(255,221,0,0.10)":"transparent",
-              border:`1px solid ${autoCapture?"#ffdd00":"rgba(255,221,0,0.18)"}`,
-              borderRadius:2,fontSize:6,letterSpacing:.5,color:autoCapture?"#ffdd00":"rgba(255,221,0,0.35)",transition:"all 0.12s"}}>
-              🎯 AUTO {autoCapture?"ON":"OFF"}
-            </button>
-            <button onClick={manualSnap} style={{flex:1,padding:"6px 2px",background:"transparent",
-              border:`1px solid ${color}18`,borderRadius:2,fontSize:7,color:`${color}55`}}>📷</button>
-            <button onClick={burstSnap} style={{flex:1,padding:"6px 2px",
-              background:"rgba(255,68,170,0.08)",
-              border:"1px solid rgba(255,68,170,0.3)",
-              borderRadius:2,fontSize:6,color:"rgba(255,68,170,0.7)",letterSpacing:.5}}>
-              ×5
-            </button>
-            <button onClick={toggleRecord} style={{flex:1,padding:"6px 2px",
-              background:recording?"rgba(255,34,34,0.10)":"transparent",
-              border:`1px solid ${recording?"#ff2222":"rgba(255,34,34,0.18)"}`,
-              borderRadius:2,fontSize:6,color:recording?"#ff2222":"rgba(255,34,34,0.35)"}}>
-              {recording?"■":"●"}REC
-            </button>
-          </div>
-          {/* UTILITY ROW */}
-          <div style={{display:"flex",gap:3}}>
-            <button onClick={scanQR} style={{flex:1,padding:"6px 2px",
-              background:"rgba(68,255,200,0.06)",border:"1px solid rgba(68,255,200,0.25)",
-              borderRadius:2,fontSize:7,color:"rgba(68,255,200,0.7)",letterSpacing:.3}}>
-              📷QR
-            </button>
-            <button onClick={exportPDF} style={{flex:1,padding:"6px 2px",
-              background:"rgba(180,100,255,0.06)",border:"1px solid rgba(180,100,255,0.25)",
-              borderRadius:2,fontSize:7,color:"rgba(180,100,255,0.7)",letterSpacing:.3}}>
-              📄 RPT
-            </button>
-            {qrResult&&(
-              <div style={{flex:3,padding:"4px 6px",background:"rgba(68,255,200,0.06)",
-                border:"1px solid rgba(68,255,200,0.2)",borderRadius:2,
-                fontFamily:"'DM Mono',monospace",fontSize:6,color:"rgba(68,255,200,0.9)",
-                overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",
-                display:"flex",alignItems:"center",gap:4}}>
-                <span style={{flexShrink:0}}>QR:</span>
-                <span style={{overflow:"hidden",textOverflow:"ellipsis"}}>{qrResult}</span>
-                <button onClick={()=>setQrResult(null)} style={{background:"transparent",border:"none",
-                  color:"rgba(68,255,200,0.5)",fontSize:9,cursor:"pointer",flexShrink:0,padding:0}}>×</button>
+            {hardZoom&&hzoomSupported&&(
+              <div style={{display:"flex",alignItems:"center",gap:10,marginTop:8}}>
+                <span style={{fontSize:9,color:`${color}60`,letterSpacing:1,whiteSpace:"nowrap"}}>HW ZOOM</span>
+                <input type="range" min="1" max={maxZoom} step="0.1" value={hzoom}
+                  onChange={e=>applyZoom(parseFloat(e.target.value))}
+                  style={{flex:1,accentColor:color,height:4}}/>
+                <span style={{fontSize:9,color:color,minWidth:34,fontWeight:700}}>{hzoom.toFixed(1)}×</span>
               </div>
             )}
           </div>
 
-          {/* MODAL ROW */}
-          <div style={{display:"flex",gap:4}}>
-            {[
-              {l:`📁 ${newCapCount>0?`(${newCapCount})`:"GAL"}`,m:"gallery",c:newCapCount>0?color:undefined},
-              {l:"🗺 MAP",m:"map",c:gps?"#00ccff":undefined},
-              {l:`⏱ ${newEventCount>0?`(${newEventCount})`:"LOG"}`,m:"timeline",c:newEventCount>0?"#cc44ff":undefined},
-              {l:`⚡ WIRE${tripwires.length?` (${tripwires.length})`:""}`,m:"tripwire",c:hasTripwire?"#ffcc00":tripwires.length>0?"#ffcc0080":undefined},
-              {l:"? HELP",m:"manual",c:undefined},
-              {l:"📊 SYS",m:"sensors",c:undefined},
-            ].map(({l,m,c})=>(
-              <button key={m} onClick={()=>setModal(m)} style={{flex:1,padding:"6px 2px",
-                background:modal===m?`${c||color}10`:"transparent",
-                border:`1px solid ${c||color}${modal===m?"":"25"}`,
-                borderRadius:2,fontSize:7,color:c||`${color}45`,letterSpacing:.3,transition:"all 0.12s"}}>
-                {l}
-              </button>
-            ))}
+          {/* ── SLIDERS ── */}
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              <span style={{fontSize:9,color:`${color}60`,letterSpacing:1,minWidth:36}}>SENS</span>
+              <input type="range" min="0" max="1" step="0.05" value={sensitivity}
+                onChange={e=>setSensitivity(parseFloat(e.target.value))}
+                style={{flex:1,accentColor:color,height:4}}/>
+              <span style={{fontSize:9,color:color,minWidth:32,fontWeight:700,textAlign:"right"}}>{Math.round(sensitivity*100)}%</span>
+            </div>
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              <span style={{fontSize:9,color:`${color}60`,letterSpacing:1,minWidth:36}}>GAIN</span>
+              <div style={{flex:1,display:"flex",gap:4,alignItems:"flex-end",height:22}}>
+                {[-2,-1,0,1,2].map((v,i)=>(
+                  <div key={i} onClick={()=>setBrightness(v*0.75)} style={{
+                    flex:1,height:10+i*3,borderRadius:2,cursor:"pointer",
+                    background:brightness>=v*0.75?color:`${color}20`,
+                    transition:"background 0.1s",
+                    boxShadow:brightness>=v*0.75?`0 0 4px ${color}50`:"none",
+                  }}/>
+                ))}
+              </div>
+              <span style={{fontSize:9,color:color,minWidth:32,fontWeight:700,textAlign:"right"}}>
+                {brightness>0?"+":""}{(brightness).toFixed(1)}
+              </span>
+            </div>
           </div>
+
+          {/* ── FEATURE TOGGLES ── */}
+          <div>
+            <div style={{fontSize:9,color:`${color}50`,letterSpacing:2,marginBottom:6}}>FEATURES</div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:5}}>
+              {[
+                {l:"EDGE",v:edgeOverlay,f:()=>setEdgeOverlay(e=>!e)},
+                {l:"NR",v:noiseReduction,f:()=>setNoiseReduction(n=>!n)},
+                {l:"MOTION",v:motionEnabled,f:()=>setMotionEnabled(m=>!m)},
+                {l:"DUAL",v:dualMode,f:()=>setDualMode(d=>!d)},
+                {l:"RETICLE",v:showReticle,f:()=>setShowReticle(r=>!r)},
+                {l:"FACE",v:faceDetect,f:()=>setFaceDetect(fd=>!fd)},
+                {l:"rPPG HR",v:showRPPG,f:()=>setShowRPPG(r=>!r)},
+                {l:"MIC",v:audioEnabled,f:()=>setAudioEnabled(a=>!a)},
+                {l:"🔦 TORCH",v:torchOn,f:toggleTorch,c:"#ffdd88"},
+                {l:"SHAKE",v:shakeEnabled,f:()=>setShakeEnabled(s=>!s),c:"#ff8844"},
+                {l:"HW ZOOM",v:hardZoom,f:()=>setHardZoom(h=>!h),c:"#44ffcc"},
+                {l:"SYNC",v:multiSync,f:()=>setMultiSync(s=>!s),c:"#cc44ff"},
+              ].map(({l,v,f,c})=>(
+                <button key={l} onClick={f} style={{
+                  padding:"10px 4px",
+                  background:v?`${c||color}18`:"rgba(0,0,0,0.35)",
+                  border:`1.5px solid ${v?(c||color):`${c||color}22`}`,
+                  borderRadius:7,fontSize:8,fontWeight:v?700:400,
+                  color:v?(c||color):`${c||color}45`,
+                  letterSpacing:.3,transition:"all 0.12s",
+                  boxShadow:v?`0 0 6px ${c||color}25`:"none",
+                  lineHeight:1.2,
+                }}>
+                  {l}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* ── CAPTURE ACTIONS ── */}
+          <div>
+            <div style={{fontSize:9,color:`${color}50`,letterSpacing:2,marginBottom:6}}>CAPTURE</div>
+            <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr",gap:5}}>
+              <button onClick={()=>setAutoCapture(a=>!a)} style={{
+                padding:"12px 6px",
+                background:autoCapture?"rgba(255,221,0,0.15)":"rgba(0,0,0,0.35)",
+                border:`1.5px solid ${autoCapture?"#ffdd00":"rgba(255,221,0,0.25)"}`,
+                borderRadius:7,fontSize:9,fontWeight:700,
+                color:autoCapture?"#ffdd00":"rgba(255,221,0,0.45)",
+                boxShadow:autoCapture?"0 0 8px rgba(255,221,0,0.2)":"none",
+                transition:"all 0.12s",
+              }}>
+                🎯 AUTO {autoCapture?"ON":"OFF"}
+              </button>
+              <button onClick={manualSnap} style={{
+                padding:"12px 4px",background:"rgba(0,0,0,0.35)",
+                border:`1.5px solid ${color}30`,borderRadius:7,
+                fontSize:14,color,
+              }}>📷</button>
+              <button onClick={burstSnap} style={{
+                padding:"12px 4px",
+                background:burstMode?"rgba(255,68,170,0.15)":"rgba(0,0,0,0.35)",
+                border:"1.5px solid rgba(255,68,170,0.35)",
+                borderRadius:7,fontSize:9,fontWeight:700,
+                color:"rgba(255,68,170,0.8)",
+              }}>×5</button>
+              <button onClick={toggleRecord} style={{
+                padding:"12px 4px",
+                background:recording?"rgba(255,34,34,0.15)":"rgba(0,0,0,0.35)",
+                border:`1.5px solid ${recording?"#ff2222":"rgba(255,34,34,0.25)"}`,
+                borderRadius:7,fontSize:9,fontWeight:700,
+                color:recording?"#ff2222":"rgba(255,34,34,0.45)",
+                boxShadow:recording?"0 0 8px rgba(255,34,34,0.2)":"none",
+              }}>
+                {recording?"■ STOP":"● REC"}
+              </button>
+            </div>
+          </div>
+
+          {/* ── TOOLS ── */}
+          <div>
+            <div style={{fontSize:9,color:`${color}50`,letterSpacing:2,marginBottom:6}}>TOOLS</div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:5}}>
+              {[
+                {l:"📁 Gallery",m:"gallery",c:newCapCount>0?color:undefined,badge:newCapCount>0?newCapCount:null},
+                {l:"🗺 Map",m:"map",c:"#00ccff"},
+                {l:"⏱ Log",m:"timeline",c:"#cc44ff",badge:newEventCount>0?newEventCount:null},
+                {l:"⚡ Tripwire",m:"tripwire",c:hasTripwire?"#ffcc00":"#ffcc0080"},
+                {l:"📷 QR Scan",m:"qrscan",c:"#44ffc8"},
+                {l:"📄 Report",m:"report",c:"#b464ff"},
+                {l:"📊 Sensors",m:"sensors",c:"#44ffcc"},
+                {l:"? Manual",m:"manual",c:`${color}80`},
+              ].map(({l,m,c,badge})=>(
+                <button key={m} onClick={()=>{
+                  if(m==="qrscan"){scanQR();return;}
+                  if(m==="report"){exportPDF();return;}
+                  setModal(m);
+                }} style={{
+                  padding:"11px 4px",
+                  background:modal===m?`${c||color}15`:"rgba(0,0,0,0.35)",
+                  border:`1.5px solid ${c||color}${modal===m?"":"30"}`,
+                  borderRadius:7,fontSize:9,fontWeight:500,
+                  color:c||`${color}60`,
+                  letterSpacing:.2,transition:"all 0.12s",
+                  position:"relative",
+                }}>
+                  {l}
+                  {badge&&<span style={{
+                    position:"absolute",top:3,right:4,
+                    background:c||color,color:"#000",
+                    fontSize:6,fontWeight:700,borderRadius:8,
+                    padding:"1px 4px",lineHeight:1.2,
+                  }}>{badge}</span>}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* QR result */}
+          {qrResult&&(
+            <div style={{
+              padding:"10px 12px",
+              background:"rgba(68,255,200,0.06)",
+              border:"1px solid rgba(68,255,200,0.3)",
+              borderRadius:7,display:"flex",alignItems:"center",gap:8,
+            }}>
+              <span style={{fontSize:9,color:"rgba(68,255,200,0.6)",letterSpacing:1,flexShrink:0}}>QR:</span>
+              <span style={{fontSize:9,color:"rgba(68,255,200,0.95)",flex:1,
+                overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{qrResult}</span>
+              <button onClick={()=>setQrResult(null)} style={{
+                background:"transparent",border:"1px solid rgba(68,255,200,0.3)",
+                color:"rgba(68,255,200,0.6)",fontSize:9,cursor:"pointer",
+                borderRadius:4,padding:"2px 8px",
+              }}>✕</button>
+            </div>
+          )}
 
           {/* PEER STATUS */}
           {multiSync&&(
-            <div style={{padding:"5px 8px",border:`1px solid #cc44ff25`,borderRadius:2,background:"rgba(204,68,255,0.04)"}}>
+            <div style={{
+              padding:"8px 12px",
+              border:"1px solid rgba(204,68,255,0.2)",
+              borderRadius:7,background:"rgba(204,68,255,0.05)",
+            }}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                <span style={{fontSize:7,color:"#cc44ff",letterSpacing:1,fontFamily:"'DM Mono',monospace"}}>SYNC — ID:{PEER_ID.slice(-4)}</span>
-                <span style={{fontSize:6,color:"rgba(204,68,255,0.6)",letterSpacing:1}}>{peers.length} PEER{peers.length!==1?"S":""}</span>
+                <span style={{fontSize:9,color:"#cc44ff",letterSpacing:1}}>SYNC — ID:{PEER_ID.slice(-4)}</span>
+                <span style={{fontSize:8,color:"rgba(204,68,255,0.6)"}}>{peers.length} PEER{peers.length!==1?"S":""}</span>
               </div>
               {syncAlerts.slice(0,2).map((a,i)=>(
-                <div key={i} style={{fontSize:6,color:"rgba(204,68,255,0.7)",marginTop:2,letterSpacing:.5}}>
+                <div key={i} style={{fontSize:8,color:"rgba(204,68,255,0.7)",marginTop:3}}>
                   ↳ {a.from.slice(-4)}: {a.payload?.label||"ALERT"}
                 </div>
               ))}
