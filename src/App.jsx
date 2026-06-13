@@ -76,7 +76,7 @@ function applyCLAHE(data,w,h,tiles=6,clip=3.5){
 
 // NVG-specific extreme CLAHE — 10x10 tiles, high clip, on green channel only
 function applyNVGCLAHE(data,w,h){
-  const tiles=10,clip=8.0;
+  const tiles=8,clip=6.0;
   const tW=Math.floor(w/tiles),tH=Math.floor(h/tiles);
   // Extract green channel into temp array, equalize it, write back
   const green=new Uint8Array(w*h);
@@ -132,25 +132,32 @@ function temporalBlend(data,history,alpha=0.75){
 
 // Phosphor bloom: soft-glow on bright green pixels (real NVG has halation)
 function applyPhosphorBloom(data,w,h){
-  // Box-blur the green channel at 4px radius, add back scaled
   const g=new Float32Array(w*h);
   for(let i=0;i<data.length;i+=4) g[i/4]=data[i+1];
-  const blurred=new Float32Array(w*h);
   const r=4;
-  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
-    let sum=0,cnt=0;
-    for(let dy=-r;dy<=r;dy++)for(let dx=-r;dx<=r;dx++){
-      const nx=x+dx,ny=y+dy;
-      if(nx>=0&&nx<w&&ny>=0&&ny<h){sum+=g[ny*w+nx];cnt++;}
+  // Separable box blur — horizontal then vertical
+  const tmp=new Float32Array(w*h);
+  const blurred=new Float32Array(w*h);
+  for(let y=0;y<h;y++){
+    let sum=0;
+    for(let x=-r;x<=r;x++) sum+=g[y*w+Math.min(w-1,Math.max(0,x))];
+    for(let x=0;x<w;x++){
+      tmp[y*w+x]=sum/(r*2+1);
+      sum+=g[y*w+Math.min(w-1,x+r+1)]-g[y*w+Math.max(0,x-r)];
     }
-    blurred[y*w+x]=sum/cnt;
   }
-  // Add glow: brighter pixels bloom more
+  for(let x=0;x<w;x++){
+    let sum=0;
+    for(let y=-r;y<=r;y++) sum+=tmp[Math.min(h-1,Math.max(0,y))*w+x];
+    for(let y=0;y<h;y++){
+      blurred[y*w+x]=sum/(r*2+1);
+      sum+=tmp[Math.min(h-1,y+r+1)*w+x]-tmp[Math.max(0,y-r)*w+x];
+    }
+  }
   for(let i=0;i<data.length;i+=4){
     const pi=i/4;
     const glow=blurred[pi]*0.35;
     data[i+1]=Math.min(255,data[i+1]+glow);
-    // Slight red tint at peak brightness (real P43 phosphor characteristic)
     if(data[i+1]>200) data[i]=Math.min(255,data[i]+data[i+1]*0.04);
   }
 }
@@ -248,7 +255,7 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
   let stackedLum=null;
   if(mode==="NVG"&&!isDayMode){
     // Step 1: frame stacking (8 frames) to pull signal from sensor noise
-    stackedLum=stackFrames(data,refs.stackBuf,refs.stackIdx,8);
+    stackedLum=stackFrames(data,refs.stackBuf,refs.stackIdx,4);
     // Step 2: apply stacked luminance back into green channel before CLAHE
     if(stackedLum){
       for(let i=0;i<data.length;i+=4){
@@ -698,17 +705,29 @@ function applyUnsharpMask(data,w,h,amount=1.8,radius=2){
   const lum=new Float32Array(n);
   for(let i=0;i<data.length;i+=4)
     lum[i/4]=0.299*data[i]+0.587*data[i+1]+0.114*data[i+2];
-  // box blur approximation
+  // Separable box blur: horizontal pass then vertical pass — O(n) not O(n*r^2)
+  const tmp=new Float32Array(n);
   const blurred=new Float32Array(n);
-  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
-    let sum=0,cnt=0;
-    for(let dy=-radius;dy<=radius;dy++)for(let dx=-radius;dx<=radius;dx++){
-      const nx=x+dx,ny=y+dy;
-      if(nx>=0&&nx<w&&ny>=0&&ny<h){sum+=lum[ny*w+nx];cnt++;}
+  for(let y=0;y<h;y++){
+    let sum=0;
+    for(let x=-radius;x<=radius;x++) sum+=lum[y*w+Math.min(w-1,Math.max(0,x))];
+    for(let x=0;x<w;x++){
+      tmp[y*w+x]=sum/(radius*2+1);
+      const add=lum[y*w+Math.min(w-1,x+radius+1)];
+      const rem=lum[y*w+Math.max(0,x-radius)];
+      sum+=add-rem;
     }
-    blurred[y*w+x]=sum/cnt;
   }
-  // sharpen = original + amount*(original - blurred)
+  for(let x=0;x<w;x++){
+    let sum=0;
+    for(let y=-radius;y<=radius;y++) sum+=tmp[Math.min(h-1,Math.max(0,y))*w+x];
+    for(let y=0;y<h;y++){
+      blurred[y*w+x]=sum/(radius*2+1);
+      const add=tmp[Math.min(h-1,y+radius+1)*w+x];
+      const rem=tmp[Math.max(0,y-radius)*w+x];
+      sum+=add-rem;
+    }
+  }
   for(let i=0;i<data.length;i+=4){
     const pi=i/4;
     const diff=lum[pi]-blurred[pi];
@@ -721,28 +740,33 @@ function applyUnsharpMask(data,w,h,amount=1.8,radius=2){
 
 // Dark channel prior dehaze — removes atmospheric haze/glare
 function applyDehaze(data,w,h,strength=0.7){
-  const patch=7;
-  const n=w*h;
-  // Compute dark channel
-  const dark=new Float32Array(n);
-  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+  // Fast approximate dark-channel: downsample to 1/4 resolution grid,
+  // patch radius reduced, then upsample transmission map
+  const step=4; // sample every 4th pixel
+  const patch=2; // small patch on downsampled grid (~8px effective)
+  const gw=Math.ceil(w/step),gh=Math.ceil(h/step);
+  const dark=new Float32Array(gw*gh);
+  for(let gy=0;gy<gh;gy++)for(let gx=0;gx<gw;gx++){
     let minV=255;
     for(let dy=-patch;dy<=patch;dy++)for(let dx=-patch;dx<=patch;dx++){
-      const nx=x+dx,ny=y+dy;
-      if(nx>=0&&nx<w&&ny>=0&&ny<h){
-        const i=(ny*w+nx)*4;
-        minV=Math.min(minV,data[i],data[i+1],data[i+2]);
-      }
+      const sx=Math.min(w-1,Math.max(0,(gx+dx)*step));
+      const sy=Math.min(h-1,Math.max(0,(gy+dy)*step));
+      const i=(sy*w+sx)*4;
+      const m=Math.min(data[i],data[i+1],data[i+2]);
+      if(m<minV)minV=m;
     }
-    dark[y*w+x]=minV;
+    dark[gy*gw+gx]=minV;
   }
-  // Estimate atmospheric light (top 0.1% brightest dark channel pixels)
-  const sorted=[...dark].sort((a,b)=>b-a);
-  const A=sorted[Math.floor(n*0.001)];
-  // Estimate transmission and recover scene
+  // Estimate atmospheric light: max of dark channel grid (approximation)
+  let A=0;
+  for(let i=0;i<dark.length;i++) if(dark[i]>A)A=dark[i];
+  A=Math.max(A,10);
+  // Apply transmission per-pixel using nearest grid sample (no expensive interpolation)
   for(let i=0;i<data.length;i+=4){
     const pi=i/4;
-    const t=Math.max(0.1,1-(strength*dark[pi]/Math.max(1,A)));
+    const x=pi%w,y=(pi-x)/w|0;
+    const gx=Math.min(gw-1,x/step|0),gy=Math.min(gh-1,y/step|0);
+    const t=Math.max(0.15,1-(strength*dark[gy*gw+gx]/A));
     data[i]  =Math.min(255,Math.max(0,(data[i]  -A)/t+A));
     data[i+1]=Math.min(255,Math.max(0,(data[i+1]-A)/t+A));
     data[i+2]=Math.min(255,Math.max(0,(data[i+2]-A)/t+A));
