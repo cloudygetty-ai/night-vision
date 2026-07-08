@@ -227,19 +227,31 @@ function useTFDetector(){
     })();
     return()=>{cancelled=true;};
   },[]);
+  const busyRef=useRef(false);
+  const smallRef=useRef(null);
   const detect=useCallback(async(canvas)=>{
-    if(!modelRef.current||!canvas)return[];
+    if(!modelRef.current||!canvas||busyRef.current)return null;
+    busyRef.current=true;
     try{
-      const preds=await modelRef.current.detect(canvas,8,0.35);
+      // Downscale to 320px-wide canvas — 8x fewer pixels than 720p, model
+      // internally resizes to 300x300 anyway so zero accuracy loss
+      if(!smallRef.current)smallRef.current=document.createElement("canvas");
+      const small=smallRef.current;
+      const scale=320/canvas.width;
+      small.width=320;small.height=Math.round(canvas.height*scale);
+      small.getContext("2d").drawImage(canvas,0,0,small.width,small.height);
+      const preds=await modelRef.current.detect(small,6,0.40);
+      const inv=1/scale;
       return preds.map(p=>({
-        x:p.bbox[0],y:p.bbox[1],w:p.bbox[2],h:p.bbox[3],
-        cx:p.bbox[0]+p.bbox[2]/2,cy:p.bbox[1]+p.bbox[3]/2,
-        size:p.bbox[2]*p.bbox[3],
+        x:p.bbox[0]*inv,y:p.bbox[1]*inv,w:p.bbox[2]*inv,h:p.bbox[3]*inv,
+        cx:(p.bbox[0]+p.bbox[2]/2)*inv,cy:(p.bbox[1]+p.bbox[3]/2)*inv,
+        size:p.bbox[2]*p.bbox[3]*inv*inv,
         label:p.class.toUpperCase(),
         conf:Math.round(p.score*100),
         icon:COCO_ICONS[p.class]||"◈",
       }));
-    }catch{return[];}
+    }catch{return null;}
+    finally{busyRef.current=false;}
   },[]);
   return{detect,modelReady};
 }
@@ -1731,6 +1743,7 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
   const videoRef=useRef(null),rawRef=useRef(null),dispRef=useRef(null),rafRef=useRef(null);
   const prevRef=useRef(null),motRef=useRef(null),cooldown=useRef(0),fpsRef=useRef({frames:0,last:performance.now()});
   const stackBuf=useRef(null),stackIdx=useRef(0);
+  const lastTfRef=useRef(0);
   const[blobs,setBlobs]=useState([]);const[motionLevel,setMotionLevel]=useState(0);
   const[tempData,setTempData]=useState(null);const[cameraSize,setCameraSize]=useState({w:1280,h:720});
   const[fps,setFps]=useState(0);const[flash,setFlash]=useState(false);const[autoCapPending,setAutoCapPending]=useState(false);
@@ -1768,30 +1781,20 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
         setCameraSize({w:result.sw,h:result.sh});
         if(motionEnabled){
           setMotionLevel(result.motionFrac);
-          // Run TF detection on display canvas every 6 frames when model ready
-          let finalBlobs=result.blobs;
-          if(modelReady&&tfDetect&&disp&&(fpsRef.current.frames%6===0)){
+          // TF detection: time-throttled (500ms), non-blocking, busy-guarded
+          const nowTf=performance.now();
+          if(modelReady&&tfDetect&&disp&&nowTf-lastTfRef.current>500){
+            lastTfRef.current=nowTf;
             tfDetect(disp).then(preds=>{
-              if(preds.length>0){
-                // Merge TF predictions with motion blobs
-                const merged=preds.map(p=>({
-                  ...p,
-                  // scale from canvas coords to native coords
-                  x:p.x*(result.sw/disp.width),
-                  y:p.y*(result.sh/disp.height),
-                  w:p.w*(result.sw/disp.width),
-                  h:p.h*(result.sh/disp.height),
-                  cx:p.cx*(result.sw/disp.width),
-                  cy:p.cy*(result.sh/disp.height),
-                }));
-                setBlobs(merged);
-              } else {
-                // Enrich motion blobs with fallback classifier
+              if(preds&&preds.length>0){
+                const sx=result.sw/disp.width,sy=result.sh/disp.height;
+                setBlobs(preds.map(p=>({...p,
+                  x:p.x*sx,y:p.y*sy,w:p.w*sx,h:p.h*sy,cx:p.cx*sx,cy:p.cy*sy})));
+              } else if(preds){
                 setBlobs(result.blobs.map(b=>({...b,...classifyBlobFallback(b,result.sw,result.sh)})));
               }
-            }).catch(()=>{
-              setBlobs(result.blobs.map(b=>({...b,...classifyBlobFallback(b,result.sw,result.sh)})));
-            });
+              // preds===null → detector busy, keep previous boxes (no flicker)
+            }).catch(()=>{});
           } else if(!modelReady){
             setBlobs(result.blobs.map(b=>({...b,...classifyBlobFallback(b,result.sw,result.sh)})));
           }
