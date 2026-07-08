@@ -1,4 +1,6 @@
 import{useState,useEffect,useRef,useCallback,useMemo}from"react";
+import*as tf from"@tensorflow/tfjs";
+import*as cocoSsd from"@tensorflow-models/coco-ssd";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // LUT BUILDER
@@ -181,18 +183,65 @@ function findBlobs(motionMap,w,h,minSize=60){
   return blobs.sort((a,b)=>b.size-a.size).slice(0,8);
 }
 
-// AI Object classification (heuristic-based, no ML model needed)
-function classifyBlob(blob,sw,sh){
+// Heuristic fallback classifier (used when TF model not yet loaded)
+function classifyBlobFallback(blob,sw,sh){
   const aspect=blob.w/(blob.h||1);
   const area=(blob.w*blob.h)/(sw*sh);
   const cy=blob.cy/sh;
-  if(area>0.25)return{label:"VEHICLE",conf:88,icon:"🚗"};
-  if(aspect>1.8&&area>0.05)return{label:"VEHICLE",conf:75,icon:"🚗"};
-  if(aspect>0.5&&aspect<2.2&&area>0.02&&cy>0.3)return{label:"PERSON",conf:82,icon:"🧍"};
-  if(area<0.005)return{label:"SMALL OBJ",conf:60,icon:"◈"};
-  if(aspect>2.5)return{label:"ANIMAL",conf:55,icon:"🐾"};
-  if(cy<0.25&&area>0.01)return{label:"DRONE/BIRD",conf:65,icon:"🦅"};
-  return{label:"UNKNOWN",conf:50,icon:"?"};
+  if(area>0.25)return{label:"VEHICLE",conf:72,icon:"🚗"};
+  if(aspect>1.8&&area>0.05)return{label:"VEHICLE",conf:65,icon:"🚗"};
+  if(aspect>0.5&&aspect<2.2&&area>0.02&&cy>0.3)return{label:"PERSON",conf:70,icon:"🧍"};
+  if(area<0.005)return{label:"SMALL OBJ",conf:50,icon:"◈"};
+  if(aspect>2.5)return{label:"ANIMAL",conf:45,icon:"🐾"};
+  if(cy<0.25&&area>0.01)return{label:"DRONE/BIRD",conf:55,icon:"🦅"};
+  return{label:"UNKNOWN",conf:40,icon:"?"};
+}
+
+// Icon map for COCO-SSD class names
+const COCO_ICONS={
+  person:"🧍",car:"🚗",truck:"🚛",bus:"🚌",motorcycle:"🏍",bicycle:"🚲",
+  dog:"🐕",cat:"🐈",bird:"🦅",horse:"🐎",cow:"🐄",sheep:"🐑",
+  elephant:"🐘",bear:"🐻",zebra:"🦓",giraffe:"🦒",
+  bottle:"🍾",cup:"☕",fork:"🍴",knife:"🔪",spoon:"🥄",
+  chair:"🪑",couch:"🛋",bed:"🛏",toilet:"🚽",
+  laptop:"💻","cell phone":"📱",keyboard:"⌨️",mouse:"🖱",
+  tv:"📺",microwave:"📟",oven:"🍳",refrigerator:"🧊",
+  book:"📚",clock:"🕐",vase:"🏺",scissors:"✂️",
+  backpack:"🎒",umbrella:"☂️",handbag:"👜",suitcase:"🧳",
+  "fire hydrant":"🚒","stop sign":"🛑","parking meter":"🅿️",
+  bench:"🪑","traffic light":"🚦",
+};
+
+// useTFDetector — loads COCO-SSD once, exposes a detect() fn
+function useTFDetector(){
+  const modelRef=useRef(null);
+  const[modelReady,setModelReady]=useState(false);
+  useEffect(()=>{
+    let cancelled=false;
+    (async()=>{
+      try{
+        await tf.ready();
+        const m=await cocoSsd.load({base:"lite_mobilenet_v2"});
+        if(!cancelled){modelRef.current=m;setModelReady(true);}
+      }catch(e){console.warn("COCO-SSD load failed:",e);}
+    })();
+    return()=>{cancelled=true;};
+  },[]);
+  const detect=useCallback(async(canvas)=>{
+    if(!modelRef.current||!canvas)return[];
+    try{
+      const preds=await modelRef.current.detect(canvas,8,0.35);
+      return preds.map(p=>({
+        x:p.bbox[0],y:p.bbox[1],w:p.bbox[2],h:p.bbox[3],
+        cx:p.bbox[0]+p.bbox[2]/2,cy:p.bbox[1]+p.bbox[3]/2,
+        size:p.bbox[2]*p.bbox[3],
+        label:p.class.toUpperCase(),
+        conf:Math.round(p.score*100),
+        icon:COCO_ICONS[p.class]||"◈",
+      }));
+    }catch{return[];}
+  },[]);
+  return{detect,modelReady};
 }
 
 // Distance estimation (pinhole camera model approximation)
@@ -279,15 +328,17 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
     const boosted=Math.max(0,Math.min(255,(lum*bri-mid)*con+mid));
     const pIdx=i/4;
     if(mode==="NVG"){
-      // Use boosted luminance → pure green, crush red/blue to near zero
-      const v=Math.min(255,boosted);
-      data[i]=Math.min(255,v*0.03);
-      data[i+1]=Math.min(255,v);
-      data[i+2]=Math.min(255,v*0.02);
-      // Authentic phosphor noise: coarser at low signal, fine at high
-      const noiseAmt=v<80?14:v<160?8:4;
-      const n=(Math.random()-.5)*noiseAmt;
-      data[i+1]=Math.max(0,Math.min(255,data[i+1]+n));
+      // High-clarity green channel — use stacked lum if available for cleaner signal
+      const src=stackedLum?Math.min(255,stackedLum[pIdx]*1.8):boosted;
+      // Gamma correction for shadow lift (gamma 0.7 pulls dark regions up)
+      const gamma=Math.pow(src/255,0.70)*255;
+      const v=Math.min(255,gamma);
+      data[i]=Math.min(255,v*0.02);      // crush red near-zero
+      data[i+1]=Math.min(255,v*1.08);   // green slightly above lum for punch
+      data[i+2]=Math.min(255,v*0.015);  // crush blue
+      // Noise: signal-adaptive — quiet at mid/high signal
+      const noiseAmt=v<60?12:v<120?6:v<200?2:0;
+      if(noiseAmt>0){const n=(Math.random()-.5)*noiseAmt;data[i+1]=Math.max(0,Math.min(255,data[i+1]+n));}
     }else if(mode==="THERMAL"||mode==="RAINBOW"||mode==="FUSION"){
       const al=lut||LUTS.THERMAL;const li=Math.min(255,Math.round(boosted));
       data[i]=al[li*3];data[i+1]=al[li*3+1];data[i+2]=al[li*3+2];
@@ -1595,26 +1646,45 @@ function TargetBoxes({blobs,cw,ch,color,autoCapPending}){
                 borderLeft:sx<0?`2px solid ${tc}`:"none",borderRight:sx>0?`2px solid ${tc}`:"none"}}/>
             ))}
             {/* AI label */}
-            <div style={{position:"absolute",top:-28,left:0,display:"flex",gap:2,flexDirection:"column"}}>
-              <div style={{display:"flex",gap:2,alignItems:"center"}}>
-                <span style={{fontSize:7,color:tc,letterSpacing:1,background:"rgba(0,0,0,0.8)",
-                  padding:"1px 3px",borderRadius:1,fontFamily:"'DM Mono',monospace"}}>
+            {/* Object name label — positioned above box */}
+            <div style={{
+              position:"absolute",top:-38,left:0,
+              display:"flex",flexDirection:"column",gap:2,
+            }}>
+              <div style={{display:"flex",gap:3,alignItems:"center",flexWrap:"wrap"}}>
+                <span style={{
+                  fontSize:isMain?10:8,fontWeight:700,
+                  color:"#000",letterSpacing:.5,
+                  background:tc,
+                  padding:isMain?"2px 6px":"1px 4px",
+                  borderRadius:3,fontFamily:"'DM Mono',monospace",
+                  boxShadow:`0 0 8px ${tc}60`,
+                  whiteSpace:"nowrap",
+                }}>
                   {b.icon} {b.label}
                 </span>
-                <span style={{fontSize:6,color:`${tc}90`,background:"rgba(0,0,0,0.7)",
-                  padding:"1px 3px",borderRadius:1,fontFamily:"'DM Mono',monospace"}}>
+                <span style={{
+                  fontSize:isMain?9:7,fontWeight:600,
+                  color:tc,background:"rgba(0,0,0,0.85)",
+                  padding:"1px 4px",borderRadius:3,
+                  fontFamily:"'DM Mono',monospace",border:`1px solid ${tc}50`,
+                }}>
                   {b.conf}%
                 </span>
                 {isMain&&autoCapPending&&(
-                  <span style={{fontSize:6,color:"#fff",background:"rgba(255,34,34,0.85)",
-                    padding:"1px 3px",borderRadius:1,animation:"rec-blink 0.3s step-end infinite",
-                    fontFamily:"'DM Mono',monospace"}}>📷</span>
+                  <span style={{fontSize:8,color:"#fff",background:"rgba(255,34,34,0.9)",
+                    padding:"2px 5px",borderRadius:3,animation:"rec-blink 0.3s step-end infinite",
+                    fontFamily:"'DM Mono',monospace",fontWeight:700}}>📷</span>
                 )}
               </div>
               {b.dist&&(
-                <span style={{fontSize:6,color:`${tc}80`,background:"rgba(0,0,0,0.7)",
-                  padding:"1px 3px",borderRadius:1,fontFamily:"'DM Mono',monospace",letterSpacing:1}}>
-                  ~{b.dist<10?b.dist.toFixed(1):Math.round(b.dist)}m
+                <span style={{
+                  fontSize:isMain?8:7,color:`${tc}`,fontWeight:600,
+                  background:"rgba(0,0,0,0.8)",
+                  padding:"1px 5px",borderRadius:3,fontFamily:"'DM Mono',monospace",
+                  letterSpacing:1,border:`1px solid ${tc}30`,width:"fit-content",
+                }}>
+                  📏 ~{b.dist<10?b.dist.toFixed(1):Math.round(b.dist)}m
                 </span>
               )}
             </div>
@@ -1657,7 +1727,7 @@ function ThermalOverlay({tempData,mode}){
 // ═══════════════════════════════════════════════════════════════════════════════
 function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeOverlay,
   noiseReduction,color,zoom,showReticle,motionEnabled,autoCapture,tripwires,showRPPG,
-  onCapture,onMotionEvent,onTripwireHit,onRPPG,compact=false}){
+  onCapture,onMotionEvent,onTripwireHit,onRPPG,compact=false,tfDetect,modelReady}){
   const videoRef=useRef(null),rawRef=useRef(null),dispRef=useRef(null),rafRef=useRef(null);
   const prevRef=useRef(null),motRef=useRef(null),cooldown=useRef(0),fpsRef=useRef({frames:0,last:performance.now()});
   const stackBuf=useRef(null),stackIdx=useRef(0);
@@ -1697,7 +1767,34 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
       if(result){
         setCameraSize({w:result.sw,h:result.sh});
         if(motionEnabled){
-          setMotionLevel(result.motionFrac);setBlobs(result.blobs);
+          setMotionLevel(result.motionFrac);
+          // Run TF detection on display canvas every 6 frames when model ready
+          let finalBlobs=result.blobs;
+          if(modelReady&&tfDetect&&disp&&(fpsRef.current.frames%6===0)){
+            tfDetect(disp).then(preds=>{
+              if(preds.length>0){
+                // Merge TF predictions with motion blobs
+                const merged=preds.map(p=>({
+                  ...p,
+                  // scale from canvas coords to native coords
+                  x:p.x*(result.sw/disp.width),
+                  y:p.y*(result.sh/disp.height),
+                  w:p.w*(result.sw/disp.width),
+                  h:p.h*(result.sh/disp.height),
+                  cx:p.cx*(result.sw/disp.width),
+                  cy:p.cy*(result.sh/disp.height),
+                }));
+                setBlobs(merged);
+              } else {
+                // Enrich motion blobs with fallback classifier
+                setBlobs(result.blobs.map(b=>({...b,...classifyBlobFallback(b,result.sw,result.sh)})));
+              }
+            }).catch(()=>{
+              setBlobs(result.blobs.map(b=>({...b,...classifyBlobFallback(b,result.sw,result.sh)})));
+            });
+          } else if(!modelReady){
+            setBlobs(result.blobs.map(b=>({...b,...classifyBlobFallback(b,result.sw,result.sh)})));
+          }
           const now=Date.now();
           if(autoCapture&&result.blobs.length>0&&result.motionFrac>0.008&&now-cooldown.current>3000){
             cooldown.current=now;setAutoCapPending(true);
@@ -1849,6 +1946,7 @@ export default function NightVisionCamera(){
   const rear=useCameraStream({facingMode:"environment"},true);
   const front=useCameraStream({facingMode:"user"},dualMode);
   const{hzoom,maxZoom,supported:hzoomSupported,applyZoom}=useHardwareZoom(hardZoom?rear.stream:null);
+  const{detect:tfDetect,modelReady}=useTFDetector();
 
   const color=MODE_META[mode].color;
   const timeStr=clock.toLocaleTimeString("en-US",{hour12:false});
@@ -2038,13 +2136,15 @@ export default function NightVisionCamera(){
               noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
               motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
               showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
-              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={true}/>
+              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={true}
+              tfDetect={tfDetect} modelReady={modelReady}/>
             <CameraPanel stream={front.stream} ready={front.ready} error={front.error} label="FRONT"
               mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
               noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
               motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
               showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
-              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={true}/>
+              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={true}
+              tfDetect={tfDetect} modelReady={modelReady}/>
           </div>
         ):(
           <div style={{flex:1,minHeight:0,display:"flex",flexDirection:"column"}}>
@@ -2053,7 +2153,8 @@ export default function NightVisionCamera(){
               noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
               motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
               showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
-              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={false}/>
+              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={false}
+              tfDetect={tfDetect} modelReady={modelReady}/>
             {(showRPPG||audioEnabled)&&(
               <BiometricHUD hr={hr} audioLevel={audioLevel} audioSpike={audioSpike} color={color}/>
             )}
