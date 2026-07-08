@@ -2133,7 +2133,7 @@ export default function NightVisionCamera(){
 
         {/* CAMERAS */}
         {dualMode?(
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:1,background:`${color}08`,flex:1,minHeight:0}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:1,background:`${color}08`,height:"38dvh",flexShrink:0}}>
             <CameraPanel stream={rear.stream} ready={rear.ready} error={rear.error} label="REAR"
               mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
               noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
@@ -2150,7 +2150,7 @@ export default function NightVisionCamera(){
               tfDetect={tfDetect} modelReady={modelReady}/>
           </div>
         ):(
-          <div style={{flex:1,minHeight:0,display:"flex",flexDirection:"column"}}>
+          <div style={{height:"45dvh",flexShrink:0,display:"flex",flexDirection:"column"}}>
             <CameraPanel stream={rear.stream} ready={rear.ready} error={rear.error} label="REAR"
               mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
               noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
@@ -2164,12 +2164,14 @@ export default function NightVisionCamera(){
           </div>
         )}
 
-        {/* CONTROLS */}
+        {/* CONTROLS — scrollable deck below fixed camera */}
         <div style={{
-          padding:"12px 12px 10px",
+          padding:"12px 12px 24px",
           borderTop:`1px solid ${color}18`,
           display:"flex",flexDirection:"column",gap:10,
           background:"rgba(0,0,0,0.85)",
+          flex:1,minHeight:0,overflowY:"auto",
+          WebkitOverflowScrolling:"touch",
         }}>
 
           {/* ── MODE SELECTOR ── */}
