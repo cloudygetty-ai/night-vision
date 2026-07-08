@@ -719,20 +719,32 @@ function useCameraStream(constraints,enabled=true){
   // eslint-disable-next-line
   },[key]);
 
+  const[retryKey,setRetryKey]=useState(0);
+  const retry=useCallback(()=>setRetryKey(k=>k+1),[]);
+
   useEffect(()=>{
     if(!enabled){setStream(s=>{s?.getTracks().forEach(t=>t.stop());return null;});setReady(false);return;}
     let live=true;
     const isLive=()=>live;
     setReady(false);setError(null);
 
+    let gotStream=false;
     const start=()=>acquire(isLive,s=>{
+      gotStream=true;
       setStream(s);setReady(true);
-      // track ended = OS killed camera, restart
       s.getVideoTracks().forEach(t=>{
         t.onended=()=>{if(live){setReady(false);setTimeout(()=>start(),800);}};
       });
     },e=>setError(e));
     start();
+
+    // iOS hang guard: if no stream and no error after 6s, surface tap-to-start
+    const initTimeout=setTimeout(()=>{
+      if(live&&!gotStream)setError("TAP TO START CAMERA");
+    },6000);
+    const clearInit=()=>clearTimeout(initTimeout);
+    // clear timeout when stream arrives
+    const checkInterval=setInterval(()=>{if(gotStream){clearInit();clearInterval(checkInterval);}},500);
 
     // visibilitychange: resume when tab comes back
     const onVisible=()=>{
@@ -750,12 +762,12 @@ function useCameraStream(constraints,enabled=true){
       }
     };
     document.addEventListener("visibilitychange",onVisible);
-    return()=>{live=false;document.removeEventListener("visibilitychange",onVisible);};
+    return()=>{live=false;clearTimeout(initTimeout);clearInterval(checkInterval);document.removeEventListener("visibilitychange",onVisible);};
   // eslint-disable-next-line
-  },[key,acquire]);
+  },[key,acquire,retryKey]);
 
   useEffect(()=>()=>stream?.getTracks().forEach(t=>t.stop()),[stream]);
-  return{stream,error,ready};
+  return{stream,error,ready,retry};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1739,7 +1751,7 @@ function ThermalOverlay({tempData,mode}){
 // ═══════════════════════════════════════════════════════════════════════════════
 function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeOverlay,
   noiseReduction,color,zoom,showReticle,motionEnabled,autoCapture,tripwires,showRPPG,
-  onCapture,onMotionEvent,onTripwireHit,onRPPG,compact=false,tfDetect,modelReady}){
+  onCapture,onMotionEvent,onTripwireHit,onRPPG,compact=false,tfDetect,modelReady,onRetry}){
   const videoRef=useRef(null),rawRef=useRef(null),dispRef=useRef(null),rafRef=useRef(null);
   const prevRef=useRef(null),motRef=useRef(null),cooldown=useRef(0),fpsRef=useRef({frames:0,last:performance.now()});
   const stackBuf=useRef(null),stackIdx=useRef(0);
@@ -1872,11 +1884,18 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
         </div>
       )}
       {error&&(
-        <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:6,zIndex:30,background:"rgba(0,0,0,0.92)"}}>
-          <span style={{fontSize:14}}>📷</span>
-          <span style={{fontFamily:"'DM Mono',monospace",fontSize:7,color:"#ff4444",letterSpacing:2}}>{label} OFFLINE</span>
-          <span style={{fontSize:6,color:"rgba(255,100,100,0.5)",textAlign:"center",maxWidth:180,letterSpacing:.5}}>
-            {error.toLowerCase().includes("denied")?"PERMISSION REQUIRED":error.slice(0,50).toUpperCase()}
+        <div onClick={onRetry} style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:10,zIndex:30,background:"rgba(0,0,0,0.92)",cursor:"pointer"}}>
+          <span style={{fontSize:28}}>📷</span>
+          <span style={{fontFamily:"'DM Mono',monospace",fontSize:11,color:error==="TAP TO START CAMERA"?color:"#ff4444",letterSpacing:2,fontWeight:700}}>
+            {error==="TAP TO START CAMERA"?"▶ TAP TO START CAMERA":`${label} OFFLINE`}
+          </span>
+          {error!=="TAP TO START CAMERA"&&(
+            <span style={{fontSize:8,color:"rgba(255,100,100,0.6)",textAlign:"center",maxWidth:220,letterSpacing:.5,fontFamily:"'DM Mono',monospace"}}>
+              {error.toLowerCase().includes("denied")?"ALLOW CAMERA IN BROWSER SETTINGS, THEN TAP":error.slice(0,60).toUpperCase()}
+            </span>
+          )}
+          <span style={{fontSize:8,color:`${color}70`,letterSpacing:2,border:`1px solid ${color}40`,padding:"6px 16px",borderRadius:6,fontFamily:"'DM Mono',monospace"}}>
+            ↻ RETRY
           </span>
         </div>
       )}
@@ -2140,14 +2159,14 @@ export default function NightVisionCamera(){
               motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
               showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
               onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={true}
-              tfDetect={tfDetect} modelReady={modelReady}/>
+              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry}/>
             <CameraPanel stream={front.stream} ready={front.ready} error={front.error} label="FRONT"
               mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
               noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
               motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
               showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
               onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={true}
-              tfDetect={tfDetect} modelReady={modelReady}/>
+              tfDetect={tfDetect} modelReady={modelReady} onRetry={front.retry}/>
           </div>
         ):(
           <div style={{height:"45dvh",flexShrink:0,display:"flex",flexDirection:"column"}}>
@@ -2157,7 +2176,7 @@ export default function NightVisionCamera(){
               motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
               showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
               onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={false}
-              tfDetect={tfDetect} modelReady={modelReady}/>
+              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry}/>
             {(showRPPG||audioEnabled)&&(
               <BiometricHUD hr={hr} audioLevel={audioLevel} audioSpike={audioSpike} color={color}/>
             )}
