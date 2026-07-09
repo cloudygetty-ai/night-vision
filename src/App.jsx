@@ -1772,23 +1772,29 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
     const v=videoRef.current;
     v.srcObject=stream;
     v.play().catch(()=>{});
-    // stall watchdog: if currentTime doesn't advance for 2.5s, replay
+    // stall watchdog: replay after 2 stalls, full rebind after 4
     let lastTime=-1,stallCount=0;
     const watchdog=setInterval(()=>{
       if(!v.srcObject)return;
       if(v.currentTime===lastTime&&v.readyState>=2){
         stallCount++;
-        if(stallCount>=2){
-          stallCount=0;
+        if(stallCount===2){
           v.play().catch(()=>{});
+        } else if(stallCount>=4){
+          stallCount=0;
+          // Hard rebind — detach and re-attach the stream
+          const s=v.srcObject;
+          v.srcObject=null;
+          requestAnimationFrame(()=>{v.srcObject=s;v.play().catch(()=>{});});
         }
       } else { stallCount=0; }
       lastTime=v.currentTime;
-    },2500);
+    },2000);
     return()=>clearInterval(watchdog);
   },[stream]);
 
   const renderLoop=useCallback(()=>{
+    try{
     const video=videoRef.current,raw=rawRef.current,disp=dispRef.current;
     if(video&&raw&&disp){
       const result=processFrame(video,raw,disp,
@@ -1827,7 +1833,7 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
               setAutoCapPending(false);
             },600);
           }
-          if(result.triggeredWires.length)onTripwireHit&&onTripwireHit(result.triggeredWires,label);
+          if(result.triggeredWires?.length)onTripwireHit&&onTripwireHit(result.triggeredWires,label);
         }
         if(result.tempData)setTempData(result.tempData);
         if(showRPPG&&result.rppgVal)onRPPG&&onRPPG(result.rppgVal);
@@ -1835,6 +1841,7 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
         const n=performance.now();if(n-fc.last>=1000){setFps(fc.frames);fc.frames=0;fc.last=n;}
       }
     }
+    }catch(e){/* never let one bad frame kill the loop */}
     rafRef.current=requestAnimationFrame(renderLoop);
   // eslint-disable-next-line
   },[mode,brightness,sensitivity,edgeOverlay,noiseReduction,motionEnabled,autoCapture,showRPPG,JSON.stringify(tripwires)]);
