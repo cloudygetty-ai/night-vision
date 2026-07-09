@@ -281,15 +281,21 @@ function extractRPPG(data,w,h){
 
 function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
   const{mode,brightness,sensitivity,edgeOverlay,noiseReduction,lutName,tripwires,showRPPG}=cfg;
-  const sw=video.videoWidth,sh=video.videoHeight;
-  if(!sw||!sh||video.readyState<2)return null;
-  rawCanvas.width=sw;rawCanvas.height=sh;dispCanvas.width=sw;dispCanvas.height=sh;
+  const vw=video.videoWidth,vh=video.videoHeight;
+  if(!vw||!vh||video.readyState<2)return null;
+  // Cap processing resolution — massive speedup, display upscales via CSS
+  const MAXW=854;
+  const pScale=vw>MAXW?MAXW/vw:1;
+  const sw=Math.round(vw*pScale),sh=Math.round(vh*pScale);
+  if(rawCanvas.width!==sw){rawCanvas.width=sw;rawCanvas.height=sh;}
+  if(dispCanvas.width!==sw){dispCanvas.width=sw;dispCanvas.height=sh;}
   const rawCtx=rawCanvas.getContext("2d",{willReadFrequently:true});
   rawCtx.drawImage(video,0,0,sw,sh);
   const imageData=rawCtx.getImageData(0,0,sw,sh);
   const data=imageData.data;
-  if(noiseReduction&&refs.prev.current)temporalBlend(data,refs.prev.current,0.78);
-  refs.prev.current=new Uint8ClampedArray(data);
+  if(noiseReduction&&refs.prev.current&&refs.prev.current.length===data.length)temporalBlend(data,refs.prev.current,0.78);
+  if(!refs.prev.current||refs.prev.current.length!==data.length)refs.prev.current=new Uint8ClampedArray(data.length);
+  refs.prev.current.set(data);
   const motionThresh=Math.round(15+(1-sensitivity)*40);
   const motionMap=new Uint8Array(sw*sh);let motionPixels=0;
   if(refs.motion.current&&refs.motion.current.length===data.length){
@@ -1755,7 +1761,7 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
   const videoRef=useRef(null),rawRef=useRef(null),dispRef=useRef(null),rafRef=useRef(null);
   const prevRef=useRef(null),motRef=useRef(null),cooldown=useRef(0),fpsRef=useRef({frames:0,last:performance.now()});
   const stackBuf=useRef(null),stackIdx=useRef(0);
-  const lastTfRef=useRef(0);
+  const lastTfRef=useRef(0);const lastMlRef=useRef(0);
   const[blobs,setBlobs]=useState([]);const[motionLevel,setMotionLevel]=useState(0);
   const[tempData,setTempData]=useState(null);const[cameraSize,setCameraSize]=useState({w:1280,h:720});
   const[fps,setFps]=useState(0);const[flash,setFlash]=useState(false);const[autoCapPending,setAutoCapPending]=useState(false);
@@ -1790,9 +1796,10 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
         {prev:prevRef,motion:motRef,stackBuf,stackIdx}
       );
       if(result){
-        setCameraSize({w:result.sw,h:result.sh});
+        setCameraSize(cs=>cs.w===result.sw&&cs.h===result.sh?cs:{w:result.sw,h:result.sh});
         if(motionEnabled){
-          setMotionLevel(result.motionFrac);
+          const nowMl=performance.now();
+          if(nowMl-lastMlRef.current>200){lastMlRef.current=nowMl;setMotionLevel(result.motionFrac);}
           // TF detection: time-throttled (500ms), non-blocking, busy-guarded
           const nowTf=performance.now();
           if(modelReady&&tfDetect&&disp&&nowTf-lastTfRef.current>500){
