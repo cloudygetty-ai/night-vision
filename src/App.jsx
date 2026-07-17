@@ -317,6 +317,21 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
 
   // Day vision modes skip NVG/thermal pipeline entirely
   const isDayMode=mode==="TACT"||mode==="HAZE"||mode==="POLAR"||mode==="RAW";
+  const isAstro=mode==="ASTRO";
+
+  // ASTRO: 30-frame additive long exposure — reveals stars & faint light
+  if(mode==="ASTRO"){
+    const stacked=stackFrames(data,refs.stackBuf,refs.stackIdx,30);
+    if(stacked){
+      for(let i=0;i<data.length;i+=4){
+        // Additive gain ×3.5 + gamma 0.55 deep shadow lift, cool blue-white palette
+        const v=Math.min(255,Math.pow(Math.min(255,stacked[i/4]*3.5)/255,0.55)*255);
+        data[i]=Math.min(255,v*0.85);
+        data[i+1]=Math.min(255,v*0.92);
+        data[i+2]=Math.min(255,v*1.06);
+      }
+    }
+  }
 
   // NVG: extreme processing pipeline
   let stackedLum=null;
@@ -365,8 +380,8 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
     }else if(mode==="BLUE"){
       data[i]=Math.min(255,boosted*0.12);data[i+1]=Math.min(255,boosted*0.32);data[i+2]=Math.min(255,boosted*1.15+b*0.25);
       const n=(Math.random()-.5)*7;data[i+2]=Math.max(0,Math.min(255,data[i+2]+n));
-    }else if(mode==="TACT"||mode==="HAZE"||mode==="POLAR"||mode==="RAW"){
-      // Day / raw modes: pass-through untouched
+    }else if(mode==="TACT"||mode==="HAZE"||mode==="POLAR"||mode==="RAW"||mode==="ASTRO"){
+      // Day / raw / astro: already handled — pass through
       data[i]=r;data[i+1]=g;data[i+2]=b;
     }else{const w2=Math.min(255,boosted);data[i]=data[i+1]=data[i+2]=w2;}
 
@@ -774,6 +789,128 @@ function useCameraStream(constraints,enabled=true){
 
   useEffect(()=>()=>stream?.getTracks().forEach(t=>t.stop()),[stream]);
   return{stream,error,ready,retry};
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NVS-8.0 — TARGET TRACKER (persistent IDs, trails, velocity)
+// ═══════════════════════════════════════════════════════════════════════════════
+class TargetTracker{
+  constructor(){this.tracks=[];this.nextId=1;}
+  update(detections,now){
+    const MAXDIST=120,MAXAGE=1500,TRAIL=24;
+    const unmatched=[...detections];
+    // Associate nearest detection to each live track
+    for(const tr of this.tracks){
+      let best=-1,bestD=MAXDIST;
+      for(let i=0;i<unmatched.length;i++){
+        const d=Math.hypot(unmatched[i].cx-tr.cx,unmatched[i].cy-tr.cy);
+        if(d<bestD){bestD=d;best=i;}
+      }
+      if(best>=0){
+        const det=unmatched.splice(best,1)[0];
+        const dt=Math.max(16,now-tr.t);
+        tr.vx=0.7*tr.vx+0.3*((det.cx-tr.cx)/dt*1000);
+        tr.vy=0.7*tr.vy+0.3*((det.cy-tr.cy)/dt*1000);
+        Object.assign(tr,det);tr.t=now;
+        tr.trail.push({x:det.cx,y:det.cy});
+        if(tr.trail.length>TRAIL)tr.trail.shift();
+      }
+    }
+    // Spawn new tracks
+    for(const det of unmatched){
+      this.tracks.push({...det,id:this.nextId++,t:now,vx:0,vy:0,trail:[{x:det.cx,y:det.cy}]});
+    }
+    // Reap stale
+    this.tracks=this.tracks.filter(tr=>now-tr.t<MAXAGE);
+    return this.tracks;
+  }
+}
+
+// Screen wake lock — keeps display on during surveillance
+function useWakeLock(){
+  useEffect(()=>{
+    let lock=null,active=true;
+    const acquire=async()=>{
+      try{lock=await navigator.wakeLock?.request("screen");}catch{}
+    };
+    acquire();
+    const onVis=()=>{if(document.visibilityState==="visible"&&active)acquire();};
+    document.addEventListener("visibilitychange",onVis);
+    return()=>{active=false;document.removeEventListener("visibilitychange",onVis);lock?.release?.().catch(()=>{});};
+  },[]);
+}
+
+// Battery status
+function useBattery(){
+  const[bat,setBat]=useState(null);
+  useEffect(()=>{
+    let b=null;
+    navigator.getBattery?.().then(battery=>{
+      b=battery;
+      const upd=()=>setBat({level:Math.round(battery.level*100),charging:battery.charging});
+      upd();
+      battery.addEventListener("levelchange",upd);
+      battery.addEventListener("chargingchange",upd);
+    }).catch(()=>{});
+    return()=>{};
+  },[]);
+  return bat;
+}
+
+// Voice control — Web Speech API
+function useVoiceControl(enabled,commands){
+  const[listening,setListening]=useState(false);
+  const[lastCmd,setLastCmd]=useState(null);
+  const cmdRef=useRef(commands);
+  cmdRef.current=commands;
+  useEffect(()=>{
+    if(!enabled){setListening(false);return;}
+    const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+    if(!SR)return;
+    const rec=new SR();
+    rec.continuous=true;rec.interimResults=false;rec.lang="en-US";
+    rec.onresult=e=>{
+      const text=e.results[e.results.length-1][0].transcript.toLowerCase().trim();
+      for(const[phrase,fn]of Object.entries(cmdRef.current)){
+        if(text.includes(phrase)){fn();setLastCmd(phrase.toUpperCase());setTimeout(()=>setLastCmd(null),2000);break;}
+      }
+    };
+    rec.onend=()=>{if(enabled)try{rec.start();}catch{}};
+    try{rec.start();setListening(true);}catch{}
+    return()=>{rec.onend=null;try{rec.stop();}catch{};setListening(false);};
+  },[enabled]);
+  return{listening,lastCmd};
+}
+
+// Threat audio alert — synthesized beep via WebAudio
+function useThreatBeep(){
+  const ctxRef=useRef(null);
+  return useCallback((kind="alert")=>{
+    try{
+      if(!ctxRef.current)ctxRef.current=new(window.AudioContext||window.webkitAudioContext)();
+      const ctx=ctxRef.current;
+      const o=ctx.createOscillator(),g=ctx.createGain();
+      o.connect(g);g.connect(ctx.destination);
+      if(kind==="person"){o.frequency.value=880;g.gain.value=0.15;}
+      else if(kind==="wire"){o.frequency.value=1320;g.gain.value=0.2;}
+      else{o.frequency.value=660;g.gain.value=0.12;}
+      o.type="square";
+      const t=ctx.currentTime;
+      o.start(t);
+      g.gain.setValueAtTime(g.gain.value,t);
+      g.gain.exponentialRampToValueAtTime(0.001,t+0.18);
+      o.stop(t+0.2);
+      if(kind==="wire"){ // double beep
+        const o2=ctx.createOscillator(),g2=ctx.createGain();
+        o2.connect(g2);g2.connect(ctx.destination);
+        o2.frequency.value=1320;o2.type="square";
+        o2.start(t+0.25);
+        g2.gain.setValueAtTime(0.2,t+0.25);
+        g2.gain.exponentialRampToValueAtTime(0.001,t+0.43);
+        o2.stop(t+0.45);
+      }
+    }catch{}
+  },[]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1657,6 +1794,33 @@ function TargetBoxes({blobs,cw,ch,color,autoCapPending}){
   if(!blobs||!blobs.length)return null;
   return(
     <div style={{position:"absolute",inset:0,pointerEvents:"none",zIndex:22}}>
+      {/* Motion trails + velocity vectors */}
+      <svg style={{position:"absolute",inset:0,width:"100%",height:"100%"}} viewBox={`0 0 ${cw} ${ch}`} preserveAspectRatio="none">
+        {blobs.map((b,i)=>{
+          const tc=THREAT_C[Math.min(i,7)];
+          return(
+            <g key={`tr${b.id||i}`}>
+              {b.trail&&b.trail.length>1&&(
+                <polyline points={b.trail.map(p=>`${p.x},${p.y}`).join(" ")}
+                  fill="none" stroke={tc} strokeWidth={cw/300} strokeOpacity="0.55"
+                  strokeDasharray={`${cw/150},${cw/300}`} strokeLinecap="round"/>
+              )}
+              {(Math.abs(b.vx)>15||Math.abs(b.vy)>15)&&(
+                <line x1={b.cx} y1={b.cy}
+                  x2={b.cx+Math.max(-cw/4,Math.min(cw/4,b.vx*0.8))}
+                  y2={b.cy+Math.max(-ch/4,Math.min(ch/4,b.vy*0.8))}
+                  stroke={tc} strokeWidth={cw/250} strokeOpacity="0.85"
+                  markerEnd="url(#vhead)"/>
+              )}
+            </g>
+          );
+        })}
+        <defs>
+          <marker id="vhead" markerWidth="6" markerHeight="6" refX="4" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#ffdd00"/>
+          </marker>
+        </defs>
+      </svg>
       {blobs.map((b,i)=>{
         const x=(b.x/cw)*100,y=(b.y/ch)*100,bw=(b.w/cw)*100,bh=(b.h/ch)*100,pad=1.2;
         const tc=THREAT_C[Math.min(i,7)],thr=THREAT_L[Math.min(i,7)];
@@ -1691,7 +1855,7 @@ function TargetBoxes({blobs,cw,ch,color,autoCapPending}){
                   boxShadow:`0 0 8px ${tc}60`,
                   whiteSpace:"nowrap",
                 }}>
-                  {b.icon} {b.label}
+                  {b.icon} {b.label}{b.id?` #${b.id}`:""}
                 </span>
                 <span style={{
                   fontSize:isMain?9:7,fontWeight:600,
@@ -1762,10 +1926,12 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
   const prevRef=useRef(null),motRef=useRef(null),cooldown=useRef(0),fpsRef=useRef({frames:0,last:performance.now()});
   const stackBuf=useRef(null),stackIdx=useRef(0);
   const lastTfRef=useRef(0);const lastMlRef=useRef(0);
+  const trackerRef=useRef(new TargetTracker());
+  const[magnify,setMagnify]=useState(null);
   const[blobs,setBlobs]=useState([]);const[motionLevel,setMotionLevel]=useState(0);
   const[tempData,setTempData]=useState(null);const[cameraSize,setCameraSize]=useState({w:1280,h:720});
   const[fps,setFps]=useState(0);const[flash,setFlash]=useState(false);const[autoCapPending,setAutoCapPending]=useState(false);
-  const MODE_LUT={NVG:null,THERMAL:"THERMAL",RAINBOW:"RAINBOW",FUSION:"FUSION",BLUE:null,WHITE:null};
+  const MODE_LUT={NVG:null,THERMAL:"THERMAL",RAINBOW:"RAINBOW",FUSION:"FUSION",BLUE:null,WHITE:null,ASTRO:null};
 
   useEffect(()=>{
     if(!videoRef.current||!stream)return;
@@ -1811,17 +1977,20 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
           if(modelReady&&tfDetect&&disp&&nowTf-lastTfRef.current>500){
             lastTfRef.current=nowTf;
             tfDetect(disp).then(preds=>{
+              const nowTr=performance.now();
               if(preds&&preds.length>0){
                 const sx=result.sw/disp.width,sy=result.sh/disp.height;
-                setBlobs(preds.map(p=>({...p,
-                  x:p.x*sx,y:p.y*sy,w:p.w*sx,h:p.h*sy,cx:p.cx*sx,cy:p.cy*sy})));
+                const dets=preds.map(p=>({...p,
+                  x:p.x*sx,y:p.y*sy,w:p.w*sx,h:p.h*sy,cx:p.cx*sx,cy:p.cy*sy}));
+                setBlobs(trackerRef.current.update(dets,nowTr).slice());
               } else if(preds){
-                setBlobs(result.blobs.map(b=>({...b,...classifyBlobFallback(b,result.sw,result.sh)})));
+                const dets=result.blobs.map(b=>({...b,...classifyBlobFallback(b,result.sw,result.sh)}));
+                setBlobs(trackerRef.current.update(dets,nowTr).slice());
               }
-              // preds===null → detector busy, keep previous boxes (no flicker)
             }).catch(()=>{});
           } else if(!modelReady){
-            setBlobs(result.blobs.map(b=>({...b,...classifyBlobFallback(b,result.sw,result.sh)})));
+            const dets=result.blobs.map(b=>({...b,...classifyBlobFallback(b,result.sw,result.sh)}));
+            setBlobs(trackerRef.current.update(dets,performance.now()).slice());
           }
           const now=Date.now();
           if(autoCapture&&result.blobs.length>0&&result.motionFrac>0.008&&now-cooldown.current>3000){
@@ -1931,6 +2100,7 @@ const MODE_META={
   TACT:   {label:"TACT",   color:"#f0e060"},
   HAZE:   {label:"DEHAZE", color:"#60d0ff"},
   POLAR:  {label:"POLARIZ",color:"#ff60d0"},
+  ASTRO:  {label:"ASTRO",  color:"#a0b8ff"},
 };
 const MODE_KEYS=Object.keys(MODE_META);
 const ZOOM_STEPS=[1,1.5,2,3,4,6,8,12];
@@ -1983,6 +2153,25 @@ export default function NightVisionCamera(){
   const front=useCameraStream({facingMode:"user"},dualMode);
   const{hzoom,maxZoom,supported:hzoomSupported,applyZoom}=useHardwareZoom(hardZoom?rear.stream:null);
   const{detect:tfDetect,modelReady}=useTFDetector();
+  useWakeLock();
+  const battery=useBattery();
+  const beep=useThreatBeep();
+  const[voiceOn,setVoiceOn]=useState(false);
+  const[alertsOn,setAlertsOn]=useState(true);
+  const{listening,lastCmd}=useVoiceControl(voiceOn,{
+    "night vision":()=>setMode("NVG"),
+    "thermal":()=>setMode("THERMAL"),
+    "raw":()=>setMode("RAW"),
+    "astro":()=>setMode("ASTRO"),
+    "tactical":()=>setMode("TACT"),
+    "capture":()=>manualSnapRef.current?.(),
+    "burst":()=>burstSnapRef.current?.(),
+    "record":()=>toggleRecordRef.current?.(),
+    "torch":()=>toggleTorch(),
+    "zoom in":()=>setZoom(z=>Math.min(12,z*2)),
+    "zoom out":()=>setZoom(z=>Math.max(1,z/2)),
+  });
+  const manualSnapRef=useRef(null),burstSnapRef=useRef(null),toggleRecordRef=useRef(null);
 
   const color=MODE_META[mode].color;
   const timeStr=clock.toLocaleTimeString("en-US",{hour12:false});
@@ -2000,14 +2189,24 @@ export default function NightVisionCamera(){
   },[addEvent]);
 
   // Handle motion events → timeline + GPS pin + multicast
+  // Beep when a PERSON track appears (throttled 4s)
+  const lastPersonBeep=useRef(0);
+  useEffect(()=>{
+    // handled inside handleMotionEvent below
+  },[]);
+
   const handleMotionEvent=useCallback((blob,label)=>{
     const evt={label:`${label} ${blob.label||"MOTION"}`,conf:blob.conf,lat:gps?.lat,lon:gps?.lon,icon:blob.icon||"🎯"};
     addEvent("motion",evt);
     broadcast("MOTION_ALERT",evt);
-  },[addEvent,broadcast,gps]);
+    if(alertsOn&&blob.label==="PERSON"&&Date.now()-lastPersonBeep.current>4000){
+      lastPersonBeep.current=Date.now();beep("person");
+    }
+  },[addEvent,broadcast,gps,alertsOn,beep]);
 
   // Handle tripwire hits
   const handleTripwireHit=useCallback((ids,label)=>{
+    if(alertsOn)beep("wire");
     setTripwires(tw=>tw.map(t=>ids.includes(t.id)?{...t,triggered:true}:t));
     ids.forEach(id=>{
       const tw=tripwires.find(t=>t.id===id);
@@ -2078,6 +2277,9 @@ export default function NightVisionCamera(){
     addEvent("export",{label:`Session report exported — ${events.length} events, ${captures.length} captures`});
   },[mode,zoom,sensitivity,gps,altitude,pressure,events,captures,tripwires,addEvent]);
 
+  // Voice command refs (fns defined above)
+  useEffect(()=>{manualSnapRef.current=manualSnap;burstSnapRef.current=burstSnap;toggleRecordRef.current=toggleRecord;});
+
   // Shake → burst capture
   useEffect(()=>{
     if(shakeImpact&&burstMode)burstSnap();
@@ -2146,6 +2348,10 @@ export default function NightVisionCamera(){
             {multiSync&&peers.length>0&&<span style={{fontSize:7,color:"#cc44ff",letterSpacing:1,border:"1px solid #cc44ff30",padding:"1px 4px",borderRadius:1}}>{peers.length}P</span>}
             {hasTripwire&&<span style={{fontSize:7,color:"#ffcc00",letterSpacing:1,animation:"rec-blink 0.4s step-end infinite",border:"1px solid #ffcc0050",padding:"1px 4px",borderRadius:1}}>⚠WIRE</span>}
             {audioSpike&&<span style={{fontSize:7,color:"#ff2222",letterSpacing:1,animation:"rec-blink 0.3s step-end infinite"}}>🔊!</span>}
+            {torchOn&&<span style={{fontSize:9}}>🔦</span>}
+            {modelReady?<span style={{fontSize:7,color:"rgba(0,255,80,0.7)",letterSpacing:1}}>AI✓</span>:<span style={{fontSize:7,color:"rgba(255,200,0,0.7)",letterSpacing:1,animation:"rec-blink 1s step-end infinite"}}>AI▸</span>}
+            {listening&&<span style={{fontSize:7,color:"#ff88ff",letterSpacing:1,animation:"rec-blink 1.2s step-end infinite"}}>🎤VOX</span>}
+            {lastCmd&&<span style={{fontSize:7,color:"#ffdd00",letterSpacing:1,fontWeight:700}}>»{lastCmd}</span>}
           </div>
           <div style={{display:"flex",flexDirection:"column",alignItems:"center"}}>
             <span style={{fontSize:6,color:`${color}45`,letterSpacing:1}}>{dateStr}</span>
@@ -2156,6 +2362,7 @@ export default function NightVisionCamera(){
             {gps&&<span style={{fontSize:6,color:`${color}40`,letterSpacing:.5}}>{gps.lat.toFixed(3)}°N</span>}
             {altitude!=null&&<span style={{fontSize:6,color:`${color}35`,letterSpacing:.5}}>{altitude}m ASL</span>}
             {wind>1&&<span style={{fontSize:6,color:`${color}35`,letterSpacing:.5}}>💨{wind.toFixed(1)}m/s</span>}
+            {battery&&<span style={{fontSize:6,color:battery.level<20?"#ff4444":`${color}35`,letterSpacing:.5}}>{battery.charging?"⚡":"🔋"}{battery.level}%</span>}
             <div style={{display:"flex",gap:4,alignItems:"center"}}>
               <SignalBars level={.8} color={color}/>
               {autoCapture&&<span style={{fontSize:6,color:"#ffdd00",animation:"rec-blink 1.5s step-end infinite"}}>AUTO</span>}
@@ -2300,6 +2507,8 @@ export default function NightVisionCamera(){
                 {l:"SHAKE",v:shakeEnabled,f:()=>setShakeEnabled(s=>!s),c:"#ff8844"},
                 {l:"HW ZOOM",v:hardZoom,f:()=>setHardZoom(h=>!h),c:"#44ffcc"},
                 {l:"SYNC",v:multiSync,f:()=>setMultiSync(s=>!s),c:"#cc44ff"},
+                {l:"🎤 VOICE",v:voiceOn,f:()=>setVoiceOn(v=>!v),c:"#ff88ff"},
+                {l:"🔔 ALERTS",v:alertsOn,f:()=>setAlertsOn(a=>!a),c:"#ffaa00"},
               ].map(({l,v,f,c})=>(
                 <button key={l} onClick={f} style={{
                   padding:"10px 4px",
