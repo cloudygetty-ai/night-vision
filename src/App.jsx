@@ -402,6 +402,26 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
     }
   }
 
+  // Motion heatmap: accumulate motion into decaying heat buffer, blend as overlay
+  if(refs.heatOn){
+    if(!refs.heat.current||refs.heat.current.length!==sw*sh)refs.heat.current=new Float32Array(sw*sh);
+    const heat=refs.heat.current;
+    for(let p=0;p<sw*sh;p++){
+      if(motionMap[p])heat[p]=Math.min(1,heat[p]+0.08);
+      else heat[p]*=0.995; // slow decay — zones persist ~30s
+    }
+    for(let p=0;p<sw*sh;p++){
+      const hv=heat[p];
+      if(hv>0.05){
+        const i=p*4;
+        // cold→hot: blue→yellow→red
+        data[i]  =Math.min(255,data[i]+hv*220);
+        data[i+1]=Math.min(255,data[i+1]+(hv<0.5?hv*160:(1-hv)*160));
+        data[i+2]=Math.min(255,data[i+2]+(hv<0.3?hv*200:0));
+      }
+    }
+  }
+
   // Phosphor bloom pass (NVG only) — after pixel processing, before output
   if(mode==="NVG") applyPhosphorBloom(data,sw,sh);
 
@@ -1790,6 +1810,43 @@ function SignalBars({level=.8,color}){
 // AI Object boxes
 const THREAT_L=["CRITICAL","HIGH","MED","LOW","TRACE","TRACK","--","--"];
 const THREAT_C=["#ff2222","#ff5500","#ffaa00","#ffdd00","#aaffaa","#00ffcc","#00ccff","#aaaaaa"];
+// PIP Magnifier — 3x zoomed inset of tapped region, live
+function MagnifierPIP({source,fx,fy,color,onClose}){
+  const pipRef=useRef(null);
+  useEffect(()=>{
+    let raf;
+    const draw=()=>{
+      const src=source.current,pip=pipRef.current;
+      if(src&&pip&&src.width>0){
+        const ctx=pip.getContext("2d");
+        const MAG=3,VW=src.width/MAG,VH=src.height/MAG;
+        const sx=Math.max(0,Math.min(src.width-VW,fx*src.width-VW/2));
+        const sy=Math.max(0,Math.min(src.height-VH,fy*src.height-VH/2));
+        pip.width=300;pip.height=300*(VH/VW);
+        ctx.imageSmoothingEnabled=false;
+        ctx.drawImage(src,sx,sy,VW,VH,0,0,pip.width,pip.height);
+        // crosshair
+        ctx.strokeStyle=color;ctx.lineWidth=1;ctx.globalAlpha=0.7;
+        ctx.beginPath();ctx.moveTo(pip.width/2,0);ctx.lineTo(pip.width/2,pip.height);
+        ctx.moveTo(0,pip.height/2);ctx.lineTo(pip.width,pip.height/2);ctx.stroke();
+        ctx.globalAlpha=1;
+      }
+      raf=requestAnimationFrame(draw);
+    };
+    raf=requestAnimationFrame(draw);
+    return()=>cancelAnimationFrame(raf);
+  },[source,fx,fy,color]);
+  return(
+    <div onClick={onClose} style={{position:"absolute",top:8,right:8,zIndex:40,
+      border:`2px solid ${color}`,borderRadius:8,overflow:"hidden",
+      boxShadow:`0 0 16px ${color}50`,cursor:"pointer",width:"42%",maxWidth:220}}>
+      <canvas ref={pipRef} style={{width:"100%",display:"block"}}/>
+      <div style={{position:"absolute",top:3,left:6,fontSize:8,color,fontFamily:"'DM Mono',monospace",
+        letterSpacing:1,textShadow:"0 0 4px #000"}}>3× MAG — TAP TO CLOSE</div>
+    </div>
+  );
+}
+
 function TargetBoxes({blobs,cw,ch,color,autoCapPending}){
   if(!blobs||!blobs.length)return null;
   return(
@@ -1921,12 +1978,13 @@ function ThermalOverlay({tempData,mode}){
 // ═══════════════════════════════════════════════════════════════════════════════
 function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeOverlay,
   noiseReduction,color,zoom,showReticle,motionEnabled,autoCapture,tripwires,showRPPG,
-  onCapture,onMotionEvent,onTripwireHit,onRPPG,compact=false,tfDetect,modelReady,onRetry}){
+  onCapture,onMotionEvent,onTripwireHit,onRPPG,compact=false,tfDetect,modelReady,onRetry,heatmapOn=false}){
   const videoRef=useRef(null),rawRef=useRef(null),dispRef=useRef(null),rafRef=useRef(null);
   const prevRef=useRef(null),motRef=useRef(null),cooldown=useRef(0),fpsRef=useRef({frames:0,last:performance.now()});
   const stackBuf=useRef(null),stackIdx=useRef(0);
   const lastTfRef=useRef(0);const lastMlRef=useRef(0);
   const trackerRef=useRef(new TargetTracker());
+  const heatRef=useRef(null);
   const[magnify,setMagnify]=useState(null);
   const[blobs,setBlobs]=useState([]);const[motionLevel,setMotionLevel]=useState(0);
   const[tempData,setTempData]=useState(null);const[cameraSize,setCameraSize]=useState({w:1280,h:720});
@@ -1965,7 +2023,7 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
     if(video&&raw&&disp){
       const result=processFrame(video,raw,disp,
         {mode,brightness,sensitivity,edgeOverlay,noiseReduction,lutName:MODE_LUT[mode]||null,tripwires,showRPPG},
-        {prev:prevRef,motion:motRef,stackBuf,stackIdx}
+        {prev:prevRef,motion:motRef,stackBuf,stackIdx,heat:heatRef,heatOn:heatmapOn}
       );
       if(result){
         setCameraSize(cs=>cs.w===result.sw&&cs.h===result.sh?cs:{w:result.sw,h:result.sh});
@@ -2021,9 +2079,16 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
     <div style={{position:"relative",width:"100%",flex:1,minHeight:0,background:"#010801",overflow:"hidden",border:`1px solid ${color}12`}}>
       <video ref={videoRef} muted playsInline autoPlay style={{position:"absolute",opacity:0,pointerEvents:"none",width:"100%",height:"100%",objectFit:"cover"}}/>
       <canvas ref={rawRef} style={{display:"none"}}/>
-      <canvas ref={dispRef} data-primary={label==="REAR"?"true":undefined} style={{width:"100%",height:"100%",display:"block",
+      <canvas ref={dispRef} data-primary={label==="REAR"?"true":undefined}
+        onClick={e=>{
+          const r=e.currentTarget.getBoundingClientRect();
+          const fx=(e.clientX-r.left)/r.width,fy=(e.clientY-r.top)/r.height;
+          setMagnify(m=>m?null:{fx,fy});
+        }}
+        style={{width:"100%",height:"100%",display:"block",
         transform:`scale(${zoom})`,transformOrigin:"center",transition:"transform 0.15s ease",
-        imageRendering:zoom>=4?"pixelated":"auto"}}/>
+        imageRendering:zoom>=4?"pixelated":"auto",cursor:"crosshair"}}/>
+      {magnify&&<MagnifierPIP source={dispRef} fx={magnify.fx} fy={magnify.fy} color={color} onClose={()=>setMagnify(null)}/>}
       <div style={{position:"absolute",inset:0,pointerEvents:"none",zIndex:10,overflow:"hidden"}}>
         <div style={{position:"absolute",left:0,right:0,height:2,
           background:`linear-gradient(180deg,transparent,${color}12,transparent)`,
@@ -2157,6 +2222,9 @@ export default function NightVisionCamera(){
   const battery=useBattery();
   const beep=useThreatBeep();
   const[voiceOn,setVoiceOn]=useState(false);
+  const[sentryOn,setSentryOn]=useState(false);
+  const[heatmapOn,setHeatmapOn]=useState(false);
+  const sentryRecUntil=useRef(0);
   const[alertsOn,setAlertsOn]=useState(true);
   const{listening,lastCmd}=useVoiceControl(voiceOn,{
     "night vision":()=>setMode("NVG"),
@@ -2172,6 +2240,7 @@ export default function NightVisionCamera(){
     "zoom out":()=>setZoom(z=>Math.max(1,z/2)),
   });
   const manualSnapRef=useRef(null),burstSnapRef=useRef(null),toggleRecordRef=useRef(null);
+  const recordingRef=useRef(false);
 
   const color=MODE_META[mode].color;
   const timeStr=clock.toLocaleTimeString("en-US",{hour12:false});
@@ -2202,7 +2271,22 @@ export default function NightVisionCamera(){
     if(alertsOn&&blob.label==="PERSON"&&Date.now()-lastPersonBeep.current>4000){
       lastPersonBeep.current=Date.now();beep("person");
     }
-  },[addEvent,broadcast,gps,alertsOn,beep]);
+    // SENTRY: person detected → auto-record 10s clip
+    if(sentryOn&&blob.label==="PERSON"){
+      const now=Date.now();
+      sentryRecUntil.current=now+10000;
+      if(!recordingRef.current){
+        toggleRecordRef.current?.();
+        addEvent("sentry",{label:"SENTRY AUTO-REC — PERSON DETECTED"});
+        const checkStop=()=>{
+          if(Date.now()>=sentryRecUntil.current){
+            if(recordingRef.current)toggleRecordRef.current?.();
+          }else setTimeout(checkStop,1000);
+        };
+        setTimeout(checkStop,10000);
+      }
+    }
+  },[addEvent,broadcast,gps,alertsOn,beep,sentryOn]);
 
   // Handle tripwire hits
   const handleTripwireHit=useCallback((ids,label)=>{
@@ -2278,7 +2362,7 @@ export default function NightVisionCamera(){
   },[mode,zoom,sensitivity,gps,altitude,pressure,events,captures,tripwires,addEvent]);
 
   // Voice command refs (fns defined above)
-  useEffect(()=>{manualSnapRef.current=manualSnap;burstSnapRef.current=burstSnap;toggleRecordRef.current=toggleRecord;});
+  useEffect(()=>{manualSnapRef.current=manualSnap;burstSnapRef.current=burstSnap;toggleRecordRef.current=toggleRecord;recordingRef.current=recording;});
 
   // Shake → burst capture
   useEffect(()=>{
@@ -2352,6 +2436,7 @@ export default function NightVisionCamera(){
             {modelReady?<span style={{fontSize:7,color:"rgba(0,255,80,0.7)",letterSpacing:1}}>AI✓</span>:<span style={{fontSize:7,color:"rgba(255,200,0,0.7)",letterSpacing:1,animation:"rec-blink 1s step-end infinite"}}>AI▸</span>}
             {listening&&<span style={{fontSize:7,color:"#ff88ff",letterSpacing:1,animation:"rec-blink 1.2s step-end infinite"}}>🎤VOX</span>}
             {lastCmd&&<span style={{fontSize:7,color:"#ffdd00",letterSpacing:1,fontWeight:700}}>»{lastCmd}</span>}
+            {sentryOn&&<span style={{fontSize:7,color:"#ff3355",letterSpacing:1,fontWeight:700,border:"1px solid #ff335560",padding:"1px 4px",borderRadius:2}}>🛡SENTRY</span>}
           </div>
           <div style={{display:"flex",flexDirection:"column",alignItems:"center"}}>
             <span style={{fontSize:6,color:`${color}45`,letterSpacing:1}}>{dateStr}</span>
@@ -2380,14 +2465,14 @@ export default function NightVisionCamera(){
               motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
               showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
               onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={true}
-              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry}/>
+              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry} heatmapOn={heatmapOn}/>
             <CameraPanel stream={front.stream} ready={front.ready} error={front.error} label="FRONT"
               mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
               noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
               motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
               showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
               onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={true}
-              tfDetect={tfDetect} modelReady={modelReady} onRetry={front.retry}/>
+              tfDetect={tfDetect} modelReady={modelReady} onRetry={front.retry} heatmapOn={heatmapOn}/>
           </div>
         ):(
           <div style={{height:"45dvh",flexShrink:0,display:"flex",flexDirection:"column"}}>
@@ -2397,7 +2482,7 @@ export default function NightVisionCamera(){
               motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
               showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
               onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={false}
-              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry}/>
+              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry} heatmapOn={heatmapOn}/>
             {(showRPPG||audioEnabled)&&(
               <BiometricHUD hr={hr} audioLevel={audioLevel} audioSpike={audioSpike} color={color}/>
             )}
@@ -2509,6 +2594,8 @@ export default function NightVisionCamera(){
                 {l:"SYNC",v:multiSync,f:()=>setMultiSync(s=>!s),c:"#cc44ff"},
                 {l:"🎤 VOICE",v:voiceOn,f:()=>setVoiceOn(v=>!v),c:"#ff88ff"},
                 {l:"🔔 ALERTS",v:alertsOn,f:()=>setAlertsOn(a=>!a),c:"#ffaa00"},
+                {l:"🛡 SENTRY",v:sentryOn,f:()=>setSentryOn(s=>!s),c:"#ff3355"},
+                {l:"🌡 HEAT",v:heatmapOn,f:()=>setHeatmapOn(h=>!h),c:"#ff7700"},
               ].map(({l,v,f,c})=>(
                 <button key={l} onClick={f} style={{
                   padding:"10px 4px",
