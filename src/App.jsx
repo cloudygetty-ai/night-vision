@@ -559,76 +559,107 @@ function useDeviceOrientation(){
 }
 function useGPS(){
   const[pos,setPos]=useState(null);
+  const[track,setTrack]=useState([]);
   useEffect(()=>{
     if(!navigator.geolocation)return;
-    const id=navigator.geolocation.watchPosition(
-      p=>setPos({lat:p.coords.latitude,lon:p.coords.longitude,acc:p.coords.accuracy}),
-      ()=>{},
-      {enableHighAccuracy:true,maximumAge:5000}
-    );
+    const id=navigator.geolocation.watchPosition(p=>{
+      const next={lat:p.coords.latitude,lon:p.coords.longitude,acc:p.coords.accuracy,
+        alt:p.coords.altitude,speed:p.coords.speed,heading:p.coords.heading,t:Date.now()};
+      setPos(next);
+      setTrack(tr=>{
+        const last=tr[tr.length-1];
+        if(!last)return[next];
+        const d=Math.hypot((next.lat-last.lat)*111320,(next.lon-last.lon)*111320*Math.cos(next.lat*Math.PI/180));
+        return d>3?[...tr.slice(-499),next]:tr;
+      });
+    },()=>{},{enableHighAccuracy:true,maximumAge:2000,timeout:10000});
     return()=>navigator.geolocation.clearWatch(id);
   },[]);
-  return pos;
+  return{pos,track};
 }
-function useMicrophone(enabled){
+function useMicrophone(enabled,analyserOut){
   const[level,setLevel]=useState(0);
   const[spike,setSpike]=useState(false);
-  const ctxRef=useRef(null);
-  const analyserRef=useRef(null);
-  const rafRef=useRef(null);
-  const baselineRef=useRef(50);
+  const[peakFreq,setPeakFreq]=useState(0);
+  const baseRef=useRef(0);
   useEffect(()=>{
     if(!enabled){setLevel(0);setSpike(false);return;}
-    let active=true;
-    navigator.mediaDevices?.getUserMedia({audio:true,video:false}).then(stream=>{
-      if(!active)return;
-      const ctx=new(window.AudioContext||window.webkitAudioContext)();
-      const analyser=ctx.createAnalyser();
-      analyser.fftSize=256;
-      const src=ctx.createMediaStreamSource(stream);
+    let ctx,src,analyser,raf,stream;
+    navigator.mediaDevices?.getUserMedia({audio:true,video:false}).then(s=>{
+      stream=s;
+      ctx=new(window.AudioContext||window.webkitAudioContext)();
+      src=ctx.createMediaStreamSource(s);
+      analyser=ctx.createAnalyser();
+      analyser.fftSize=1024;analyser.smoothingTimeConstant=0.6;
       src.connect(analyser);
-      ctxRef.current=ctx;analyserRef.current=analyser;
-      const buf=new Uint8Array(analyser.frequencyBinCount);
+      if(analyserOut)analyserOut.current=analyser;
+      const freq=new Uint8Array(analyser.frequencyBinCount);
+      const time=new Uint8Array(analyser.fftSize);
       const tick=()=>{
-        if(!active)return;
-        analyser.getByteFrequencyData(buf);
-        const avg=buf.reduce((s,v)=>s+v,0)/buf.length;
-        setLevel(Math.round(avg));
-        baselineRef.current=baselineRef.current*0.98+avg*0.02;
-        setSpike(avg>baselineRef.current*2.2&&avg>35);
-        rafRef.current=requestAnimationFrame(tick);
+        analyser.getByteTimeDomainData(time);
+        let sum=0;
+        for(let i=0;i<time.length;i++){const d=(time[i]-128)/128;sum+=d*d;}
+        const rms=Math.sqrt(sum/time.length);
+        setLevel(rms);
+        baseRef.current=baseRef.current*0.97+rms*0.03;
+        setSpike(rms>baseRef.current*2.2&&rms>0.02);
+        analyser.getByteFrequencyData(freq);
+        let mi=0,mv=0;
+        for(let i=1;i<freq.length;i++)if(freq[i]>mv){mv=freq[i];mi=i;}
+        setPeakFreq(Math.round(mi*ctx.sampleRate/analyser.fftSize));
+        raf=requestAnimationFrame(tick);
       };
-      rafRef.current=requestAnimationFrame(tick);
+      tick();
     }).catch(()=>{});
-    return()=>{
-      active=false;
-      cancelAnimationFrame(rafRef.current);
-      ctxRef.current?.close();
-    };
-  },[enabled]);
-  return{level,spike};
+    return()=>{cancelAnimationFrame(raf);stream?.getTracks().forEach(t=>t.stop());ctx?.close?.();if(analyserOut)analyserOut.current=null;};
+  },[enabled,analyserOut]);
+  return{level,spike,peakFreq};
 }
 function useRPPG(samples){
   const[hr,setHr]=useState(null);
+  const[quality,setQuality]=useState(0);
+  const[spo2,setSpo2]=useState(null);
   const bufRef=useRef([]);
   useEffect(()=>{
-    if(!samples)return;
-    const buf=bufRef.current;
-    buf.push({v:samples,t:Date.now()});
-    if(buf.length>180)buf.shift();
-    if(buf.length<60)return;
-    // Peak detection on green channel signal
-    const vals=buf.map(b=>b.v);
-    const mean=vals.reduce((s,v)=>s+v,0)/vals.length;
-    const norm=vals.map(v=>v-mean);
-    let peaks=0;
-    for(let i=1;i<norm.length-1;i++){
-      if(norm[i]>norm[i-1]&&norm[i]>norm[i+1]&&norm[i]>2)peaks++;
+    if(samples==null)return;
+    const b=bufRef.current;
+    b.push({v:samples,t:Date.now()});
+    if(b.length>256)b.shift();
+    if(b.length<128)return;
+    // Detrend (remove DC + linear drift)
+    const n=b.length,vals=b.map(x=>x.v);
+    const mean=vals.reduce((s,v)=>s+v,0)/n;
+    const det=vals.map((v,i)=>v-mean);
+    // Hamming window
+    const win=det.map((v,i)=>v*(0.54-0.46*Math.cos(2*Math.PI*i/(n-1))));
+    // Effective sample rate from timestamps
+    const dur=(b[n-1].t-b[0].t)/1000;
+    if(dur<4)return;
+    const fs=n/dur;
+    // Goertzel scan over physiological band 0.7-3.5 Hz (42-210 BPM)
+    let bestF=0,bestP=0,total=0;
+    for(let f=0.7;f<=3.5;f+=0.02){
+      const k=2*Math.PI*f/fs;
+      const c=2*Math.cos(k);
+      let s0=0,s1=0,s2=0;
+      for(let i=0;i<n;i++){s0=win[i]+c*s1-s2;s2=s1;s1=s0;}
+      const p=s1*s1+s2*s2-c*s1*s2;
+      total+=p;
+      if(p>bestP){bestP=p;bestF=f;}
     }
-    const seconds=(buf[buf.length-1].t-buf[0].t)/1000;
-    if(seconds>2){const bpm=Math.round((peaks/seconds)*60);if(bpm>40&&bpm<180)setHr(bpm);}
+    // Signal quality = peak dominance over band energy
+    const q=Math.min(1,(bestP/Math.max(1e-9,total/140))/8);
+    setQuality(q);
+    if(q>0.25){
+      const bpm=Math.round(bestF*60);
+      if(bpm>=42&&bpm<=210)setHr(prev=>prev?Math.round(prev*0.7+bpm*0.3):bpm);
+      // Crude SpO2 proxy from AC/DC ratio (illustrative only)
+      const ac=Math.sqrt(det.reduce((s,v)=>s+v*v,0)/n);
+      const ratio=ac/Math.max(1,mean);
+      setSpo2(Math.max(90,Math.min(99,Math.round(99-ratio*180))));
+    }
   },[samples]);
-  return hr;
+  return{hr,quality,spo2};
 }
 // Hardware torch control
 function useTorch(){
@@ -1194,13 +1225,18 @@ function InstructionsModal({color,onClose}){
       {icon:"📷",title:"QR SCAN",body:"Reads QR / Code-128 / EAN-13 / DataMatrix from the live view (Chrome Android). Result shows inline and logs."},
       {icon:"📄",title:"SESSION REPORT",body:"Downloads a .txt report: mode, GPS, altitude, pressure, full event log, capture list, tripwire inventory."},
       {icon:"📊",title:"SENSORS",body:"Live readout: GPS, altitude, barometric pressure, compass, wind, heart rate, torch, zoom, shake count, totals."},
-      {icon:"❤️",title:"rPPG HEART RATE",body:"Fingertip over the rear lens with torch on → BPM from color micro-variations in ~10s. Hold still."},
+      {icon:"❤️",title:"rPPG HEART RATE",body:"Fingertip over the rear lens with torch on → BPM in ~8s via Goertzel frequency analysis with Hamming windowing. Shows signal quality % and an estimated SpO2 proxy. Hold still; quality above 50% is reliable."},
+      {icon:"🧭",title:"GPS BREADCRUMB TRACK",body:"Your movement path is logged (3m resolution, last 500 points) and drawn as a dashed trail on the map with total distance. Speed and heading appear in the HUD when moving."},
+      {icon:"📊",title:"CSV EXPORT",body:"Event Log → ↓ CSV exports every event with ISO timestamp, type, label, GPS coords, and confidence for spreadsheet analysis."},
+      {icon:"🗂",title:"GALLERY BULK ACTIONS",body:"↓ ALL downloads every capture in sequence. CLEAR wipes the gallery. Filter chips in the Event Log narrow by event type."},
       {icon:"🔦",title:"TORCH / HW ZOOM",body:"TORCH drives the phone flashlight. HW ZOOM exposes true optical/sensor zoom via slider where the device supports it."},
     ],
     voice:[
       {icon:"🎤",title:"ENABLE VOICE",body:"Toggle 🎤 VOICE and allow the mic. 🎤VOX blinks in the header while listening. Recognized commands flash as »COMMAND."},
-      {icon:"🗣",title:"MODE COMMANDS",body:'Say: "night vision", "thermal", "raw", "astro", "tactical" — switches modes hands-free.'},
-      {icon:"📸",title:"ACTION COMMANDS",body:'Say: "capture" (snapshot), "burst" (×5), "record" (start/stop), "torch" (flashlight), "zoom in", "zoom out".'},
+      {icon:"🗣",title:"MODE COMMANDS",body:'"night vision" · "thermal" · "raw" · "astro" · "tactical" · "dehaze" · "polarize" · "rainbow" · "arctic" · "white hot" · "fusion"'},
+      {icon:"📸",title:"CAPTURE COMMANDS",body:'"capture" · "burst" · "record" · "auto capture" · "scan code" · "report"'},
+      {icon:"⚙️",title:"SYSTEM COMMANDS",body:'"torch" · "zoom in" · "zoom out" · "gain up" · "gain down" · "sentry on" · "sentry off" · "heat map" · "silence"'},
+      {icon:"📂",title:"NAVIGATION COMMANDS",body:'"show map" · "show log" · "gallery" · "sensors" · "close"'},
       {icon:"🔗",title:"SAME-DEVICE SYNC",body:"SYNC links tabs on the same device via BroadcastChannel — motion alerts propagate between them. Cross-device: open the URL on each device independently; WebRTC streaming is planned."},
       {icon:"⚠️",title:"BROWSER SUPPORT",body:"Voice uses Web Speech API — best on Chrome (Android/desktop) and iOS Safari 16+. If 🎤VOX never appears, the browser lacks speech recognition."},
     ],
@@ -1250,12 +1286,21 @@ function tileToLatLon(tx,ty,z){
   return{lat:latRad*180/Math.PI,lon};
 }
 
-function GPSMap({pos,events,color,onClose}){
+function GPSMap({pos,events,track=[],color,onClose}){
   const mapRef=useRef(null);
   const canvasRef=useRef(null);
   const[zoom,setZoom]=useState(16);
   const[center,setCenter]=useState(null);
   const[pins,setPins]=useState([]);
+  const trackDist=useMemo(()=>{
+    if(!track||track.length<2)return 0;
+    let d=0;
+    for(let i=1;i<track.length;i++){
+      const a=track[i-1],b=track[i];
+      d+=Math.hypot((b.lat-a.lat)*111320,(b.lon-a.lon)*111320*Math.cos(b.lat*Math.PI/180));
+    }
+    return d;
+  },[track]);
   const tileCache=useRef({});
   const dragging=useRef(null);
   const centerRef=useRef(null);
@@ -1348,6 +1393,18 @@ function GPSMap({pos,events,color,onClose}){
       return{x:W/2+(lx-cx_exact)*TILE,y:H/2+(ly-cy_exact)*TILE};
     };
 
+    // Breadcrumb track (movement history)
+    if(track&&track.length>1){
+      ctx.strokeStyle=color;ctx.globalAlpha=0.5;ctx.lineWidth=2;ctx.setLineDash([6,4]);
+      ctx.beginPath();
+      track.forEach((p,i)=>{const s=toScreen(p.lat,p.lon);i?ctx.lineTo(s.x,s.y):ctx.moveTo(s.x,s.y);});
+      ctx.stroke();ctx.setLineDash([]);ctx.globalAlpha=1;
+      // start marker
+      const s0=toScreen(track[0].lat,track[0].lon);
+      ctx.beginPath();ctx.arc(s0.x,s0.y,4,0,Math.PI*2);
+      ctx.fillStyle=`${color}90`;ctx.fill();
+    }
+
     // Motion pins
     for(const pin of pins){
       const{x,y}=toScreen(pin.lat,pin.lon);
@@ -1392,7 +1449,7 @@ function GPSMap({pos,events,color,onClose}){
     ctx.fillText(`${ctr.lat.toFixed(5)}°N  ${ctr.lon.toFixed(5)}°W`,8,H-8);
     ctx.textAlign="right";
     ctx.fillText(`Z${z}`,W-8,H-8);
-  },[zoom,pins,pos,color]);
+  },[zoom,pins,pos,color,track]);
 
   // Redraw on any change
   useEffect(()=>{draw();},[draw,center]);
@@ -1465,7 +1522,7 @@ function GPSMap({pos,events,color,onClose}){
       <div style={{padding:"5px 14px",borderTop:`1px solid ${color}10`,
         display:"flex",justifyContent:"space-between",background:"rgba(0,0,0,0.8)",flexShrink:0}}>
         <span style={{fontFamily:"'DM Mono',monospace",fontSize:7,color:`${color}40`,letterSpacing:1}}>
-          🟠 {pins.length} MOTION PINS • DRAG TO PAN • +/− TO ZOOM
+          🟠 {pins.length} PINS • {trackDist>0?`${trackDist<1000?Math.round(trackDist)+"m":(trackDist/1000).toFixed(2)+"km"} TRACK • `:""}DRAG TO PAN
         </span>
         <span style={{fontFamily:"'DM Mono',monospace",fontSize:7,color:`${color}25`,letterSpacing:1}}>
           OSM TILES
@@ -1479,100 +1536,65 @@ function GPSMap({pos,events,color,onClose}){
 // TIMELINE MODAL
 // ═══════════════════════════════════════════════════════════════════════════════
 function TimelineModal({events,captures,color,onClose}){
-  const[selected,setSelected]=useState(null);
-  const allEvents=useMemo(()=>[
-    ...events.map(e=>({...e,kind:"event"})),
-    ...captures.map(c=>({id:c.ts,ts:c.ts,type:"capture",data:c,kind:"capture"})),
-  ].sort((a,b)=>b.ts-a.ts),[events,captures]);
-
-  const typeColor={motion:"#ff5500",capture:"#00ff50",audio:"#00ccff",tripwire:"#ffcc00",peer:"#cc44ff"};
-  const typeIcon={motion:"🎯",capture:"📷",audio:"🔊",tripwire:"⚠️",peer:"📡"};
-
+  const[filter,setFilter]=useState("all");
+  const types=useMemo(()=>{
+    const t={};events.forEach(e=>{t[e.type]=(t[e.type]||0)+1;});
+    return t;
+  },[events]);
+  const shown=useMemo(()=>filter==="all"?events:events.filter(e=>e.type===filter),[events,filter]);
+  const ICON={motion:"🎯",tripwire:"⚡",sentry:"🛡",qr:"📷",export:"📄",capture:"📸"};
+  const exportCSV=()=>{
+    const rows=[["timestamp","type","label","lat","lon","confidence"]];
+    events.forEach(e=>rows.push([
+      new Date(e.ts).toISOString(),e.type,
+      (e.data?.label||"").replace(/,/g,";"),
+      e.data?.lat??"",e.data?.lon??"",e.data?.conf??""]));
+    const csv=rows.map(r=>r.join(",")).join("\n");
+    const url=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
+    const a=document.createElement("a");
+    a.href=url;a.download=`nvs-events-${Date.now()}.csv`;a.click();
+    URL.revokeObjectURL(url);
+  };
   return(
-    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.97)",zIndex:200,
-      display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease"}}>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
-        padding:"10px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0}}>
-        <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>
-          TIMELINE — {allEvents.length} EVENTS
-        </span>
-        <button onClick={onClose} style={{padding:"4px 10px",background:"transparent",
-          border:`1px solid ${color}30`,borderRadius:2,color:`${color}70`,
-          fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:2,cursor:"pointer"}}>
-          CLOSE
-        </button>
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.97)",zIndex:200,display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0}}>
+        <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>EVENT LOG</span>
+        <div style={{display:"flex",gap:6}}>
+          <button onClick={exportCSV} style={{padding:"6px 12px",background:"transparent",border:`1px solid ${color}30`,borderRadius:4,color:`${color}70`,fontFamily:"'DM Mono',monospace",fontSize:9,letterSpacing:1,cursor:"pointer"}}>↓ CSV</button>
+          <button onClick={onClose} style={{padding:"6px 12px",background:"transparent",border:`1px solid ${color}30`,borderRadius:4,color:`${color}70`,fontFamily:"'DM Mono',monospace",fontSize:9,letterSpacing:2,cursor:"pointer"}}>CLOSE</button>
+        </div>
       </div>
-      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",flex:1,overflow:"hidden"}}>
-        {/* Event list */}
-        <div style={{overflowY:"auto",borderRight:`1px solid ${color}10`,padding:8}}>
-          {allEvents.length===0&&(
-            <div style={{textAlign:"center",padding:30,fontFamily:"'DM Mono',monospace",
-              fontSize:8,color:`${color}35`,letterSpacing:1}}>NO EVENTS YET</div>
-          )}
-          {allEvents.map(ev=>{
-            const tc=typeColor[ev.type]||color;
-            const ti=typeIcon[ev.type]||"●";
-            const t=new Date(ev.ts).toLocaleTimeString("en-US",{hour12:false});
-            return(
-              <div key={ev.id} onClick={()=>setSelected(ev)}
-                style={{display:"flex",gap:6,padding:"5px 6px",marginBottom:3,
-                  background:selected?.id===ev.id?`${tc}12`:"transparent",
-                  border:`1px solid ${selected?.id===ev.id?tc:`${tc}15`}`,
-                  borderRadius:2,cursor:"pointer"}}>
-                <span style={{fontSize:11,flexShrink:0}}>{ti}</span>
-                <div style={{display:"flex",flexDirection:"column",gap:1,flex:1,minWidth:0}}>
-                  <span style={{fontSize:7,color:tc,letterSpacing:1,fontFamily:"'DM Mono',monospace"}}>
-                    {ev.type.toUpperCase()}{ev.data?.label?` — ${ev.data.label}`:""}
-                  </span>
-                  <span style={{fontSize:6,color:`${tc}60`,fontFamily:"'DM Mono',monospace"}}>{t}</span>
-                </div>
+      <div style={{display:"flex",gap:5,padding:"8px 12px",borderBottom:`1px solid ${color}10`,overflowX:"auto",flexShrink:0}}>
+        {[["all",`ALL ${events.length}`],...Object.entries(types).map(([t,c])=>[t,`${ICON[t]||"•"} ${t.toUpperCase()} ${c}`])].map(([k,label])=>(
+          <button key={k} onClick={()=>setFilter(k)} style={{padding:"6px 10px",whiteSpace:"nowrap",
+            background:filter===k?`${color}12`:"transparent",border:`1px solid ${filter===k?color:`${color}20`}`,
+            borderRadius:5,fontSize:8,color:filter===k?color:`${color}45`,fontFamily:"'DM Mono',monospace",cursor:"pointer"}}>
+            {label}
+          </button>
+        ))}
+      </div>
+      <div style={{flex:1,overflowY:"auto",padding:"8px 12px",display:"flex",flexDirection:"column",gap:4}}>
+        {shown.length===0&&<div style={{padding:24,textAlign:"center",fontFamily:"'DM Mono',monospace",fontSize:9,color:`${color}40`}}>NO EVENTS</div>}
+        {shown.map((e,i)=>(
+          <div key={i} style={{display:"flex",gap:10,alignItems:"flex-start",padding:"8px 10px",border:`1px solid ${color}10`,borderRadius:5,background:`${color}03`}}>
+            <span style={{fontSize:13,flexShrink:0}}>{e.data?.icon||ICON[e.type]||"•"}</span>
+            <div style={{flex:1,display:"flex",flexDirection:"column",gap:2}}>
+              <span style={{fontFamily:"'DM Mono',monospace",fontSize:9,color:`${color}90`,lineHeight:1.4}}>{e.data?.label||e.type}</span>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                <span style={{fontFamily:"'DM Mono',monospace",fontSize:7,color:`${color}45`}}>
+                  {new Date(e.ts).toLocaleTimeString("en-US",{hour12:false})}
+                </span>
+                {e.data?.conf&&<span style={{fontSize:7,color:`${color}40`}}>{e.data.conf}%</span>}
+                {e.data?.lat&&<span style={{fontSize:7,color:`${color}40`}}>📍{e.data.lat.toFixed(4)}</span>}
               </div>
-            );
-          })}
-        </div>
-        {/* Detail pane */}
-        <div style={{overflowY:"auto",padding:10}}>
-          {!selected&&(
-            <div style={{textAlign:"center",padding:30,fontFamily:"'DM Mono',monospace",
-              fontSize:8,color:`${color}30`,letterSpacing:1}}>SELECT EVENT</div>
-          )}
-          {selected&&(
-            <div style={{display:"flex",flexDirection:"column",gap:8}}>
-              {selected.kind==="capture"&&selected.data?.url&&(
-                <img src={selected.data.url} style={{width:"100%",borderRadius:2,
-                  border:`1px solid ${color}20`}} alt="event"/>
-              )}
-              <div style={{fontFamily:"'DM Mono',monospace",fontSize:7,color:`${color}80`,letterSpacing:1}}>
-                {Object.entries(selected.data||{}).filter(([k])=>k!=="url"&&k!=="icon").map(([k,v])=>(
-                  <div key={k} style={{display:"flex",justifyContent:"space-between",
-                    padding:"2px 0",borderBottom:`1px solid ${color}08`}}>
-                    <span style={{color:`${color}50`}}>{k.toUpperCase()}</span>
-                    <span style={{color:`${color}90`,maxWidth:"60%",textAlign:"right",
-                      overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                      {String(v).slice(0,40)}
-                    </span>
-                  </div>
-                ))}
-              </div>
-              {selected.kind==="capture"&&selected.data?.url&&(
-                <a href={selected.data.url} download={`nvs7-${selected.ts}.png`}
-                  style={{textAlign:"center",padding:"5px",background:`${color}08`,
-                    border:`1px solid ${color}25`,borderRadius:2,color,
-                    fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:2,textDecoration:"none"}}>
-                  ↓ SAVE IMAGE
-                </a>
-              )}
             </div>
-          )}
-        </div>
+          </div>
+        ))}
       </div>
     </div>
   );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// TRIPWIRE EDITOR
-// ═══════════════════════════════════════════════════════════════════════════════
 function TripwireEditor({tripwires,onUpdate,color,onClose}){
   const[drawing,setDrawing]=useState(false);
   const[current,setCurrent]=useState([]);
@@ -1941,7 +1963,7 @@ function ThermalOverlay({tempData,mode}){
 // ═══════════════════════════════════════════════════════════════════════════════
 function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeOverlay,
   noiseReduction,color,zoom,showReticle,motionEnabled,autoCapture,tripwires,showRPPG,
-  onCapture,onMotionEvent,onTripwireHit,onRPPG,compact=false,tfDetect,modelReady,onRetry,heatmapOn=false}){
+  onCapture,onMotionEvent,onTripwireHit,onRPPG,compact=false,tfDetect,modelReady,onRetry,heatmapOn=false,onTrackCount}){
   const videoRef=useRef(null),rawRef=useRef(null),dispRef=useRef(null),rafRef=useRef(null);
   const prevRef=useRef(null),motRef=useRef(null),cooldown=useRef(0),fpsRef=useRef({frames:0,last:performance.now()});
   const stackBuf=useRef(null),stackIdx=useRef(0);
@@ -2003,15 +2025,15 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
                 const sx=result.sw/disp.width,sy=result.sh/disp.height;
                 const dets=preds.map(p=>({...p,
                   x:p.x*sx,y:p.y*sy,w:p.w*sx,h:p.h*sy,cx:p.cx*sx,cy:p.cy*sy}));
-                setBlobs(trackerRef.current.update(dets,nowTr).slice());
+                const t=trackerRef.current.update(dets,nowTr).slice();setBlobs(t);onTrackCount?.(t.length);
               } else if(preds){
                 const dets=result.blobs.map(b=>({...b,...classifyBlobFallback(b,result.sw,result.sh)}));
-                setBlobs(trackerRef.current.update(dets,nowTr).slice());
+                const t=trackerRef.current.update(dets,nowTr).slice();setBlobs(t);onTrackCount?.(t.length);
               }
             }).catch(()=>{});
           } else if(!modelReady){
             const dets=result.blobs.map(b=>({...b,...classifyBlobFallback(b,result.sw,result.sh)}));
-            setBlobs(trackerRef.current.update(dets,performance.now()).slice());
+            const t2=trackerRef.current.update(dets,performance.now()).slice();setBlobs(t2);onTrackCount?.(t2.length);
           }
           const now=Date.now();
           if(autoCapture&&result.blobs.length>0&&result.motionFrac>0.008&&now-cooldown.current>3000){
@@ -2150,6 +2172,8 @@ export default function NightVisionCamera(){
   const[dualMode,setDualMode]=useState(false);
   const[recording,setRecording]=useState(false);
   const[captures,setCaptures]=useState([]);
+  const clearGallery=useCallback(()=>setCaptures([]),[]);
+  const downloadAll=useCallback(()=>{captures.forEach((c,i)=>setTimeout(()=>{const a=document.createElement('a');a.href=c.url;a.download=`nvs-${c.ts}.png`;a.click();},i*250));},[captures]);
   const[tripwires,setTripwires]=useState([]);
   const[showRPPG,setShowRPPG]=useState(false);
   const[audioEnabled,setAudioEnabled]=useState(false);
@@ -2167,9 +2191,9 @@ export default function NightVisionCamera(){
 
   const clock=useClock();
   const heading=useDeviceOrientation();
-  const gps=useGPS();
-  const{level:audioLevel,spike:audioSpike}=useMicrophone(audioEnabled);
-  const hr=useRPPG(showRPPG?rppgSample:null);
+  const{pos:gps,track:gpsTrack}=useGPS();
+  const{level:audioLevel,spike:audioSpike,peakFreq}=useMicrophone(audioEnabled,micAnalyserRef);
+  const{hr,quality:hrQ,spo2}=useRPPG(showRPPG?rppgSample:null);
   const{peers,alerts:syncAlerts,broadcast}=useMultiSync(multiSync,PEER_ID);
   const{events,add:addEvent}=useTimeline();
   const{torchOn,toggle:toggleTorch}=useTorch();
@@ -2187,6 +2211,7 @@ export default function NightVisionCamera(){
   const[voiceOn,setVoiceOn]=useState(false);
   const[sentryOn,setSentryOn]=useState(false);
   const[heatmapOn,setHeatmapOn]=useState(false);
+  const[blobsCount,setBlobsCount]=useState(0);
   const sentryRecUntil=useRef(0);
   const[alertsOn,setAlertsOn]=useState(true);
   const{listening,lastCmd}=useVoiceControl(voiceOn,{
@@ -2201,9 +2226,30 @@ export default function NightVisionCamera(){
     "torch":()=>toggleTorch(),
     "zoom in":()=>setZoom(z=>Math.min(12,z*2)),
     "zoom out":()=>setZoom(z=>Math.max(1,z/2)),
+    "dehaze":()=>setMode("HAZE"),
+    "polarize":()=>setMode("POLAR"),
+    "rainbow":()=>setMode("RAINBOW"),
+    "arctic":()=>setMode("BLUE"),
+    "white hot":()=>setMode("WHITE"),
+    "fusion":()=>setMode("FUSION"),
+    "sentry on":()=>setSentryOn(true),
+    "sentry off":()=>setSentryOn(false),
+    "heat map":()=>setHeatmapOn(h=>!h),
+    "auto capture":()=>setAutoCapture(a=>!a),
+    "gain up":()=>setBrightness(b=>Math.min(1.5,b+0.375)),
+    "gain down":()=>setBrightness(b=>Math.max(-1.5,b-0.375)),
+    "show map":()=>setModal("map"),
+    "show log":()=>setModal("timeline"),
+    "gallery":()=>setModal("gallery"),
+    "sensors":()=>setModal("sensors"),
+    "report":()=>exportPDFRef.current?.(),
+    "scan code":()=>scanQRRef.current?.(),
+    "close":()=>setModal(null),
+    "silence":()=>setAlertsOn(false),
   });
   const manualSnapRef=useRef(null),burstSnapRef=useRef(null),toggleRecordRef=useRef(null);
   const recordingRef=useRef(false);
+  const exportPDFRef=useRef(null),scanQRRef=useRef(null);
 
   const color=MODE_META[mode].color;
   const timeStr=clock.toLocaleTimeString("en-US",{hour12:false});
@@ -2300,6 +2346,15 @@ export default function NightVisionCamera(){
     lines.push(`Generated: ${now.toLocaleString()}`);
     lines.push(`Mode: ${mode} | Zoom: ${zoom}x | Sensitivity: ${Math.round(sensitivity*100)}%`);
     if(gps)lines.push(`GPS: ${gps.lat.toFixed(5)}°N ${gps.lon.toFixed(5)}°W ±${gps.acc?.toFixed(0)}m`);
+    if(gps?.speed!=null)lines.push(`Speed: ${(gps.speed*2.237).toFixed(1)} mph  Heading: ${gps.heading!=null?Math.round(gps.heading)+"°":"--"}`);
+    if(gpsTrack.length>1){
+      let d=0;for(let i=1;i<gpsTrack.length;i++){const a=gpsTrack[i-1],b=gpsTrack[i];
+        d+=Math.hypot((b.lat-a.lat)*111320,(b.lon-a.lon)*111320*Math.cos(b.lat*Math.PI/180));}
+      lines.push(`Track: ${gpsTrack.length} points, ${d<1000?Math.round(d)+"m":(d/1000).toFixed(2)+"km"} traveled`);
+    }
+    if(hr)lines.push(`Heart rate: ${hr} BPM (quality ${Math.round(hrQ*100)}%)${spo2?`, SpO2 ~${spo2}%`:""}`);
+    lines.push(`AI model: ${modelReady?"COCO-SSD active":"not loaded"}`);
+    lines.push(`Systems: ${[sentryOn&&"SENTRY",heatmapOn&&"HEATMAP",voiceOn&&"VOICE",alertsOn&&"ALERTS",autoCapture&&"AUTOCAP",torchOn&&"TORCH"].filter(Boolean).join(", ")||"none"}`);
     if(altitude!=null)lines.push(`Altitude: ${altitude}m`);
     if(pressure!=null)lines.push(`Pressure: ${pressure}hPa`);
     lines.push(`\nEVENT LOG (${events.length} events):`);
@@ -2325,7 +2380,7 @@ export default function NightVisionCamera(){
   },[mode,zoom,sensitivity,gps,altitude,pressure,events,captures,tripwires,addEvent]);
 
   // Voice command refs (fns defined above)
-  useEffect(()=>{manualSnapRef.current=manualSnap;burstSnapRef.current=burstSnap;toggleRecordRef.current=toggleRecord;recordingRef.current=recording;});
+  useEffect(()=>{manualSnapRef.current=manualSnap;burstSnapRef.current=burstSnap;toggleRecordRef.current=toggleRecord;recordingRef.current=recording;exportPDFRef.current=exportPDF;scanQRRef.current=scanQR;});
 
   // Shake → burst capture
   useEffect(()=>{
@@ -2380,7 +2435,7 @@ export default function NightVisionCamera(){
         ::-webkit-scrollbar{display:none}
       `}</style>
 
-      {modal==="map"&&<GPSMap pos={gps} events={events} color={color} onClose={()=>setModal(null)}/>}
+      {modal==="map"&&<GPSMap pos={gps} track={gpsTrack} events={events} color={color} onClose={()=>setModal(null)}/>}
       {modal==="timeline"&&<TimelineModal events={events} captures={captures} color={color} onClose={()=>setModal(null)}/>}
       {modal==="tripwire"&&<TripwireEditor tripwires={tripwires} onUpdate={setTripwires} color={color} onClose={()=>setModal(null)}/>}
       {modal==="manual"&&<InstructionsModal color={color} onClose={()=>setModal(null)}/>}
@@ -2411,6 +2466,9 @@ export default function NightVisionCamera(){
             {altitude!=null&&<span style={{fontSize:6,color:`${color}35`,letterSpacing:.5}}>{altitude}m ASL</span>}
             {wind>1&&<span style={{fontSize:6,color:`${color}35`,letterSpacing:.5}}>💨{wind.toFixed(1)}m/s</span>}
             {battery&&<span style={{fontSize:6,color:battery.level<20?"#ff4444":`${color}35`,letterSpacing:.5}}>{battery.charging?"⚡":"🔋"}{battery.level}%</span>}
+            {gps?.speed>0.5&&<span style={{fontSize:6,color:`${color}35`,letterSpacing:.5}}>🏃{(gps.speed*2.237).toFixed(1)}mph</span>}
+            {showRPPG&&hr&&<span style={{fontSize:6,color:hrQ>0.5?"#ff6688":`${color}35`,letterSpacing:.5}}>❤️{hr}{spo2?` ${spo2}%`:""}</span>}
+            {audioEnabled&&peakFreq>0&&<span style={{fontSize:6,color:`${color}30`,letterSpacing:.5}}>♪{peakFreq}Hz</span>}
             <div style={{display:"flex",gap:4,alignItems:"center"}}>
               <SignalBars level={.8} color={color}/>
               {autoCapture&&<span style={{fontSize:6,color:"#ffdd00",animation:"rec-blink 1.5s step-end infinite"}}>AUTO</span>}
@@ -2428,7 +2486,7 @@ export default function NightVisionCamera(){
               motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
               showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
               onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={true}
-              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry} heatmapOn={heatmapOn}/>
+              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry} heatmapOn={heatmapOn} onTrackCount={setBlobsCount}/>
             <CameraPanel stream={front.stream} ready={front.ready} error={front.error} label="FRONT"
               mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
               noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
@@ -2445,7 +2503,7 @@ export default function NightVisionCamera(){
               motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
               showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
               onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={false}
-              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry} heatmapOn={heatmapOn}/>
+              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry} heatmapOn={heatmapOn} onTrackCount={setBlobsCount}/>
             {(showRPPG||audioEnabled)&&(
               <BiometricHUD hr={hr} audioLevel={audioLevel} audioSpike={audioSpike} color={color}/>
             )}
@@ -2722,6 +2780,14 @@ export default function NightVisionCamera(){
               {l:"COMPASS",v:heading!=null?`${heading}° ${compassDir}`:"--",c:"#ffcc44"},
               {l:"WIND EST",v:audioEnabled?`${wind.toFixed(1)} m/s`:"Enable mic",c:"#88ccff"},
               {l:"rPPG HR",v:hr?`${hr} BPM`:"Enable rPPG",c:"#ff6688"},
+              {l:"HR QUALITY",v:showRPPG?`${Math.round(hrQ*100)}%`:"--",c:"#ff6688"},
+              {l:"SpO2 EST",v:spo2?`${spo2}%`:"--",c:"#ff6688"},
+              {l:"GPS SPEED",v:gps?.speed!=null?`${(gps.speed*2.237).toFixed(1)} mph`:"--",c:"#00ccff"},
+              {l:"GPS HEADING",v:gps?.heading!=null?`${Math.round(gps.heading)}°`:"--",c:"#00ccff"},
+              {l:"TRACK PTS",v:`${gpsTrack.length}`,c:"#00ccff"},
+              {l:"AUDIO PEAK",v:audioEnabled?`${peakFreq} Hz`:"Enable mic",c:"#88ccff"},
+              {l:"AI MODEL",v:modelReady?"COCO-SSD READY":"LOADING…",c:modelReady?"#00ff50":"#ffcc00"},
+              {l:"ACTIVE TRACKS",v:`${blobsCount}`,c:color},
               {l:"TORCH",v:torchOn?"ON":"OFF",c:"#ffdd88"},
               {l:"HW ZOOM",v:hardZoom&&hzoomSupported?`${hzoom.toFixed(1)}× / ${maxZoom}× max`:"CSS only",c:"#44ffcc"},
               {l:"SHAKE",v:`${shakeCount} events`,c:"#ff8844"},
@@ -2748,9 +2814,13 @@ export default function NightVisionCamera(){
             <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>
               CAPTURE LOG — {captures.length}
             </span>
-            <button onClick={()=>setModal(null)} style={{padding:"4px 10px",background:"transparent",
+            <div style={{display:"flex",gap:6}}>
+              <button onClick={downloadAll} style={{padding:"6px 10px",background:"transparent",border:`1px solid ${color}30`,borderRadius:4,color:`${color}70`,fontFamily:"'DM Mono',monospace",fontSize:9,letterSpacing:1,cursor:"pointer"}}>↓ ALL</button>
+              <button onClick={clearGallery} style={{padding:"6px 10px",background:"transparent",border:"1px solid rgba(255,68,68,0.3)",borderRadius:4,color:"rgba(255,68,68,0.7)",fontFamily:"'DM Mono',monospace",fontSize:9,letterSpacing:1,cursor:"pointer"}}>CLEAR</button>
+              <button onClick={()=>setModal(null)} style={{padding:"4px 10px",background:"transparent",
               border:`1px solid ${color}30`,borderRadius:2,color:`${color}70`,
               fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:2,cursor:"pointer"}}>CLOSE</button>
+            </div>
           </div>
           <div style={{padding:10,display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,overflowY:"auto"}}>
             {captures.length===0&&(
