@@ -1244,7 +1244,7 @@ function InstructionsModal({color,onClose}){
   return(
     <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.97)",zIndex:200,display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease"}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0}}>
-        <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>NVS-8.5 OPERATOR MANUAL</span>
+        <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>NVS-9.0 OPERATOR MANUAL</span>
         <button onClick={onClose} style={{padding:"6px 12px",background:"transparent",border:`1px solid ${color}30`,borderRadius:4,color:`${color}70`,fontFamily:"'DM Mono',monospace",fontSize:9,letterSpacing:2,cursor:"pointer"}}>CLOSE</button>
       </div>
       <div style={{display:"flex",gap:4,padding:"8px 12px",borderBottom:`1px solid ${color}10`,flexShrink:0,overflowX:"auto"}}>
