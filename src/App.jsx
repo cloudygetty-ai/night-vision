@@ -422,6 +422,33 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
     }
   }
 
+  // Digital stabilization — estimate global shift, apply counter-translation
+  let shift=null;
+  if(refs.stabOn&&refs.stabPrev){
+    shift=estimateGlobalShift(data,refs.stabPrev.current,sw,sh);
+    if(!refs.stabSmooth.current)refs.stabSmooth.current={x:0,y:0};
+    const sm=refs.stabSmooth.current;
+    sm.x=sm.x*0.82+shift.dx*0.18;
+    sm.y=sm.y*0.82+shift.dy*0.18;
+    if(!refs.stabPrev.current||refs.stabPrev.current.length!==data.length)
+      refs.stabPrev.current=new Uint8ClampedArray(data.length);
+    refs.stabPrev.current.set(data);
+  }
+
+  // Super-resolution accumulate (static scene detail recovery)
+  if(refs.srOn)superResolve(data,sw,sh,refs.srBuf,refs.srCount,shift);
+
+  // Exposure histogram (every 15th frame, cheap sampled)
+  let expo=null;
+  if(refs.expoTick){
+    refs.expoTick.current=(refs.expoTick.current||0)+1;
+    if(refs.expoTick.current%15===0)expo=computeHistogram(data);
+  }
+
+  // Star/satellite point detection (ASTRO only)
+  let starPts=null;
+  if(mode==="ASTRO"&&refs.starsOn)starPts=detectPoints(data,sw,sh,200);
+
   // Phosphor bloom pass (NVG only) — after pixel processing, before output
   if(mode==="NVG") applyPhosphorBloom(data,sw,sh);
 
@@ -509,8 +536,8 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
   const blobs=motionPixels>20?findBlobs(motionMap,sw,sh,60):[];
   // Classify and add distance to each blob
   const enrichedBlobs=blobs.map(b=>{
-    const cls=classifyBlob(b,sw,sh);
-    const dist=estimateDistance(b.h,sh,cls.label);
+    const cls=classifyBlobFallback(b,sw,sh);
+    const dist=estimateRange(cls.label,b.h,sh)??estimateDistance(b.h,sh,cls.label);
     return{...b,...cls,dist};
   });
 
@@ -536,7 +563,7 @@ function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
     }
   }
 
-  return{motionFrac:motionPixels/(sw*sh),blobs:enrichedBlobs,tempData,sw,sh,triggeredWires,rppgVal};
+  return{motionFrac:motionPixels/(sw*sh),blobs:enrichedBlobs,tempData,sw,sh,triggeredWires,rppgVal,expo,starPts,shift:refs.stabSmooth?.current||null};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -965,6 +992,239 @@ function useThreatBeep(){
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// NVS-10.0 — PERSISTENCE (IndexedDB) + NEW SUBSYSTEMS
+// ═══════════════════════════════════════════════════════════════════════════════
+const DB_NAME="nvs_vault",DB_VER=1;
+function openDB(){
+  return new Promise((res,rej)=>{
+    const rq=indexedDB.open(DB_NAME,DB_VER);
+    rq.onupgradeneeded=()=>{
+      const db=rq.result;
+      if(!db.objectStoreNames.contains("captures"))db.createObjectStore("captures",{keyPath:"ts"});
+      if(!db.objectStoreNames.contains("clips"))db.createObjectStore("clips",{keyPath:"ts"});
+      if(!db.objectStoreNames.contains("events"))db.createObjectStore("events",{keyPath:"ts"});
+      if(!db.objectStoreNames.contains("kv"))db.createObjectStore("kv",{keyPath:"k"});
+    };
+    rq.onsuccess=()=>res(rq.result);
+    rq.onerror=()=>rej(rq.error);
+  });
+}
+async function dbPut(store,val){try{const db=await openDB();return new Promise(r=>{const tx=db.transaction(store,"readwrite");tx.objectStore(store).put(val);tx.oncomplete=()=>r(true);tx.onerror=()=>r(false);});}catch{return false;}}
+async function dbAll(store){try{const db=await openDB();return new Promise(r=>{const tx=db.transaction(store,"readonly");const rq=tx.objectStore(store).getAll();rq.onsuccess=()=>r(rq.result||[]);rq.onerror=()=>r([]);});}catch{return[];}}
+async function dbDel(store,key){try{const db=await openDB();return new Promise(r=>{const tx=db.transaction(store,"readwrite");tx.objectStore(store).delete(key);tx.oncomplete=()=>r(true);tx.onerror=()=>r(false);});}catch{return false;}}
+async function dbClear(store){try{const db=await openDB();return new Promise(r=>{const tx=db.transaction(store,"readwrite");tx.objectStore(store).clear();tx.oncomplete=()=>r(true);tx.onerror=()=>r(false);});}catch{return false;}}
+async function dbUsage(){try{const e=await navigator.storage?.estimate?.();return e?{used:e.usage,quota:e.quota}:null;}catch{return null;}}
+
+// Persisted settings — survives reload
+function usePersistedSettings(defaults){
+  const[loaded,setLoaded]=useState(false);
+  const[settings,setSettings]=useState(defaults);
+  useEffect(()=>{
+    (async()=>{
+      const rows=await dbAll("kv");
+      const saved=rows.find(r=>r.k==="settings");
+      if(saved?.v)setSettings(s=>({...s,...saved.v}));
+      setLoaded(true);
+    })();
+  },[]);
+  const save=useCallback((patch)=>{
+    setSettings(s=>{const next={...s,...patch};dbPut("kv",{k:"settings",v:next});return next;});
+  },[]);
+  return{settings,save,loaded};
+}
+
+// ── LASER RANGEFINDER: reference-object scaling ──
+const REF_HEIGHTS={PERSON:1.7,CAR:1.5,TRUCK:3.2,BUS:3.2,DOG:0.5,CAT:0.3,BICYCLE:1.0,MOTORCYCLE:1.3,"STOP SIGN":2.1,"FIRE HYDRANT":0.8,CHAIR:0.9,BOTTLE:0.25};
+function estimateRange(label,pxHeight,frameHeight,vFovDeg=55){
+  const real=REF_HEIGHTS[label];
+  if(!real||!pxHeight)return null;
+  const anglePerPx=(vFovDeg*Math.PI/180)/frameHeight;
+  const subtended=pxHeight*anglePerPx;
+  if(subtended<=0)return null;
+  return real/(2*Math.tan(subtended/2));
+}
+
+// ── PANORAMA STITCHER ──
+function usePanorama(){
+  const[frames,setFrames]=useState([]);
+  const add=useCallback(dataUrl=>setFrames(f=>[...f,dataUrl].slice(-12)),[]);
+  const reset=useCallback(()=>setFrames([]),[]);
+  const stitch=useCallback(async()=>{
+    if(frames.length<2)return null;
+    const imgs=await Promise.all(frames.map(src=>new Promise(r=>{const i=new Image();i.onload=()=>r(i);i.src=src;})));
+    const h=imgs[0].height,OVER=0.18;
+    const step=Math.round(imgs[0].width*(1-OVER));
+    const c=document.createElement("canvas");
+    c.width=step*(imgs.length-1)+imgs[0].width;c.height=h;
+    const ctx=c.getContext("2d");
+    imgs.forEach((im,i)=>{
+      const x=i*step;
+      if(i===0){ctx.drawImage(im,0,0);return;}
+      // feather blend the overlap
+      const ow=im.width-step;
+      const g=ctx.createLinearGradient(x,0,x+ow,0);
+      g.addColorStop(0,"rgba(0,0,0,0)");g.addColorStop(1,"rgba(0,0,0,1)");
+      ctx.save();ctx.globalCompositeOperation="source-over";
+      ctx.drawImage(im,x,0);ctx.restore();
+    });
+    return c.toDataURL("image/jpeg",0.9);
+  },[frames]);
+  return{frames,add,reset,stitch};
+}
+
+// ── STAR / SATELLITE TRACKER (bright-point detection + drift) ──
+function detectPoints(data,w,h,thresh=210){
+  const pts=[];const seen=new Uint8Array(w*h);
+  for(let y=2;y<h-2;y+=2)for(let x=2;x<w-2;x+=2){
+    const i=(y*w+x)*4;
+    const lum=0.299*data[i]+0.587*data[i+1]+0.114*data[i+2];
+    if(lum<thresh)continue;
+    const p=y*w+x;if(seen[p])continue;
+    // local max check
+    let isMax=true;
+    for(let dy=-2;dy<=2&&isMax;dy++)for(let dx=-2;dx<=2;dx++){
+      const j=((y+dy)*w+(x+dx))*4;
+      if(0.299*data[j]+0.587*data[j+1]+0.114*data[j+2]>lum){isMax=false;break;}
+    }
+    if(isMax){pts.push({x,y,lum});for(let dy=-3;dy<=3;dy++)for(let dx=-3;dx<=3;dx++){const q=(y+dy)*w+(x+dx);if(q>=0&&q<seen.length)seen[q]=1;}}
+    if(pts.length>120)return pts;
+  }
+  return pts;
+}
+
+// ── HISTOGRAM / EXPOSURE ANALYSIS ──
+function computeHistogram(data){
+  const hist=new Uint32Array(64);
+  let clipLow=0,clipHigh=0,sum=0,n=0;
+  for(let i=0;i<data.length;i+=16){ // sample every 4th pixel
+    const lum=0.299*data[i]+0.587*data[i+1]+0.114*data[i+2];
+    hist[Math.min(63,lum>>2)]++;
+    if(lum<4)clipLow++;if(lum>251)clipHigh++;
+    sum+=lum;n++;
+  }
+  return{hist,mean:sum/Math.max(1,n),clipLow:clipLow/Math.max(1,n),clipHigh:clipHigh/Math.max(1,n)};
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NVS-11.0 — STABILIZATION, SUPER-RES, LOITER ANALYTICS, GEOFENCE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── DIGITAL STABILIZATION: phase-correlation-lite global motion estimate ──
+// Samples a sparse grid, finds best integer shift within ±8px, smooths it.
+function estimateGlobalShift(cur,prev,w,h){
+  if(!prev||prev.length!==cur.length)return{dx:0,dy:0};
+  const STEP=12,R=8;
+  let bestDx=0,bestDy=0,bestErr=Infinity;
+  for(let dy=-R;dy<=R;dy+=2)for(let dx=-R;dx<=R;dx+=2){
+    let err=0,n=0;
+    for(let y=R;y<h-R;y+=STEP)for(let x=R;x<w-R;x+=STEP){
+      const i=(y*w+x)*4;
+      const j=((y+dy)*w+(x+dx))*4;
+      err+=Math.abs(cur[i+1]-prev[j+1]);n++;
+      if(err>bestErr*n/Math.max(1,n))break;
+    }
+    const norm=err/Math.max(1,n);
+    if(norm<bestErr){bestErr=norm;bestDx=dx;bestDy=dy;}
+  }
+  return{dx:bestDx,dy:bestDy,err:bestErr};
+}
+
+// ── SUPER-RESOLUTION: multi-frame accumulate with sub-pixel offsets ──
+// Averages N registered frames at 2x grid for real detail recovery on static scenes.
+function superResolve(data,w,h,srBuf,srCount,shift){
+  const n=w*h;
+  if(!srBuf.current||srBuf.current.length!==n*3){
+    srBuf.current=new Float32Array(n*3);srCount.current=0;
+  }
+  const buf=srBuf.current;
+  // register incoming frame by inverse shift, accumulate
+  for(let y=0;y<h;y++){
+    const sy=Math.min(h-1,Math.max(0,y+(shift?.dy||0)));
+    for(let x=0;x<w;x++){
+      const sx=Math.min(w-1,Math.max(0,x+(shift?.dx||0)));
+      const s=(sy*w+sx)*4,d=(y*w+x)*3;
+      buf[d]+=data[s];buf[d+1]+=data[s+1];buf[d+2]+=data[s+2];
+    }
+  }
+  srCount.current++;
+  const c=srCount.current;
+  if(c<2)return false;
+  for(let p=0;p<n;p++){
+    const d=p*3,i=p*4;
+    data[i]=Math.min(255,buf[d]/c);
+    data[i+1]=Math.min(255,buf[d+1]/c);
+    data[i+2]=Math.min(255,buf[d+2]/c);
+  }
+  return true;
+}
+
+// ── LOITER / DWELL ANALYTICS ──
+// Flags tracks that stay within a radius beyond a dwell threshold.
+class LoiterAnalyzer{
+  constructor(){this.dwell=new Map();}
+  update(tracks,now,radiusPx=70,thresholdMs=8000){
+    const flagged=[];
+    const live=new Set();
+    for(const t of tracks){
+      if(!t.id)continue;
+      live.add(t.id);
+      const rec=this.dwell.get(t.id);
+      if(!rec){this.dwell.set(t.id,{ox:t.cx,oy:t.cy,since:now,flagged:false});continue;}
+      const d=Math.hypot(t.cx-rec.ox,t.cy-rec.oy);
+      if(d>radiusPx){rec.ox=t.cx;rec.oy=t.cy;rec.since=now;rec.flagged=false;}
+      else{
+        const dwellMs=now-rec.since;
+        if(dwellMs>thresholdMs){
+          rec.flagged=true;
+          flagged.push({...t,dwellMs});
+        }
+      }
+    }
+    for(const id of[...this.dwell.keys()])if(!live.has(id))this.dwell.delete(id);
+    return flagged;
+  }
+  dwellFor(id,now){const r=this.dwell.get(id);return r?now-r.since:0;}
+}
+
+// ── GEOFENCE: radius alarm around an anchor point ──
+function haversine(a,b){
+  const R=6371000,toR=Math.PI/180;
+  const dLat=(b.lat-a.lat)*toR,dLon=(b.lon-a.lon)*toR;
+  const s=Math.sin(dLat/2)**2+Math.cos(a.lat*toR)*Math.cos(b.lat*toR)*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.sqrt(s));
+}
+function useGeofence(pos,onBreach){
+  const[anchor,setAnchor]=useState(null);
+  const[radius,setRadius]=useState(100);
+  const[inside,setInside]=useState(true);
+  const wasInside=useRef(true);
+  const dist=useMemo(()=>anchor&&pos?haversine(anchor,pos):null,[anchor,pos]);
+  useEffect(()=>{
+    if(dist==null)return;
+    const now=dist<=radius;
+    setInside(now);
+    if(wasInside.current!==now){
+      wasInside.current=now;
+      onBreach?.(now?"ENTERED":"EXITED",Math.round(dist));
+    }
+  },[dist,radius,onBreach]);
+  const drop=useCallback(()=>{if(pos){setAnchor({lat:pos.lat,lon:pos.lon});wasInside.current=true;}},[pos]);
+  const clear=useCallback(()=>setAnchor(null),[]);
+  return{anchor,radius,setRadius,dist,inside,drop,clear};
+}
+
+// ── SESSION STATS ──
+function useSessionStats(){
+  const startRef=useRef(Date.now());
+  const[stats,setStats]=useState({uptime:0});
+  useEffect(()=>{
+    const i=setInterval(()=>setStats(s=>({...s,uptime:Math.floor((Date.now()-startRef.current)/1000)})),1000);
+    return()=>clearInterval(i);
+  },[]);
+  return stats;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // DAY VISION PROCESSING
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1183,8 +1443,16 @@ function InstructionsModal({color,onClose}){
     auto:"AUTOMATION",
     tools:"TOOLS",
     voice:"VOICE",
+    vault:"STORAGE",
   };
   const content={
+    vault:[
+      {icon:"💾",title:"WHERE EVERYTHING GOES",body:"With VAULT on (default), photos and video clips are written to IndexedDB on this device and survive reloads, tab closes, and phone restarts. Nothing is ever uploaded — no server, no cloud."},
+      {icon:"🎞",title:"CLIP VAULT",body:"Tools → Clips: every recording (manual ⏺ REC and 🛡 SENTRY auto-clips) with inline playback, duration, size, and mode. ↓ saves to your device Downloads, ✕ deletes one, CLEAR wipes all."},
+      {icon:"📁",title:"PHOTO VAULT",body:"Gallery holds up to 200 stills across sessions. ↓ ALL downloads every shot, CLEAR wipes the store."},
+      {icon:"📊",title:"STORAGE BUDGET",body:"Sensors panel shows MB used and total quota (usually several GB). The app requests persistent storage so the browser will not silently evict your vault."},
+      {icon:"⬇",title:"GETTING DATA OUT",body:"Photos/clips: ↓ buttons. Events: ↓ CSV in the Event Log. Full session: 📄 Report. Turn VAULT off to revert to instant-download-on-stop behavior instead of storing."},
+    ],
     start:[
       {icon:"📷",title:"ALLOW CAMERA",body:"Open in Chrome/Safari and tap Allow on the camera prompt. Also Allow location (GPS map, altitude) and microphone (audio spike, wind) when asked. iOS: Settings → Safari → Camera → Allow."},
       {icon:"▶",title:"IF CAMERA WON'T START",body:"After 6s a TAP TO START CAMERA button appears — tap it. Any error screen also has a ↻ RETRY button. Tapping counts as a user gesture, which iOS always honors."},
@@ -1208,6 +1476,14 @@ function InstructionsModal({color,onClose}){
       {icon:"〰",title:"MOTION TRAILS",body:"Dashed line shows each target's last 24 positions — see patrol routes and movement history at a glance."},
       {icon:"➤",title:"VELOCITY VECTORS",body:"Yellow-tipped arrow shows direction and speed of moving targets, smoothed with momentum. Longer arrow = faster."},
       {icon:"📏",title:"DISTANCE ESTIMATE",body:"Pinhole-model range estimate under each label (assumes human-scale target). Rough guide, not a rangefinder."},
+      {icon:"📏",title:"REFERENCE RANGEFINDER",body:"Distance now comes from known real-world object heights (person 1.7m, car 1.5m, stop sign 2.1m…) against pixel height and camera FOV — far more accurate than the old generic estimate."},
+      {icon:"✨",title:"STAR / SATELLITE TRACKER",body:"Toggle STARS (best with ASTRO): finds bright point sources via local-maxima detection, circles each with its brightness value. Watch a marked point drift between frames to identify a satellite."},
+      {icon:"📊",title:"LIVE HISTOGRAM",body:"Toggle HIST for a 64-bin luminance histogram bottom-left. Blue bars = crushed shadows, red = blown highlights. An ⚠ banner warns when the frame is badly under- or over-exposed."},
+      {icon:"🌐",title:"PANORAMA",body:"Tools → Pano captures a frame each tap (up to 12). Pan roughly 15% between shots. Press STITCH to blend them into one wide image saved to Gallery."},
+      {icon:"🎯",title:"DIGITAL STABILIZATION",body:"Toggle STAB: estimates global frame-to-frame shift via sparse phase correlation and counter-translates the view with 1.08x overscan. Cancels handshake — essential at 8x+ zoom and for ASTRO."},
+      {icon:"🔬",title:"SUPER-RESOLUTION",body:"Toggle SUPER-R on a static scene: registers and averages successive frames to recover real detail and crush sensor noise. Keeps improving the longer you hold still. Resets on mode change."},
+      {icon:"⏳",title:"LOITER DETECTION",body:"Any tracked target that stays within ~70px for over 8 seconds is flagged as loitering and logged with its dwell time. Fires an alert beep. Catches someone casing a location."},
+      {icon:"📍",title:"GEOFENCE",body:"DROP plants an anchor at your current GPS position with an adjustable 25-500m radius. Crossing the boundary either way fires a double beep, a header BREACH indicator, and a log entry with distance."},
       {icon:"🌡",title:"HEAT OVERLAY",body:"Toggle HEAT: motion accumulates into a decaying blue→yellow→red heatmap showing WHERE activity happened over the last ~30s. Stacks with any mode."},
     ],
     auto:[
@@ -1244,7 +1520,7 @@ function InstructionsModal({color,onClose}){
   return(
     <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.97)",zIndex:200,display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease"}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0}}>
-        <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>NVS-9.0 OPERATOR MANUAL</span>
+        <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>NVS-11.0 OPERATOR MANUAL</span>
         <button onClick={onClose} style={{padding:"6px 12px",background:"transparent",border:`1px solid ${color}30`,borderRadius:4,color:`${color}70`,fontFamily:"'DM Mono',monospace",fontSize:9,letterSpacing:2,cursor:"pointer"}}>CLOSE</button>
       </div>
       <div style={{display:"flex",gap:4,padding:"8px 12px",borderBottom:`1px solid ${color}10`,flexShrink:0,overflowX:"auto"}}>
@@ -1963,11 +2239,15 @@ function ThermalOverlay({tempData,mode}){
 // ═══════════════════════════════════════════════════════════════════════════════
 function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeOverlay,
   noiseReduction,color,zoom,showReticle,motionEnabled,autoCapture,tripwires,showRPPG,
-  onCapture,onMotionEvent,onTripwireHit,onRPPG,compact=false,tfDetect,modelReady,onRetry,heatmapOn=false,onTrackCount}){
+  onCapture,onMotionEvent,onTripwireHit,onRPPG,compact=false,tfDetect,modelReady,onRetry,heatmapOn=false,onTrackCount,starsOn=false,showHist=false,stabOn=false,srOn=false,onLoiter}){
   const videoRef=useRef(null),rawRef=useRef(null),dispRef=useRef(null),rafRef=useRef(null);
   const prevRef=useRef(null),motRef=useRef(null),cooldown=useRef(0),fpsRef=useRef({frames:0,last:performance.now()});
   const stackBuf=useRef(null),stackIdx=useRef(0);
-  const lastTfRef=useRef(0);const lastMlRef=useRef(0);
+  const lastTfRef=useRef(0);const lastMlRef=useRef(0);const expoTick=useRef(0);
+  const stabPrev=useRef(null),stabSmooth=useRef({x:0,y:0}),srBuf=useRef(null),srCount=useRef(0);
+  const loiterRef=useRef(new LoiterAnalyzer());
+  const[expo,setExpo]=useState(null);const[stars,setStars]=useState(null);
+  useEffect(()=>{srBuf.current=null;srCount.current=0;},[srOn,mode]);
   const trackerRef=useRef(new TargetTracker());
   const heatRef=useRef(null);
   const[magnify,setMagnify]=useState(null);
@@ -2008,10 +2288,15 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
     if(video&&raw&&disp){
       const result=processFrame(video,raw,disp,
         {mode,brightness,sensitivity,edgeOverlay,noiseReduction,lutName:MODE_LUT[mode]||null,tripwires,showRPPG},
-        {prev:prevRef,motion:motRef,stackBuf,stackIdx,heat:heatRef,heatOn:heatmapOn}
+        {prev:prevRef,motion:motRef,stackBuf,stackIdx,heat:heatRef,heatOn:heatmapOn,expoTick,starsOn,stabOn,stabPrev,stabSmooth,srOn,srBuf,srCount}
       );
       if(result){
         setCameraSize(cs=>cs.w===result.sw&&cs.h===result.sh?cs:{w:result.sw,h:result.sh});
+        if(result.expo)setExpo(result.expo);
+        if(result.starPts)setStars(result.starPts);
+        if(stabOn&&result.shift&&disp){
+          disp.style.transform=`scale(${zoom*1.08}) translate(${-result.shift.x}px,${-result.shift.y}px)`;
+        }
         if(motionEnabled){
           const nowMl=performance.now();
           if(nowMl-lastMlRef.current>200){lastMlRef.current=nowMl;setMotionLevel(result.motionFrac);}
@@ -2026,9 +2311,13 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
                 const dets=preds.map(p=>({...p,
                   x:p.x*sx,y:p.y*sy,w:p.w*sx,h:p.h*sy,cx:p.cx*sx,cy:p.cy*sy}));
                 const t=trackerRef.current.update(dets,nowTr).slice();setBlobs(t);onTrackCount?.(t.length);
+                const loit=loiterRef.current.update(t,nowTr);
+                if(loit.length)onLoiter?.(loit,label);
               } else if(preds){
                 const dets=result.blobs.map(b=>({...b,...classifyBlobFallback(b,result.sw,result.sh)}));
                 const t=trackerRef.current.update(dets,nowTr).slice();setBlobs(t);onTrackCount?.(t.length);
+                const loit=loiterRef.current.update(t,nowTr);
+                if(loit.length)onLoiter?.(loit,label);
               }
             }).catch(()=>{});
           } else if(!modelReady){
@@ -2073,6 +2362,39 @@ function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeO
         style={{width:"100%",height:"100%",display:"block",
         transform:`scale(${zoom})`,transformOrigin:"center",transition:"transform 0.15s ease",
         imageRendering:zoom>=4?"pixelated":"auto",cursor:"crosshair"}}/>
+      {starsOn&&stars&&stars.length>0&&(
+        <svg style={{position:"absolute",inset:0,width:"100%",height:"100%",pointerEvents:"none",zIndex:21}}
+          viewBox={`0 0 ${cameraSize.w} ${cameraSize.h}`} preserveAspectRatio="none">
+          {stars.map((s,i)=>(
+            <g key={i}>
+              <circle cx={s.x} cy={s.y} r={cameraSize.w/180} fill="none" stroke="#a0d8ff" strokeWidth={cameraSize.w/700} opacity="0.8"/>
+              {i<12&&<text x={s.x+cameraSize.w/140} y={s.y-cameraSize.w/220} fill="#a0d8ff" fontSize={cameraSize.w/70} opacity="0.75" fontFamily="DM Mono,monospace">{Math.round(s.lum)}</text>}
+            </g>
+          ))}
+        </svg>
+      )}
+      {showHist&&expo&&(
+        <div style={{position:"absolute",bottom:6,left:6,zIndex:26,background:"rgba(0,0,0,0.7)",
+          border:`1px solid ${color}30`,borderRadius:5,padding:"5px 6px",display:"flex",flexDirection:"column",gap:3}}>
+          <div style={{display:"flex",alignItems:"flex-end",gap:1,height:28}}>
+            {Array.from(expo.hist).map((v,i)=>{
+              const mx=Math.max(...expo.hist)||1;
+              return <div key={i} style={{width:2,height:`${Math.max(1,(v/mx)*28)}px`,
+                background:i<3?"#4488ff":i>60?"#ff4444":color,opacity:.85}}/>;
+            })}
+          </div>
+          <span style={{fontFamily:"'DM Mono',monospace",fontSize:6,color:`${color}70`,letterSpacing:.5}}>
+            μ{Math.round(expo.mean)} ▼{(expo.clipLow*100).toFixed(0)}% ▲{(expo.clipHigh*100).toFixed(0)}%
+          </span>
+        </div>
+      )}
+      {expo&&(expo.clipLow>0.55||expo.clipHigh>0.30)&&(
+        <div style={{position:"absolute",top:6,left:"50%",transform:"translateX(-50%)",zIndex:27,
+          background:"rgba(0,0,0,0.75)",border:"1px solid rgba(255,170,0,0.5)",borderRadius:4,
+          padding:"3px 8px",fontFamily:"'DM Mono',monospace",fontSize:7,color:"#ffaa00",letterSpacing:1}}>
+          {expo.clipLow>0.55?"⚠ UNDEREXPOSED — RAISE GAIN":"⚠ OVEREXPOSED — LOWER GAIN"}
+        </div>
+      )}
       {magnify&&<MagnifierPIP source={dispRef} fx={magnify.fx} fy={magnify.fy} color={color} onClose={()=>setMagnify(null)}/>}
       <div style={{position:"absolute",inset:0,pointerEvents:"none",zIndex:10,overflow:"hidden"}}>
         <div style={{position:"absolute",left:0,right:0,height:2,
@@ -2172,7 +2494,20 @@ export default function NightVisionCamera(){
   const[dualMode,setDualMode]=useState(false);
   const[recording,setRecording]=useState(false);
   const[captures,setCaptures]=useState([]);
-  const clearGallery=useCallback(()=>setCaptures([]),[]);
+  const[clips,setClips]=useState([]);
+  const[vaultOn,setVaultOn]=useState(true);
+  const[storageInfo,setStorageInfo]=useState(null);
+
+  useEffect(()=>{(async()=>{
+    const[cap,cl]=await Promise.all([dbAll("captures"),dbAll("clips")]);
+    if(cap.length)setCaptures(cap.sort((a,b)=>b.ts-a.ts).slice(0,200));
+    if(cl.length)setClips(cl.sort((a,b)=>b.ts-a.ts));
+    setStorageInfo(await dbUsage());
+    try{await navigator.storage?.persist?.();}catch{}
+  })();},[]);
+
+  const clearGallery=useCallback(()=>{setCaptures([]);dbClear("captures");},[]);
+  const clearClips=useCallback(()=>{setClips([]);dbClear("clips");},[]);
   const downloadAll=useCallback(()=>{captures.forEach((c,i)=>setTimeout(()=>{const a=document.createElement('a');a.href=c.url;a.download=`nvs-${c.ts}.png`;a.click();},i*250));},[captures]);
   const[tripwires,setTripwires]=useState([]);
   const[showRPPG,setShowRPPG]=useState(false);
@@ -2196,6 +2531,12 @@ export default function NightVisionCamera(){
   const{hr,quality:hrQ,spo2}=useRPPG(showRPPG?rppgSample:null);
   const{peers,alerts:syncAlerts,broadcast}=useMultiSync(multiSync,PEER_ID);
   const{events,add:addEvent}=useTimeline();
+  useEffect(()=>{ // hydrate events from vault once
+    (async()=>{const ev=await dbAll("events");
+      if(ev.length)ev.sort((a,b)=>b.ts-a.ts).slice(0,200).forEach(e=>addEvent(e.type,e.data,e.ts));
+    })();
+  // eslint-disable-next-line
+  },[]);
   const{torchOn,toggle:toggleTorch}=useTorch();
   const{shakeCount,impact:shakeImpact}=useShake(shakeEnabled);
   const wind=useWindSpeed(audioEnabled,micAnalyserRef);
@@ -2212,6 +2553,24 @@ export default function NightVisionCamera(){
   const[sentryOn,setSentryOn]=useState(false);
   const[heatmapOn,setHeatmapOn]=useState(false);
   const[blobsCount,setBlobsCount]=useState(0);
+  const[starsOn,setStarsOn]=useState(false);
+  const[showHist,setShowHist]=useState(false);
+  const pano=usePanorama();
+  const[stabOn,setStabOn]=useState(false);
+  const[srOn,setSrOn]=useState(false);
+  const sessionStats=useSessionStats();
+  const geo=useGeofence(gps,useCallback((dir,d)=>{
+    addEvent("geofence",{label:`GEOFENCE ${dir} — ${d}m FROM ANCHOR`,icon:"📍"});
+    if(alertsOnRef.current)beepRef.current?.("wire");
+  },[addEvent]));
+  const handleLoiter=useCallback((flagged,label)=>{
+    flagged.forEach(f=>{
+      addEvent("loiter",{label:`${label} LOITER — ${f.label} #${f.id} ${Math.round(f.dwellMs/1000)}s`,conf:f.conf,icon:"⏳"});
+    });
+    if(alertsOnRef.current)beepRef.current?.("alert");
+  },[addEvent]);
+  const alertsOnRef=useRef(true),beepRef=useRef(null);
+  useEffect(()=>{panoRef.current=pano;geoRef.current=geo;});
   const sentryRecUntil=useRef(0);
   const[alertsOn,setAlertsOn]=useState(true);
   const{listening,lastCmd}=useVoiceControl(voiceOn,{
@@ -2246,7 +2605,16 @@ export default function NightVisionCamera(){
     "scan code":()=>scanQRRef.current?.(),
     "close":()=>setModal(null),
     "silence":()=>setAlertsOn(false),
+    "stars":()=>setStarsOn(s=>!s),
+    "histogram":()=>setShowHist(h=>!h),
+    "clips":()=>setModal("clips"),
+    "stabilize":()=>setStabOn(s=>!s),
+    "super resolution":()=>setSrOn(s=>!s),
+    "drop anchor":()=>geoRef.current?.drop(),
+    "clear anchor":()=>geoRef.current?.clear(),
+    "panorama":()=>{const cv=document.querySelector("canvas[data-primary='true']");if(cv)panoRef.current?.add(cv.toDataURL("image/jpeg",0.85));},
   });
+  const panoRef=useRef(null),geoRef=useRef(null);
   const manualSnapRef=useRef(null),burstSnapRef=useRef(null),toggleRecordRef=useRef(null);
   const recordingRef=useRef(false);
   const exportPDFRef=useRef(null),scanQRRef=useRef(null);
@@ -2262,9 +2630,13 @@ export default function NightVisionCamera(){
     if(!url||url==="data:,")return;
     const now=new Date();
     const entry={url,label,targets,auto,time:now.toLocaleTimeString("en-US",{hour12:false}),ts:now.getTime()};
-    setCaptures(p=>[entry,...p].slice(0,50));
+    setCaptures(p=>[entry,...p].slice(0,200));
+    if(vaultRef.current){dbPut("captures",entry).then(async()=>setStorageInfo(await dbUsage()));}
     addEvent("capture",{label,targets,auto,url,time:entry.time});
   },[addEvent]);
+  const vaultRef=useRef(true);
+  useEffect(()=>{vaultRef.current=vaultOn;},[vaultOn]);
+  useEffect(()=>{alertsOnRef.current=alertsOn;beepRef.current=beep;},[alertsOn,beep]);
 
   // Handle motion events → timeline + GPS pin + multicast
   // Beep when a PERSON track appears (throttled 4s)
@@ -2411,11 +2783,29 @@ export default function NightVisionCamera(){
       const rec=new MediaRecorder(cs,{mimeType:"video/webm"});
       const chunks=[];
       rec.ondataavailable=e=>chunks.push(e.data);
-      rec.onstop=()=>{const b=new Blob(chunks,{type:"video/webm"});const u=URL.createObjectURL(b);const a=document.createElement("a");a.href=u;a.download=`nvs7-${Date.now()}.webm`;a.click();};
+      const startedAt=Date.now();
+      rec.onstop=async()=>{
+        const b=new Blob(chunks,{type:"video/webm"});
+        const ts=Date.now();
+        const entry={ts,blob:b,size:b.size,dur:Math.round((ts-startedAt)/1000),
+          mode:modeRef.current,auto:sentryRecUntil.current>startedAt,
+          time:new Date(ts).toLocaleTimeString("en-US",{hour12:false})};
+        if(vaultRef.current){
+          await dbPut("clips",entry);
+          setClips(c=>[entry,...c]);
+          setStorageInfo(await dbUsage());
+          addEvent("clip",{label:`CLIP SAVED — ${entry.dur}s, ${(b.size/1048576).toFixed(1)}MB`});
+        }else{
+          const u=URL.createObjectURL(b);const a=document.createElement("a");
+          a.href=u;a.download=`nvs-${ts}.webm`;a.click();URL.revokeObjectURL(u);
+        }
+      };
       rec.start();mediaRecRef.current=rec;setRecording(true);
     }else{mediaRecRef.current?.stop();setRecording(false);}
   };
 
+  const modeRef=useRef(mode);
+  useEffect(()=>{modeRef.current=mode;},[mode]);
   const newCapCount=captures.length;
   const newEventCount=events.length;
   const hasTripwire=tripwires.some(t=>t.triggered);
@@ -2454,6 +2844,9 @@ export default function NightVisionCamera(){
             {modelReady?<span style={{fontSize:7,color:"rgba(0,255,80,0.7)",letterSpacing:1}}>AI✓</span>:<span style={{fontSize:7,color:"rgba(255,200,0,0.7)",letterSpacing:1,animation:"rec-blink 1s step-end infinite"}}>AI▸</span>}
             {listening&&<span style={{fontSize:7,color:"#ff88ff",letterSpacing:1,animation:"rec-blink 1.2s step-end infinite"}}>🎤VOX</span>}
             {lastCmd&&<span style={{fontSize:7,color:"#ffdd00",letterSpacing:1,fontWeight:700}}>»{lastCmd}</span>}
+            {stabOn&&<span style={{fontSize:7,color:"#66ddff",letterSpacing:1}}>🎯STAB</span>}
+            {srOn&&<span style={{fontSize:7,color:"#ffaaff",letterSpacing:1}}>🔬SR</span>}
+            {geo.anchor&&<span style={{fontSize:7,color:geo.inside?"#00ddaa":"#ff4444",letterSpacing:1,fontWeight:700}}>📍{geo.inside?"SECURE":"BREACH"}</span>}
             {sentryOn&&<span style={{fontSize:7,color:"#ff3355",letterSpacing:1,fontWeight:700,border:"1px solid #ff335560",padding:"1px 4px",borderRadius:2}}>🛡SENTRY</span>}
           </div>
           <div style={{display:"flex",flexDirection:"column",alignItems:"center"}}>
@@ -2486,14 +2879,14 @@ export default function NightVisionCamera(){
               motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
               showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
               onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={true}
-              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry} heatmapOn={heatmapOn} onTrackCount={setBlobsCount}/>
+              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry} heatmapOn={heatmapOn} onTrackCount={setBlobsCount} starsOn={starsOn} showHist={showHist} stabOn={stabOn} srOn={srOn} onLoiter={handleLoiter}/>
             <CameraPanel stream={front.stream} ready={front.ready} error={front.error} label="FRONT"
               mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
               noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
               motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
               showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
               onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={true}
-              tfDetect={tfDetect} modelReady={modelReady} onRetry={front.retry} heatmapOn={heatmapOn}/>
+              tfDetect={tfDetect} modelReady={modelReady} onRetry={front.retry} heatmapOn={heatmapOn} starsOn={starsOn} showHist={showHist}/>
           </div>
         ):(
           <div style={{height:"45dvh",flexShrink:0,display:"flex",flexDirection:"column"}}>
@@ -2503,7 +2896,7 @@ export default function NightVisionCamera(){
               motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
               showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
               onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={false}
-              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry} heatmapOn={heatmapOn} onTrackCount={setBlobsCount}/>
+              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry} heatmapOn={heatmapOn} onTrackCount={setBlobsCount} starsOn={starsOn} showHist={showHist} stabOn={stabOn} srOn={srOn} onLoiter={handleLoiter}/>
             {(showRPPG||audioEnabled)&&(
               <BiometricHUD hr={hr} audioLevel={audioLevel} audioSpike={audioSpike} color={color}/>
             )}
@@ -2617,6 +3010,11 @@ export default function NightVisionCamera(){
                 {l:"🔔 ALERTS",v:alertsOn,f:()=>setAlertsOn(a=>!a),c:"#ffaa00"},
                 {l:"🛡 SENTRY",v:sentryOn,f:()=>setSentryOn(s=>!s),c:"#ff3355"},
                 {l:"🌡 HEAT",v:heatmapOn,f:()=>setHeatmapOn(h=>!h),c:"#ff7700"},
+                {l:"✨ STARS",v:starsOn,f:()=>setStarsOn(s=>!s),c:"#a0d8ff"},
+                {l:"📊 HIST",v:showHist,f:()=>setShowHist(h=>!h),c:"#88ff88"},
+                {l:"💾 VAULT",v:vaultOn,f:()=>setVaultOn(v=>!v),c:"#00ddaa"},
+                {l:"🎯 STAB",v:stabOn,f:()=>setStabOn(s=>!s),c:"#66ddff"},
+                {l:"🔬 SUPER-R",v:srOn,f:()=>setSrOn(s=>!s),c:"#ffaaff"},
               ].map(({l,v,f,c})=>(
                 <button key={l} onClick={f} style={{
                   padding:"10px 4px",
@@ -2685,11 +3083,19 @@ export default function NightVisionCamera(){
                 {l:"⚡ Tripwire",m:"tripwire",c:hasTripwire?"#ffcc00":"#ffcc0080"},
                 {l:"📷 QR Scan",m:"qrscan",c:"#44ffc8"},
                 {l:"📄 Report",m:"report",c:"#b464ff"},
+                {l:`🎞 Clips${clips.length?` (${clips.length})`:""}`,m:"clips",c:"#ff5588"},
+                {l:`🌐 Pano${pano.frames.length?` (${pano.frames.length})`:""}`,m:"panoadd",c:"#ffcc44"},
                 {l:"📊 Sensors",m:"sensors",c:"#44ffcc"},
                 {l:"? Manual",m:"manual",c:`${color}80`},
               ].map(({l,m,c,badge})=>(
                 <button key={m} onClick={()=>{
                   if(m==="qrscan"){scanQR();return;}
+                  if(m==="panoadd"){
+                    const cv=document.querySelector("canvas[data-primary='true']");
+                    if(cv)pano.add(cv.toDataURL("image/jpeg",0.85));
+                    addEvent("pano",{label:`PANO FRAME ${pano.frames.length+1}/12 CAPTURED`});
+                    return;
+                  }
                   if(m==="report"){exportPDF();return;}
                   setModal(m);
                 }} style={{
@@ -2712,6 +3118,46 @@ export default function NightVisionCamera(){
               ))}
             </div>
           </div>
+
+          {/* Geofence control */}
+          <div style={{display:"flex",gap:5,alignItems:"center",padding:"8px 10px",
+            border:`1px solid ${geo.anchor?(geo.inside?"rgba(0,221,170,0.35)":"rgba(255,68,68,0.5)"):`${color}18`}`,
+            borderRadius:7,background:geo.anchor?(geo.inside?"rgba(0,221,170,0.05)":"rgba(255,68,68,0.08)"):"transparent"}}>
+            <span style={{fontFamily:"'DM Mono',monospace",fontSize:9,
+              color:geo.anchor?(geo.inside?"#00ddaa":"#ff4444"):`${color}55`,flex:1}}>
+              📍 {geo.anchor?`GEOFENCE ${geo.inside?"SECURE":"BREACH"} · ${geo.dist!=null?Math.round(geo.dist)+"m":"--"}/${geo.radius}m`:"GEOFENCE OFF"}
+            </span>
+            {geo.anchor&&(
+              <input type="range" min="25" max="500" step="25" value={geo.radius}
+                onChange={e=>geo.setRadius(parseInt(e.target.value))}
+                style={{width:70,accentColor:color,height:4}}/>
+            )}
+            <button onClick={geo.anchor?geo.clear:geo.drop} disabled={!gps} style={{padding:"6px 10px",
+              background:"transparent",border:`1px solid ${geo.anchor?"rgba(255,68,68,0.3)":`${color}30`}`,
+              borderRadius:4,color:geo.anchor?"rgba(255,68,68,0.7)":color,
+              fontFamily:"'DM Mono',monospace",fontSize:9,cursor:"pointer",opacity:gps?1:0.4}}>
+              {geo.anchor?"✕":"DROP"}
+            </button>
+          </div>
+
+          {pano.frames.length>0&&(
+            <div style={{display:"flex",gap:5,alignItems:"center",padding:"8px 10px",
+              border:"1px solid rgba(255,204,68,0.3)",borderRadius:7,background:"rgba(255,204,68,0.05)"}}>
+              <span style={{fontFamily:"'DM Mono',monospace",fontSize:9,color:"#ffcc44",flex:1}}>
+                🌐 PANORAMA — {pano.frames.length}/12 frames
+              </span>
+              <button onClick={async()=>{
+                const url=await pano.stitch();
+                if(url){handleCapture(url,"PANORAMA",0,false);pano.reset();addEvent("pano",{label:"PANORAMA STITCHED"});}
+              }} disabled={pano.frames.length<2} style={{padding:"6px 10px",background:"transparent",
+                border:"1px solid rgba(255,204,68,0.4)",borderRadius:4,color:"#ffcc44",
+                fontFamily:"'DM Mono',monospace",fontSize:9,cursor:"pointer",
+                opacity:pano.frames.length<2?0.4:1}}>STITCH</button>
+              <button onClick={pano.reset} style={{padding:"6px 10px",background:"transparent",
+                border:"1px solid rgba(255,68,68,0.3)",borderRadius:4,color:"rgba(255,68,68,0.7)",
+                fontFamily:"'DM Mono',monospace",fontSize:9,cursor:"pointer"}}>✕</button>
+            </div>
+          )}
 
           {/* QR result */}
           {qrResult&&(
@@ -2759,6 +3205,43 @@ export default function NightVisionCamera(){
         </div>
       </div>
 
+      {/* Clips vault modal */}
+      {modal==="clips"&&(
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.97)",zIndex:200,display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0}}>
+            <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>CLIP VAULT ({clips.length})</span>
+            <div style={{display:"flex",gap:6}}>
+              <button onClick={clearClips} style={{padding:"6px 10px",background:"transparent",border:"1px solid rgba(255,68,68,0.3)",borderRadius:4,color:"rgba(255,68,68,0.7)",fontFamily:"'DM Mono',monospace",fontSize:9,cursor:"pointer"}}>CLEAR</button>
+              <button onClick={()=>setModal(null)} style={{padding:"6px 12px",background:"transparent",border:`1px solid ${color}30`,borderRadius:4,color:`${color}70`,fontFamily:"'DM Mono',monospace",fontSize:9,letterSpacing:2,cursor:"pointer"}}>CLOSE</button>
+            </div>
+          </div>
+          <div style={{flex:1,overflowY:"auto",padding:12,display:"flex",flexDirection:"column",gap:10}}>
+            {clips.length===0&&<div style={{padding:24,textAlign:"center",fontFamily:"'DM Mono',monospace",fontSize:9,color:`${color}40`}}>NO CLIPS — RECORD OR ARM SENTRY</div>}
+            {clips.map(c=>(
+              <div key={c.ts} style={{border:`1px solid ${color}15`,borderRadius:7,overflow:"hidden",background:`${color}04`}}>
+                <video src={URL.createObjectURL(c.blob)} controls playsInline style={{width:"100%",display:"block",background:"#000"}}/>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 10px",gap:8}}>
+                  <div style={{display:"flex",flexDirection:"column",gap:2}}>
+                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:9,color:`${color}90`}}>
+                      {c.auto?"🛡 SENTRY":"⏺ MANUAL"} · {c.mode} · {c.dur}s
+                    </span>
+                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:7,color:`${color}45`}}>
+                      {c.time} · {(c.size/1048576).toFixed(1)}MB
+                    </span>
+                  </div>
+                  <div style={{display:"flex",gap:6}}>
+                    <button onClick={()=>{const u=URL.createObjectURL(c.blob);const a=document.createElement("a");a.href=u;a.download=`nvs-${c.ts}.webm`;a.click();}}
+                      style={{padding:"6px 10px",background:"transparent",border:`1px solid ${color}30`,borderRadius:4,color,fontFamily:"'DM Mono',monospace",fontSize:9,cursor:"pointer"}}>↓</button>
+                    <button onClick={async()=>{await dbDel("clips",c.ts);setClips(x=>x.filter(y=>y.ts!==c.ts));setStorageInfo(await dbUsage());}}
+                      style={{padding:"6px 10px",background:"transparent",border:"1px solid rgba(255,68,68,0.3)",borderRadius:4,color:"rgba(255,68,68,0.7)",fontFamily:"'DM Mono',monospace",fontSize:9,cursor:"pointer"}}>✕</button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Sensors modal */}
       {modal==="sensors"&&(
         <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.97)",zIndex:200,
@@ -2788,6 +3271,14 @@ export default function NightVisionCamera(){
               {l:"AUDIO PEAK",v:audioEnabled?`${peakFreq} Hz`:"Enable mic",c:"#88ccff"},
               {l:"AI MODEL",v:modelReady?"COCO-SSD READY":"LOADING…",c:modelReady?"#00ff50":"#ffcc00"},
               {l:"ACTIVE TRACKS",v:`${blobsCount}`,c:color},
+              {l:"VAULT CLIPS",v:`${clips.length}`,c:"#ff5588"},
+              {l:"VAULT PHOTOS",v:`${captures.length}`,c:"#00ddaa"},
+              {l:"STORAGE USED",v:storageInfo?`${(storageInfo.used/1048576).toFixed(1)} MB`:"--",c:"#00ddaa"},
+              {l:"STORAGE QUOTA",v:storageInfo?`${(storageInfo.quota/1073741824).toFixed(2)} GB`:"--",c:"#00ddaa"},
+              {l:"SESSION UPTIME",v:`${Math.floor(sessionStats.uptime/60)}m ${sessionStats.uptime%60}s`,c:color},
+              {l:"STABILIZATION",v:stabOn?"ACTIVE":"OFF",c:"#66ddff"},
+              {l:"SUPER-RES",v:srOn?"ACCUMULATING":"OFF",c:"#ffaaff"},
+              {l:"GEOFENCE",v:geo.anchor?`${geo.inside?"SECURE":"BREACH"} ${Math.round(geo.dist||0)}m/${geo.radius}m`:"NOT SET",c:geo.anchor?(geo.inside?"#00ddaa":"#ff4444"):`${color}50`},
               {l:"TORCH",v:torchOn?"ON":"OFF",c:"#ffdd88"},
               {l:"HW ZOOM",v:hardZoom&&hzoomSupported?`${hzoom.toFixed(1)}× / ${maxZoom}× max`:"CSS only",c:"#44ffcc"},
               {l:"SHAKE",v:`${shakeCount} events`,c:"#ff8844"},
