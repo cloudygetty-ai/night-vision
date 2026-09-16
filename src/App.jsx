@@ -4,7 +4,7 @@ import{
   useClock,useDeviceOrientation,useGPS,useMicrophone,useRPPG,useTorch,useShake,
   useWindSpeed,useBarometer,useHardwareZoom,useCameraStream,useWakeLock,useBattery,
   useVoiceControl,useThreatBeep,dbAll,dbClear,dbPut,dbDel,dbUsage,useGeofence,useSessionStats,
-  usePanorama,
+  usePanorama,watermarkCapture,hashDataUrl,useTimelapse,shareCapture,useOnline,
 }from"./part2.jsx";
 import{useMultiSync,useTimeline,genCastCode,useCastBroadcast}from"./part3.jsx";
 import{GPSMap,TimelineModal,TripwireEditor,InstructionsModal,BiometricHUD,CastModal}from"./part4.jsx";
@@ -16,6 +16,9 @@ import{MODE_META,MODE_KEYS,ZOOM_STEPS,PEER_ID,Bezel,SectionLabel,BootSequence}fr
 // ═══════════════════════════════════════════════════════════════════════════════
 export default function NightVisionCamera(){
   const[booted,setBooted]=useState(false);
+  const[stampOn,setStampOn]=useState(true);
+  const[dualLayout,setDualLayout]=useState("pip");
+  const[primaryCam,setPrimaryCam]=useState("rear");
   const[openGroups,setOpenGroups]=useState({vision:false,detect:false,alert:false,system:false});
   const cycleMode=useCallback(d=>setMode(m=>{
     const i=MODE_KEYS.indexOf(m);
@@ -133,6 +136,8 @@ export default function NightVisionCamera(){
   const[stabOn,setStabOn]=useState(false);
   const[srOn,setSrOn]=useState(false);
   const sessionStats=useSessionStats();
+  const online=useOnline();
+  const timelapse=useTimelapse(()=>manualSnapRef.current?.());
   const geo=useGeofence(gps,useCallback((dir,d)=>{
     addEvent("geofence",{label:`GEOFENCE ${dir} — ${d}m FROM ANCHOR`,icon:"📍"});
     if(alertsOnRef.current)beepRef.current?.("wire");
@@ -206,17 +211,28 @@ export default function NightVisionCamera(){
   const compassDir=heading!==null?dirs[Math.round(heading/45)%8]:"--";
 
   // Handle captures
-  const handleCapture=useCallback((url,label,targets,auto=false)=>{
+  const handleCapture=useCallback(async(url,label,targets,auto=false)=>{
     if(!url||url==="data:,")return;
     const now=new Date();
-    const entry={url,label,targets,auto,time:now.toLocaleTimeString("en-US",{hour12:false}),ts:now.getTime()};
+    let finalUrl=url;
+    const meta={utc:now.toISOString().replace("T"," ").slice(0,19)+"Z",mode:modeRef.current,
+      gps:gpsRef.current,heading:headingRef.current,alt:gpsRef.current?.alt!=null?Math.round(gpsRef.current.alt):null,label};
+    if(stampRef.current){
+      try{finalUrl=await watermarkCapture(url,meta);}catch{}
+    }
+    const hash=await hashDataUrl(finalUrl);
+    const entry={url:finalUrl,label,targets,auto,hash,utc:meta.utc,
+      lat:gpsRef.current?.lat,lon:gpsRef.current?.lon,mode:meta.mode,
+      time:now.toLocaleTimeString("en-US",{hour12:false}),ts:now.getTime()};
     setCaptures(p=>[entry,...p].slice(0,200));
     if(vaultRef.current){dbPut("captures",entry).then(async()=>setStorageInfo(await dbUsage()));}
-    addEvent("capture",{label,targets,auto,url,time:entry.time});
+    addEvent("capture",{label,targets,auto,url:finalUrl,time:entry.time,hash});
   },[addEvent]);
+  const stampRef=useRef(true),gpsRef=useRef(null),headingRef=useRef(null);
   const vaultRef=useRef(true);
   useEffect(()=>{vaultRef.current=vaultOn;},[vaultOn]);
   useEffect(()=>{alertsOnRef.current=alertsOn;beepRef.current=beep;},[alertsOn,beep]);
+  useEffect(()=>{stampRef.current=stampOn;gpsRef.current=gps;headingRef.current=heading;},[stampOn,gps,heading]);
 
   // Handle motion events → timeline + GPS pin + multicast
   // Beep when a PERSON track appears (throttled 4s)
@@ -441,6 +457,8 @@ export default function NightVisionCamera(){
             {modelReady?<span style={{fontSize:7,color:"rgba(0,255,80,0.7)",letterSpacing:1}}>AI✓</span>:<span style={{fontSize:7,color:"rgba(255,200,0,0.7)",letterSpacing:1,animation:"rec-blink 1s step-end infinite"}}>AI▸</span>}
             {listening&&<span style={{fontSize:7,color:"#ff88ff",letterSpacing:1,animation:"rec-blink 1.2s step-end infinite"}}>🎤VOX</span>}
             {lastCmd&&<span style={{fontSize:7,color:"#ffdd00",letterSpacing:1,fontWeight:700}}>»{lastCmd}</span>}
+            {!online&&<span style={{fontSize:7,color:"#ffaa00",letterSpacing:1,fontWeight:700}}>⚠OFFLINE</span>}
+            {timelapse.active&&<span style={{fontSize:7,color:"#ffcc44",letterSpacing:1,animation:"rec-blink 1s step-end infinite"}}>⏲{timelapse.count}</span>}
             {stabOn&&<span style={{fontSize:7,color:"#66ddff",letterSpacing:1}}>🎯STAB</span>}
             {srOn&&<span style={{fontSize:7,color:"#ffaaff",letterSpacing:1}}>🔬SR</span>}
             {geo.anchor&&<span style={{fontSize:7,color:geo.inside?"#00ddaa":"#ff4444",letterSpacing:1,fontWeight:700}}>📍{geo.inside?"SECURE":"BREACH"}</span>}
@@ -469,34 +487,110 @@ export default function NightVisionCamera(){
 
         {/* CAMERAS */}
         {dualMode?(
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:1,background:`${color}08`,height:"38dvh",flexShrink:0}}>
-            <CameraPanel stream={rear.stream} ready={rear.ready} error={rear.error} label="REAR"
-              mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
+          dualLayout==="pip"?(
+            /* PIP: primary full, secondary as draggable inset */
+            <div style={{position:"relative",height:"45dvh",flexShrink:0}}>
+              <CameraPanel {...(primaryCam==="rear"?
+                {stream:rear.stream,ready:rear.ready,error:rear.error,label:"REAR",onRetry:rear.retry}:
+                {stream:front.stream,ready:front.ready,error:front.error,label:"FRONT",onRetry:front.retry})}
+                mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
               noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
               motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
               showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
-              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={true}
-              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry} heatmapOn={heatmapOn} onTrackCount={setBlobsCount} starsOn={starsOn} showHist={showHist} stabOn={stabOn} srOn={srOn} onLoiter={handleLoiter} onZoom={setZoom} onSwipeMode={cycleMode} onSwipeGain={bumpGain}/>
-            <CameraPanel stream={front.stream} ready={front.ready} error={front.error} label="FRONT"
-              mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
+              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample}
+              tfDetect={tfDetect} modelReady={modelReady} heatmapOn={heatmapOn}
+              starsOn={starsOn} showHist={showHist} stabOn={stabOn} srOn={srOn}
+              onLoiter={handleLoiter} onZoom={setZoom} onSwipeMode={cycleMode} onSwipeGain={bumpGain} compact={false} onTrackCount={setBlobsCount}/>
+              <div style={{position:"absolute",bottom:10,right:10,width:"34%",aspectRatio:"3/4",
+                zIndex:30,border:`1.5px solid ${color}55`,borderRadius:9,overflow:"hidden",
+                boxShadow:`0 3px 14px rgba(0,0,0,0.7)`}}>
+                <CameraPanel {...(primaryCam==="rear"?
+                  {stream:front.stream,ready:front.ready,error:front.error,label:"FRONT",onRetry:front.retry}:
+                  {stream:rear.stream,ready:rear.ready,error:rear.error,label:"REAR",onRetry:rear.retry})}
+                  mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
               noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
               motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
               showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
-              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={true}
-              tfDetect={tfDetect} modelReady={modelReady} onRetry={front.retry} heatmapOn={heatmapOn} starsOn={starsOn} showHist={showHist}/>
-          </div>
+              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample}
+              tfDetect={tfDetect} modelReady={modelReady} heatmapOn={heatmapOn}
+              starsOn={starsOn} showHist={showHist} stabOn={stabOn} srOn={srOn}
+              onLoiter={handleLoiter} onZoom={setZoom} onSwipeMode={cycleMode} onSwipeGain={bumpGain} compact={true}/>
+              </div>
+            </div>
+          ):(
+            /* SPLIT: side-by-side equal panes */
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:1,background:`${color}08`,height:"38dvh",flexShrink:0}}>
+              <CameraPanel stream={rear.stream} ready={rear.ready} error={rear.error} label="REAR"
+                onRetry={rear.retry} mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
+              noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
+              motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
+              showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
+              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample}
+              tfDetect={tfDetect} modelReady={modelReady} heatmapOn={heatmapOn}
+              starsOn={starsOn} showHist={showHist} stabOn={stabOn} srOn={srOn}
+              onLoiter={handleLoiter} onZoom={setZoom} onSwipeMode={cycleMode} onSwipeGain={bumpGain} compact={true} onTrackCount={setBlobsCount}/>
+              <CameraPanel stream={front.stream} ready={front.ready} error={front.error} label="FRONT"
+                onRetry={front.retry} mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
+              noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
+              motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
+              showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
+              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample}
+              tfDetect={tfDetect} modelReady={modelReady} heatmapOn={heatmapOn}
+              starsOn={starsOn} showHist={showHist} stabOn={stabOn} srOn={srOn}
+              onLoiter={handleLoiter} onZoom={setZoom} onSwipeMode={cycleMode} onSwipeGain={bumpGain} compact={true}/>
+            </div>
+          )
         ):(
           <div style={{height:"45dvh",flexShrink:0,display:"flex",flexDirection:"column"}}>
             <CameraPanel stream={rear.stream} ready={rear.ready} error={rear.error} label="REAR"
-              mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
+              onRetry={rear.retry} mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
               noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
               motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
               showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
-              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={false}
-              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry} heatmapOn={heatmapOn} onTrackCount={setBlobsCount} starsOn={starsOn} showHist={showHist} stabOn={stabOn} srOn={srOn} onLoiter={handleLoiter} onZoom={setZoom} onSwipeMode={cycleMode} onSwipeGain={bumpGain}/>
+              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample}
+              tfDetect={tfDetect} modelReady={modelReady} heatmapOn={heatmapOn}
+              starsOn={starsOn} showHist={showHist} stabOn={stabOn} srOn={srOn}
+              onLoiter={handleLoiter} onZoom={setZoom} onSwipeMode={cycleMode} onSwipeGain={bumpGain} compact={false} onTrackCount={setBlobsCount}/>
             {(showRPPG||audioEnabled)&&(
               <BiometricHUD hr={hr} audioLevel={audioLevel} audioSpike={audioSpike} color={color}/>
             )}
+          </div>
+        )}
+        {dualMode&&(
+          <div style={{display:"flex",gap:6,padding:"6px 12px 0",alignItems:"center"}}>
+            {["split","pip"].map(l=>(
+              <button key={l} onClick={()=>setDualLayout(l)} style={{flex:1,padding:"8px 4px",
+                background:dualLayout===l?`${color}14`:"rgba(255,255,255,0.02)",
+                border:`1px solid ${dualLayout===l?color:`${color}22`}`,borderRadius:7,
+                fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:1.5,
+                color:dualLayout===l?color:`${color}55`,fontWeight:dualLayout===l?700:400}}>
+                {l==="split"?"◫ SPLIT":"⬓ PIP"}
+              </button>
+            ))}
+            {dualLayout==="pip"&&(
+              <button onClick={()=>setPrimaryCam(c=>c==="rear"?"front":"rear")} style={{flex:1,padding:"8px 4px",
+                background:"rgba(255,255,255,0.02)",border:`1px solid ${color}22`,borderRadius:7,
+                fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:1.5,color:`${color}70`}}>
+                ⇄ {primaryCam.toUpperCase()}
+              </button>
+            )}
+          </div>
+        )}
+        {dualMode&&front.error&&!front.stream&&(
+          <div style={{margin:"8px 12px 0",padding:"10px 12px",borderRadius:8,
+            border:"1px solid rgba(255,170,0,0.4)",background:"rgba(255,170,0,0.07)"}}>
+            <div style={{fontFamily:"'DM Mono',monospace",fontSize:9,color:"#ffaa00",letterSpacing:1,marginBottom:4}}>
+              ⚠ SECOND CAMERA UNAVAILABLE
+            </div>
+            <div style={{fontFamily:"'DM Mono',monospace",fontSize:8,color:"rgba(255,170,0,0.7)",lineHeight:1.5}}>
+              This device can only run one camera at a time (common on iOS Safari and most Android browsers).
+              Use ⇄ SWAP below to switch which camera is active, or turn DUAL CAM off.
+            </div>
+            <button onClick={()=>{setDualMode(false);front.retry?.();}} style={{marginTop:8,padding:"7px 12px",
+              background:"transparent",border:"1px solid rgba(255,170,0,0.4)",borderRadius:6,
+              color:"#ffaa00",fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:1.5}}>
+              USE SINGLE CAMERA
+            </button>
           </div>
         )}
 
@@ -672,6 +766,7 @@ export default function NightVisionCamera(){
               {l:"💾 VAULT",v:vaultOn,f:()=>setVaultOn(v=>!v),c:"#00ddaa"},
               {l:"🎤 VOICE",v:voiceOn,f:()=>setVoiceOn(v=>!v),c:"#ff88ff"},
               {l:"🔗 SYNC",v:multiSync,f:()=>setMultiSync(s=>!s),c:"#cc44ff"},
+              {l:"🏷 GEO-STAMP",v:stampOn,f:()=>setStampOn(s=>!s),c:"#00ddaa"},
               {l:"🔴 NIGHT-SAFE UI",v:redUI,f:()=>setRedUI(r=>!r),c:"#ff2200"},
               {l:"🌑 STEALTH",v:stealth,f:()=>setStealth(true),c:"#666666"},
             ]},
@@ -805,6 +900,27 @@ export default function NightVisionCamera(){
                 </button>
               ))}
             </div>
+          </div>
+
+          {/* Timelapse */}
+          <div style={{display:"flex",gap:6,alignItems:"center",padding:"8px 10px",
+            border:`1px solid ${timelapse.active?"rgba(255,204,68,0.45)":`${color}18`}`,borderRadius:8,
+            background:timelapse.active?"rgba(255,204,68,0.06)":"transparent"}}>
+            <span style={{fontFamily:"'DM Mono',monospace",fontSize:9,
+              color:timelapse.active?"#ffcc44":`${color}60`,flex:1,letterSpacing:.5}}>
+              ⏲ {timelapse.active?`TIMELAPSE · ${timelapse.count} SHOTS`:"TIMELAPSE OFF"}
+            </span>
+            <select value={timelapse.interval} onChange={e=>timelapse.setIntervalSec(+e.target.value)}
+              style={{background:"rgba(0,0,0,0.6)",border:`1px solid ${color}25`,borderRadius:5,
+                color:color,fontFamily:"'DM Mono',monospace",fontSize:9,padding:"5px 4px"}}>
+              {[2,5,10,30,60,300].map(s=><option key={s} value={s}>{s<60?`${s}s`:`${s/60}m`}</option>)}
+            </select>
+            <button onClick={timelapse.active?timelapse.stop:timelapse.start} style={{padding:"7px 12px",
+              background:"transparent",border:`1px solid ${timelapse.active?"rgba(255,68,68,0.4)":`${color}30`}`,
+              borderRadius:6,color:timelapse.active?"rgba(255,68,68,0.8)":color,
+              fontFamily:"'DM Mono',monospace",fontSize:9,letterSpacing:1}}>
+              {timelapse.active?"STOP":"START"}
+            </button>
           </div>
 
           {/* Geofence control */}
@@ -1031,6 +1147,8 @@ export default function NightVisionCamera(){
                     <div style={{fontSize:6,color:`${color}40`,fontFamily:"'DM Mono',monospace"}}>{c.time}{c.targets>0?` • ${c.targets}TGT`:""}</div>
                   </div>
                   <a href={c.url} download={`nvs7-${c.ts}.png`} style={{fontSize:8,color,textDecoration:"none",border:`1px solid ${color}30`,padding:"2px 6px",borderRadius:1,fontFamily:"'DM Mono',monospace"}}>↓</a>
+                  <button onClick={async()=>{const r=await shareCapture(c.url,`NVS ${c.utc||c.time} ${c.lat?`@${c.lat.toFixed(5)},${c.lon.toFixed(5)}`:""}`);if(r==="unsupported")addEvent("share",{label:"SHARE NOT SUPPORTED ON THIS BROWSER"});}}
+                    style={{fontSize:8,color,background:"transparent",border:`1px solid ${color}30`,padding:"2px 6px",borderRadius:3,fontFamily:"'DM Mono',monospace",cursor:"pointer"}}>⤴</button>
                 </div>
               </div>
             ))}
