@@ -485,7 +485,7 @@ export default function NightVisionCamera(){
         </div>
 
         {/* ══ TOP STATUS ══ */}
-        <StatusStrip color={color} clock={timeStr} battery={battery} onOpenSheet={()=>setSheet(true)}
+        <StatusStrip color={color} clock={timeStr} battery={battery}
           badges={<>
             {recording&&<span style={{fontSize:9,color:"#ff4444",letterSpacing:1.4,animation:"rec-blink 1s step-end infinite"}}>● REC</span>}
             {sentryOn&&<span style={{fontSize:9,color:"#ff3b62",letterSpacing:1.4,fontWeight:700}}>🛡ARMED</span>}
@@ -505,20 +505,48 @@ export default function NightVisionCamera(){
         {/* ══ BOTTOM CONTROL ISLAND ══ */}
         <div style={{position:"absolute",left:0,right:0,bottom:0,zIndex:60,
           paddingBottom:"calc(env(safe-area-inset-bottom,0px) + 6px)",
-          background:"linear-gradient(to top,rgba(0,0,0,.9),rgba(0,0,0,.55) 55%,transparent)"}}>
+          background:"linear-gradient(to top,rgba(0,0,0,.97) 0%,rgba(0,0,0,.88) 45%,rgba(0,0,0,.55) 78%,transparent)"}}>
 
           {/* preset chips */}
           <div style={{display:"flex",gap:7,padding:"0 14px 8px",overflowX:"auto"}}>
             {[{n:"SURVEIL",i:"🛡"},{n:"RECON",i:"🔭"},{n:"ASTRO",i:"✨"},{n:"SEARCH",i:"🔍"}].map(({n,i})=>(
               <button key={n} onClick={()=>applyPreset(n)} style={{flexShrink:0,
-                padding:"7px 12px",borderRadius:20,
+                padding:"10px 15px",borderRadius:22,
                 ...glass(color,activePreset===n?.6:.3),
                 border:`1px solid ${activePreset===n?color:`${color}26`}`,
-                fontFamily:"'DM Mono',monospace",fontSize:9,letterSpacing:1.4,
-                fontWeight:activePreset===n?700:400,
-                color:activePreset===n?color:`${color}85`,
+                fontFamily:"'DM Mono',monospace",fontSize:11,letterSpacing:1.4,
+                fontWeight:activePreset===n?800:600,
+                color:activePreset===n?color:`${color}c8`,
                 boxShadow:activePreset===n?`0 0 12px ${color}44`:"none"}}>
                 {i} {n}
+              </button>
+            ))}
+          </div>
+
+          {/* ALWAYS-VISIBLE TOOL STRIP */}
+          <div style={{display:"flex",gap:7,padding:"0 14px 9px",overflowX:"auto"}}>
+            {[
+              {i:"⚙",l:"SETTINGS",f:()=>{setSheetTab("vision");setSheet(true);},hi:true},
+              {i:"📁",l:"GALLERY",f:()=>setModal("gallery"),n:captures.length},
+              {i:"🎞",l:"CLIPS",f:()=>setModal("clips"),n:clips.length},
+              {i:"🗺",l:"MAP",f:()=>setModal("map")},
+              {i:"⏱",l:"LOG",f:()=>setModal("timeline"),n:events.length},
+              {i:"📊",l:"SENSORS",f:()=>setModal("sensors")},
+              {i:"⚡",l:"TRIPWIRE",f:()=>setModal("tripwire")},
+              {i:"📡",l:"CAST",f:()=>setModal("cast")},
+              {i:"📄",l:"REPORT",f:exportPDF},
+              {i:"?",l:"MANUAL",f:()=>setModal("manual")},
+            ].map(({i,l,f,n,hi})=>(
+              <button key={l} onClick={f} style={{flexShrink:0,display:"flex",alignItems:"center",gap:6,
+                padding:"12px 16px",borderRadius:12,position:"relative",
+                ...glass(color,hi?.62:.34),
+                border:`1.5px solid ${hi?color:`${color}2e`}`,
+                boxShadow:hi?`0 0 14px ${color}44`:"none"}}>
+                <span style={{fontSize:18,lineHeight:1}}>{i}</span>
+                <span style={{fontFamily:"'DM Mono',monospace",fontSize:11.5,letterSpacing:1.3,
+                  fontWeight:hi?800:600,color:hi?color:`${color}e0`}}>{l}</span>
+                {n>0&&<span style={{background:color,color:"#000",borderRadius:9,padding:"0 5px",
+                  fontSize:9.5,fontWeight:800,fontFamily:"'DM Mono',monospace"}}>{n}</span>}
               </button>
             ))}
           </div>
@@ -529,8 +557,8 @@ export default function NightVisionCamera(){
             onTorch={toggleTorch} torchOn={torchOn}
             onSentry={()=>setSentryOn(s=>!s)} sentryOn={sentryOn}
             onZoomCycle={()=>setZoom(z=>{const i=ZOOM_STEPS.indexOf(z);return ZOOM_STEPS[(i+1)%ZOOM_STEPS.length];})}/>
-          <div style={{textAlign:"center",fontFamily:"'DM Mono',monospace",fontSize:7.5,
-            color:`${color}3a`,letterSpacing:.8,paddingBottom:2}}>
+          <div style={{textAlign:"center",fontFamily:"'DM Mono',monospace",fontSize:9,
+            color:`${color}6a`,letterSpacing:.8,paddingBottom:2}}>
             swipe ◀▶ mode · ▲▼ gain · pinch zoom · 2-tap magnify
           </div>
         </div>

@@ -6,22 +6,22 @@ import{useState,useEffect,useRef}from"react";
 
 /* Frosted glass surface used by every floating element */
 export const glass=(color,alpha=0.42)=>({
-  background:`rgba(4,8,6,${alpha})`,
+  background:`rgba(2,5,4,${Math.min(0.96,alpha+0.34)})`,
   backdropFilter:"blur(18px) saturate(1.3)",
   WebkitBackdropFilter:"blur(18px) saturate(1.3)",
   border:`1px solid ${color}22`,
 });
 
 /* ── TOP STATUS STRIP — one line, only live data ─────────────────────────── */
-export function StatusStrip({color,clock,badges,battery,onOpenSheet}){
+export function StatusStrip({color,clock,badges,battery}){
   return(
     <div style={{position:"absolute",top:0,left:0,right:0,zIndex:60,
       padding:"calc(env(safe-area-inset-top,0px) + 8px) 12px 8px",
       display:"flex",alignItems:"center",gap:10,
       background:"linear-gradient(to bottom,rgba(0,0,0,.82),rgba(0,0,0,.35) 60%,transparent)"}}>
-      <span style={{fontFamily:"'Cinzel',serif",fontSize:13,fontWeight:900,color,
+      <span style={{fontFamily:"'Cinzel',serif",fontSize:16,fontWeight:900,color,
         letterSpacing:3,textShadow:`0 0 14px ${color}66`,flexShrink:0}}>NVS</span>
-      <span style={{fontFamily:"'DM Mono',monospace",fontSize:11,color:`${color}cc`,
+      <span style={{fontFamily:"'DM Mono',monospace",fontSize:13,color:`${color}ee`,
         letterSpacing:1,flexShrink:0}}>{clock}</span>
       <div style={{flex:1,display:"flex",gap:7,alignItems:"center",overflow:"hidden",flexWrap:"nowrap"}}>
         {badges}
@@ -32,8 +32,6 @@ export function StatusStrip({color,clock,badges,battery,onOpenSheet}){
           {battery.charging?"⚡":""}{battery.level}%
         </span>
       )}
-      <button onClick={onOpenSheet} style={{flexShrink:0,width:34,height:34,borderRadius:10,
-        ...glass(color,.5),color,fontSize:15,display:"grid",placeItems:"center"}}>☰</button>
     </div>
   );
 }
@@ -52,12 +50,12 @@ export function ModeWheel({modes,meta,value,onChange,color}){
         const on=m===value, mc=meta[m].color;
         return(
           <button key={m} data-m={m} onClick={()=>onChange(m)}
-            style={{scrollSnapAlign:"center",flexShrink:0,padding:"9px 15px",
+            style={{scrollSnapAlign:"center",flexShrink:0,padding:"11px 17px",
               background:"transparent",border:"none",
               fontFamily:"'DM Mono',monospace",
-              fontSize:on?13:11,fontWeight:on?700:400,
-              letterSpacing:on?2.4:1.4,
-              color:on?mc:`${mc}52`,
+              fontSize:on?17:13,fontWeight:on?800:500,
+              letterSpacing:on?2.6:1.6,
+              color:on?mc:`${mc}85`,
               textShadow:on?`0 0 16px ${mc}99`:"none",
               transition:"all .18s ease",whiteSpace:"nowrap"}}>
             {meta[m].label}
@@ -134,10 +132,10 @@ export function Sheet({open,onClose,color,tabs,tab,onTab,children}){
         <div style={{display:"flex",gap:6,padding:"0 12px 10px",overflowX:"auto",flexShrink:0}}>
           {tabs.map(t=>(
             <button key={t.id} onClick={()=>onTab(t.id)} style={{flexShrink:0,
-              padding:"9px 14px",borderRadius:11,
+              padding:"11px 16px",borderRadius:12,
               background:tab===t.id?`${color}1c`:"rgba(255,255,255,.045)",
               border:`1px solid ${tab===t.id?color:`${color}22`}`,
-              fontFamily:"'DM Mono',monospace",fontSize:10,letterSpacing:1.6,
+              fontFamily:"'DM Mono',monospace",fontSize:11.5,letterSpacing:1.6,
               fontWeight:tab===t.id?700:400,
               color:tab===t.id?color:`${color}7a`,display:"flex",alignItems:"center",gap:6}}>
               <span style={{fontSize:12}}>{t.icon}</span>{t.label}
@@ -161,15 +159,15 @@ export function Row({color,label,hint,on,onClick,c}){
   const cc=c||color;
   return(
     <button onClick={onClick} style={{display:"flex",alignItems:"center",gap:12,
-      padding:"13px 14px",borderRadius:12,textAlign:"left",
+      padding:"16px 15px",borderRadius:13,textAlign:"left",
       background:on?`${cc}16`:"rgba(255,255,255,.04)",
       border:`1px solid ${on?cc:`${cc}22`}`,
       boxShadow:on?`0 0 12px ${cc}26`:"none"}}>
       <span style={{flex:1,display:"flex",flexDirection:"column",gap:2}}>
-        <span style={{fontFamily:"'DM Mono',monospace",fontSize:11.5,letterSpacing:.6,
-          fontWeight:on?700:500,color:on?cc:`${cc}b0`}}>{label}</span>
-        {hint&&<span style={{fontFamily:"'DM Mono',monospace",fontSize:8.5,
-          color:`${cc}66`,letterSpacing:.2}}>{hint}</span>}
+        <span style={{fontFamily:"'DM Mono',monospace",fontSize:13,letterSpacing:.5,
+          fontWeight:on?700:500,color:on?cc:`${cc}d8`}}>{label}</span>
+        {hint&&<span style={{fontFamily:"'DM Mono',monospace",fontSize:10,
+          color:`${cc}8a`,letterSpacing:.2}}>{hint}</span>}
       </span>
       <span style={{width:40,height:22,borderRadius:12,flexShrink:0,position:"relative",
         background:on?cc:`${cc}2a`,transition:"background .16s"}}>
@@ -184,14 +182,14 @@ export function Tile({color,icon,label,sub,onClick,active,c,badge}){
   const cc=c||color;
   return(
     <button onClick={onClick} style={{display:"flex",flexDirection:"column",
-      alignItems:"center",justifyContent:"center",gap:5,padding:"15px 8px",
+      alignItems:"center",justifyContent:"center",gap:5,padding:"18px 9px",
       borderRadius:13,position:"relative",
       background:active?`${cc}18`:"rgba(255,255,255,.045)",
       border:`1px solid ${active?cc:`${cc}24`}`,
       boxShadow:active?`0 0 13px ${cc}2e`:"none"}}>
-      <span style={{fontSize:21,lineHeight:1}}>{icon}</span>
-      <span style={{fontFamily:"'DM Mono',monospace",fontSize:9.5,letterSpacing:1.1,
-        fontWeight:active?700:500,color:active?cc:`${cc}a8`}}>{label}</span>
+      <span style={{fontSize:25,lineHeight:1}}>{icon}</span>
+      <span style={{fontFamily:"'DM Mono',monospace",fontSize:11,letterSpacing:1.1,
+        fontWeight:active?700:500,color:active?cc:`${cc}d0`}}>{label}</span>
       {sub&&<span style={{fontFamily:"'DM Mono',monospace",fontSize:7.5,color:`${cc}62`}}>{sub}</span>}
       {badge>0&&<span style={{position:"absolute",top:6,right:7,background:cc,color:"#000",
         borderRadius:9,padding:"1px 5px",fontSize:8,fontWeight:700,
@@ -204,13 +202,13 @@ export function Slider({color,label,value,min,max,step,onChange,fmt}){
   return(
     <div style={{display:"flex",alignItems:"center",gap:12,padding:"11px 14px",
       borderRadius:12,background:"rgba(255,255,255,.04)",border:`1px solid ${color}1c`}}>
-      <span style={{fontFamily:"'DM Mono',monospace",fontSize:10,letterSpacing:1.6,
-        color:`${color}92`,minWidth:52}}>{label}</span>
+      <span style={{fontFamily:"'DM Mono',monospace",fontSize:11.5,letterSpacing:1.6,
+        color:`${color}c0`,minWidth:56}}>{label}</span>
       <input type="range" min={min} max={max} step={step} value={value}
         onChange={e=>onChange(parseFloat(e.target.value))}
         style={{flex:1,accentColor:color,height:4}}/>
-      <span style={{fontFamily:"'DM Mono',monospace",fontSize:11,fontWeight:700,
-        color,minWidth:44,textAlign:"right"}}>{fmt?fmt(value):value}</span>
+      <span style={{fontFamily:"'DM Mono',monospace",fontSize:13,fontWeight:700,
+        color,minWidth:48,textAlign:"right"}}>{fmt?fmt(value):value}</span>
     </div>
   );
 }
@@ -218,7 +216,7 @@ export function Slider({color,label,value,min,max,step,onChange,fmt}){
 export function GroupTitle({color,children}){
   return(
     <div style={{display:"flex",alignItems:"center",gap:9,padding:"8px 2px 1px"}}>
-      <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:700,color:`${color}9a`,
+      <span style={{fontFamily:"'Cinzel',serif",fontSize:12,fontWeight:700,color:`${color}c4`,
         letterSpacing:3.2}}>{children}</span>
       <span style={{flex:1,height:1,background:`linear-gradient(to right,${color}26,transparent)`}}/>
     </div>
