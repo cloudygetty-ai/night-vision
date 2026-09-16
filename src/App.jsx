@@ -21,30 +21,6 @@ export default function NightVisionCamera(){
     const i=MODE_KEYS.indexOf(m);
     return MODE_KEYS[(i+d+MODE_KEYS.length)%MODE_KEYS.length];
   }),[]);
-  const applyPreset=useCallback(name=>{
-    const P={
-      SURVEIL:{mode:"NVG",brightness:1.125,sensitivity:0.7,motionEnabled:true,autoCapture:true,
-        sentryOn:true,alertsOn:true,heatmapOn:true,stabOn:true,noiseReduction:true,
-        edgeOverlay:false,srOn:false,starsOn:false,showRPPG:false,zoom:1},
-      RECON:{mode:"TACT",brightness:0,sensitivity:0.5,motionEnabled:true,autoCapture:false,
-        sentryOn:false,alertsOn:false,heatmapOn:false,stabOn:true,noiseReduction:false,
-        edgeOverlay:true,srOn:false,starsOn:false,showRPPG:false,zoom:2},
-      ASTRO:{mode:"ASTRO",brightness:1.5,sensitivity:0.3,motionEnabled:false,autoCapture:false,
-        sentryOn:false,alertsOn:false,heatmapOn:false,stabOn:true,noiseReduction:true,
-        edgeOverlay:false,srOn:true,starsOn:true,showRPPG:false,zoom:1},
-      SEARCH:{mode:"WHITE",brightness:0.75,sensitivity:0.8,motionEnabled:true,autoCapture:true,
-        sentryOn:false,alertsOn:true,heatmapOn:false,stabOn:true,noiseReduction:true,
-        edgeOverlay:true,srOn:false,starsOn:false,showRPPG:false,zoom:1},
-    }[name];
-    if(!P)return;
-    setMode(P.mode);setBrightness(P.brightness);setSensitivity(P.sensitivity);
-    setMotionEnabled(P.motionEnabled);setAutoCapture(P.autoCapture);setSentryOn(P.sentryOn);
-    setAlertsOn(P.alertsOn);setHeatmapOn(P.heatmapOn);setStabOn(P.stabOn);
-    setNoiseReduction(P.noiseReduction);setEdgeOverlay(P.edgeOverlay);setSrOn(P.srOn);
-    setStarsOn(P.starsOn);setShowRPPG(P.showRPPG);setZoom(P.zoom);
-    setActivePreset(name);
-    addEvent("preset",{label:`PRESET LOADED — ${name}`,icon:"⚡"});
-  },[addEvent]);
   const[activePreset,setActivePreset]=useState(null);
   const[stealth,setStealth]=useState(false);
   const[redUI,setRedUI]=useState(false);
@@ -104,6 +80,31 @@ export default function NightVisionCamera(){
   const startCast=useCallback(()=>{setCastCode(genCastCode());setCastOn(true);},[]);
   const stopCast=useCallback(()=>setCastOn(false),[]);
   const{events,add:addEvent}=useTimeline();
+
+  const applyPreset=useCallback(name=>{
+    const P={
+      SURVEIL:{mode:"NVG",brightness:1.125,sensitivity:0.7,motionEnabled:true,autoCapture:true,
+        sentryOn:true,alertsOn:true,heatmapOn:true,stabOn:true,noiseReduction:true,
+        edgeOverlay:false,srOn:false,starsOn:false,showRPPG:false,zoom:1},
+      RECON:{mode:"TACT",brightness:0,sensitivity:0.5,motionEnabled:true,autoCapture:false,
+        sentryOn:false,alertsOn:false,heatmapOn:false,stabOn:true,noiseReduction:false,
+        edgeOverlay:true,srOn:false,starsOn:false,showRPPG:false,zoom:2},
+      ASTRO:{mode:"ASTRO",brightness:1.5,sensitivity:0.3,motionEnabled:false,autoCapture:false,
+        sentryOn:false,alertsOn:false,heatmapOn:false,stabOn:true,noiseReduction:true,
+        edgeOverlay:false,srOn:true,starsOn:true,showRPPG:false,zoom:1},
+      SEARCH:{mode:"WHITE",brightness:0.75,sensitivity:0.8,motionEnabled:true,autoCapture:true,
+        sentryOn:false,alertsOn:true,heatmapOn:false,stabOn:true,noiseReduction:true,
+        edgeOverlay:true,srOn:false,starsOn:false,showRPPG:false,zoom:1},
+    }[name];
+    if(!P)return;
+    setMode(P.mode);setBrightness(P.brightness);setSensitivity(P.sensitivity);
+    setMotionEnabled(P.motionEnabled);setAutoCapture(P.autoCapture);setSentryOn(P.sentryOn);
+    setAlertsOn(P.alertsOn);setHeatmapOn(P.heatmapOn);setStabOn(P.stabOn);
+    setNoiseReduction(P.noiseReduction);setEdgeOverlay(P.edgeOverlay);setSrOn(P.srOn);
+    setStarsOn(P.starsOn);setShowRPPG(P.showRPPG);setZoom(P.zoom);
+    setActivePreset(name);
+    addEvent("preset",{label:`PRESET LOADED — ${name}`,icon:"⚡"});
+  },[addEvent]);
   useEffect(()=>{ // hydrate events from vault once
     (async()=>{const ev=await dbAll("events");
       if(ev.length)ev.sort((a,b)=>b.ts-a.ts).slice(0,200).forEach(e=>addEvent(e.type,e.data,e.ts));
