@@ -9,6 +9,7 @@ import{
 import{useMultiSync,useTimeline,genCastCode,useCastBroadcast}from"./part3.jsx";
 import{GPSMap,TimelineModal,TripwireEditor,InstructionsModal,BiometricHUD,CastModal}from"./part4.jsx";
 import{CameraPanel,SignalBars}from"./part5.jsx";
+import{StatusStrip,ModeWheel,ShutterBar,Sheet,Row,Tile,Slider,GroupTitle,glass}from"./part7.jsx";
 import{MODE_META,MODE_KEYS,ZOOM_STEPS,PEER_ID,Bezel,SectionLabel,BootSequence}from"./part6.jsx";
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -17,6 +18,8 @@ import{MODE_META,MODE_KEYS,ZOOM_STEPS,PEER_ID,Bezel,SectionLabel,BootSequence}fr
 export default function NightVisionCamera(){
   const[booted,setBooted]=useState(false);
   const[q,setQ]=useState("");
+  const[sheet,setSheet]=useState(false);
+  const[sheetTab,setSheetTab]=useState("vision");
   const[stampOn,setStampOn]=useState(true);
   const[dualLayout,setDualLayout]=useState("pip");
   const[primaryCam,setPrimaryCam]=useState("rear");
@@ -407,6 +410,14 @@ export default function NightVisionCamera(){
   const newEventCount=events.length;
   const hasTripwire=tripwires.some(t=>t.triggered);
 
+  const camProps={
+    mode,brightness,sensitivity,edgeOverlay,noiseReduction,color,zoom,showReticle,
+    motionEnabled,autoCapture,tripwires,showRPPG,
+    onCapture:handleCapture,onMotionEvent:handleMotionEvent,onTripwireHit:handleTripwireHit,
+    onRPPG:setRppgSample,tfDetect,modelReady,heatmapOn,starsOn,showHist,stabOn,srOn,
+    onLoiter:handleLoiter,onZoom:setZoom,onSwipeMode:cycleMode,onSwipeGain:bumpGain,
+  };
+
   return(
     <div style={{height:"100dvh",background:"#000",display:"flex",flexDirection:"column",fontFamily:"'DM Mono',monospace",overflow:"hidden"}}>
       <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet"/>
@@ -437,605 +448,281 @@ export default function NightVisionCamera(){
       {modal==="cast"&&<CastModal color={color} code={castCode} on={castOn} viewers={castViewers} status={castStatus} onStart={startCast} onStop={stopCast} onClose={()=>setModal(null)}/>}
 
       <div style={{width:"100%",height:"100%",display:"flex",flexDirection:"column",background:"#000",
-        border:`1px solid ${color}18`,boxShadow:`inset 0 0 60px rgba(0,0,0,0.6),inset 0 0 1px ${color}25`,
+        boxShadow:`inset 0 0 90px rgba(0,0,0,0.55)`,
         animation:booted?"fade-in 0.5s ease":"none",overflow:"hidden",position:"relative"}}>
         <Bezel color={color} op={.4}/>
 
-        {/* HEADER */}
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 14px",
-          borderBottom:`1px solid ${color}15`,position:"relative",
-          background:`linear-gradient(180deg,${color}06,transparent)`,backdropFilter:"blur(2px)"}}>
-          <div style={{position:"absolute",left:0,right:0,bottom:-1,height:1,
-            background:`linear-gradient(90deg,transparent,${color}50,transparent)`,
-            backgroundSize:"200% 100%",animation:"header-sweep 5s linear infinite"}}/>
-          <div style={{display:"flex",alignItems:"center",gap:7}}>
-            <div style={{width:6,height:6,borderRadius:"50%",background:color,boxShadow:`0 0 10px ${color}`,animation:"rec-blink 2s step-end infinite"}}/>
-            <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4,textShadow:`0 0 10px ${color}40`}}>NVS-7</span>
-            {multiSync&&peers.length>0&&<span style={{fontSize:7,color:"#cc44ff",letterSpacing:1,border:"1px solid #cc44ff30",padding:"1px 4px",borderRadius:1}}>{peers.length}P</span>}
-            {hasTripwire&&<span style={{fontSize:7,color:"#ffcc00",letterSpacing:1,animation:"rec-blink 0.4s step-end infinite",border:"1px solid #ffcc0050",padding:"1px 4px",borderRadius:1}}>⚠WIRE</span>}
-            {audioSpike&&<span style={{fontSize:7,color:"#ff2222",letterSpacing:1,animation:"rec-blink 0.3s step-end infinite"}}>🔊!</span>}
-            {torchOn&&<span style={{fontSize:9}}>🔦</span>}
-            {modelReady?<span style={{fontSize:7,color:"rgba(0,255,80,0.7)",letterSpacing:1}}>AI✓</span>:<span style={{fontSize:7,color:"rgba(255,200,0,0.7)",letterSpacing:1,animation:"rec-blink 1s step-end infinite"}}>AI▸</span>}
-            {listening&&<span style={{fontSize:7,color:"#ff88ff",letterSpacing:1,animation:"rec-blink 1.2s step-end infinite"}}>🎤VOX</span>}
-            {lastCmd&&<span style={{fontSize:7,color:"#ffdd00",letterSpacing:1,fontWeight:700}}>»{lastCmd}</span>}
-            {!online&&<span style={{fontSize:7,color:"#ffaa00",letterSpacing:1,fontWeight:700}}>⚠OFFLINE</span>}
-            {timelapse.active&&<span style={{fontSize:7,color:"#ffcc44",letterSpacing:1,animation:"rec-blink 1s step-end infinite"}}>⏲{timelapse.count}</span>}
-            {stabOn&&<span style={{fontSize:7,color:"#66ddff",letterSpacing:1}}>🎯STAB</span>}
-            {srOn&&<span style={{fontSize:7,color:"#ffaaff",letterSpacing:1}}>🔬SR</span>}
-            {geo.anchor&&<span style={{fontSize:7,color:geo.inside?"#00ddaa":"#ff4444",letterSpacing:1,fontWeight:700}}>📍{geo.inside?"SECURE":"BREACH"}</span>}
-            {sentryOn&&<span style={{fontSize:7,color:"#ff3355",letterSpacing:1,fontWeight:700,border:"1px solid #ff335560",padding:"1px 4px",borderRadius:2}}>🛡SENTRY</span>}
+        {/* ══ FULL-BLEED CAMERA ══ */}
+        <div style={{position:"absolute",inset:0,zIndex:1}}>
+          {dualMode?(
+            dualLayout==="pip"?(
+              <div style={{position:"relative",width:"100%",height:"100%"}}>
+                <CameraPanel {...(primaryCam==="rear"?
+                  {stream:rear.stream,ready:rear.ready,error:rear.error,label:"REAR",onRetry:rear.retry}:
+                  {stream:front.stream,ready:front.ready,error:front.error,label:"FRONT",onRetry:front.retry})}
+                  {...camProps} compact={false} onTrackCount={setBlobsCount}/>
+                <div style={{position:"absolute",top:"calc(env(safe-area-inset-top,0px) + 58px)",right:10,
+                  width:"31%",aspectRatio:"3/4",zIndex:40,border:`1.5px solid ${color}55`,
+                  borderRadius:12,overflow:"hidden",boxShadow:"0 4px 18px rgba(0,0,0,.8)"}}>
+                  <CameraPanel {...(primaryCam==="rear"?
+                    {stream:front.stream,ready:front.ready,error:front.error,label:"FRONT",onRetry:front.retry}:
+                    {stream:rear.stream,ready:rear.ready,error:rear.error,label:"REAR",onRetry:rear.retry})}
+                    {...camProps} compact={true}/>
+                </div>
+              </div>
+            ):(
+              <div style={{display:"grid",gridTemplateRows:"1fr 1fr",gap:1,width:"100%",height:"100%",background:`${color}0a`}}>
+                <CameraPanel stream={rear.stream} ready={rear.ready} error={rear.error} label="REAR"
+                  onRetry={rear.retry} {...camProps} compact={true} onTrackCount={setBlobsCount}/>
+                <CameraPanel stream={front.stream} ready={front.ready} error={front.error} label="FRONT"
+                  onRetry={front.retry} {...camProps} compact={true}/>
+              </div>
+            )
+          ):(
+            <CameraPanel stream={rear.stream} ready={rear.ready} error={rear.error} label="REAR"
+              onRetry={rear.retry} {...camProps} compact={false} onTrackCount={setBlobsCount}/>
+          )}
+        </div>
+
+        {/* ══ TOP STATUS ══ */}
+        <StatusStrip color={color} clock={timeStr} battery={battery} onOpenSheet={()=>setSheet(true)}
+          badges={<>
+            {recording&&<span style={{fontSize:9,color:"#ff4444",letterSpacing:1.4,animation:"rec-blink 1s step-end infinite"}}>● REC</span>}
+            {sentryOn&&<span style={{fontSize:9,color:"#ff3b62",letterSpacing:1.4,fontWeight:700}}>🛡ARMED</span>}
+            {timelapse.active&&<span style={{fontSize:9,color:"#ffcc44",letterSpacing:1.2}}>⏲{timelapse.count}</span>}
+            {hasTripwire&&<span style={{fontSize:9,color:"#ffcc00",letterSpacing:1.2,animation:"rec-blink .4s step-end infinite"}}>⚠WIRE</span>}
+            {geo.anchor&&<span style={{fontSize:9,color:geo.inside?"#00ddaa":"#ff4444",letterSpacing:1.2,fontWeight:700}}>📍{geo.inside?"OK":"BREACH"}</span>}
+            {castOn&&<span style={{fontSize:9,color:"#66ddff",letterSpacing:1.2}}>📡{castViewers}</span>}
+            {!online&&<span style={{fontSize:9,color:"#ffaa00",letterSpacing:1.2}}>⚠OFF</span>}
+            {listening&&<span style={{fontSize:9,color:"#ff88ff",letterSpacing:1.2,animation:"rec-blink 1.2s step-end infinite"}}>🎤</span>}
+            {lastCmd&&<span style={{fontSize:9,color:"#ffdd00",fontWeight:700}}>»{lastCmd}</span>}
+            {!modelReady
+              ?<span style={{fontSize:9,color:"rgba(255,200,0,.8)",letterSpacing:1,animation:"rec-blink 1s step-end infinite"}}>AI▸</span>
+              :blobsCount>0&&<span style={{fontSize:9,color:`${color}cc`,letterSpacing:1}}>◎{blobsCount}</span>}
+            {heading!=null&&<span style={{fontSize:9,color:`${color}72`,letterSpacing:1}}>{String(heading).padStart(3,"0")}°</span>}
+          </>}/>
+
+        {/* ══ BOTTOM CONTROL ISLAND ══ */}
+        <div style={{position:"absolute",left:0,right:0,bottom:0,zIndex:60,
+          paddingBottom:"calc(env(safe-area-inset-bottom,0px) + 6px)",
+          background:"linear-gradient(to top,rgba(0,0,0,.9),rgba(0,0,0,.55) 55%,transparent)"}}>
+
+          {/* preset chips */}
+          <div style={{display:"flex",gap:7,padding:"0 14px 8px",overflowX:"auto"}}>
+            {[{n:"SURVEIL",i:"🛡"},{n:"RECON",i:"🔭"},{n:"ASTRO",i:"✨"},{n:"SEARCH",i:"🔍"}].map(({n,i})=>(
+              <button key={n} onClick={()=>applyPreset(n)} style={{flexShrink:0,
+                padding:"7px 12px",borderRadius:20,
+                ...glass(color,activePreset===n?.6:.3),
+                border:`1px solid ${activePreset===n?color:`${color}26`}`,
+                fontFamily:"'DM Mono',monospace",fontSize:9,letterSpacing:1.4,
+                fontWeight:activePreset===n?700:400,
+                color:activePreset===n?color:`${color}85`,
+                boxShadow:activePreset===n?`0 0 12px ${color}44`:"none"}}>
+                {i} {n}
+              </button>
+            ))}
           </div>
-          <div style={{display:"flex",flexDirection:"column",alignItems:"center"}}>
-            <span style={{fontSize:6,color:`${color}45`,letterSpacing:1}}>{dateStr}</span>
-            <span style={{fontSize:10,color,letterSpacing:2}}>{timeStr}</span>
-          </div>
-          <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:1}}>
-            {heading!==null&&<span style={{fontSize:7,color:`${color}55`,letterSpacing:1}}>{String(heading).padStart(3,"0")}° {compassDir}</span>}
-            {gps&&<span style={{fontSize:6,color:`${color}40`,letterSpacing:.5}}>{gps.lat.toFixed(3)}°N</span>}
-            {altitude!=null&&<span style={{fontSize:6,color:`${color}35`,letterSpacing:.5}}>{altitude}m ASL</span>}
-            {wind>1&&<span style={{fontSize:6,color:`${color}35`,letterSpacing:.5}}>💨{wind.toFixed(1)}m/s</span>}
-            {battery&&<span style={{fontSize:6,color:battery.level<20?"#ff4444":`${color}35`,letterSpacing:.5}}>{battery.charging?"⚡":"🔋"}{battery.level}%</span>}
-            {gps?.speed>0.5&&<span style={{fontSize:6,color:`${color}35`,letterSpacing:.5}}>🏃{(gps.speed*2.237).toFixed(1)}mph</span>}
-            {showRPPG&&hr&&<span style={{fontSize:6,color:hrQ>0.5?"#ff6688":`${color}35`,letterSpacing:.5}}>❤️{hr}{spo2?` ${spo2}%`:""}</span>}
-            {audioEnabled&&peakFreq>0&&<span style={{fontSize:6,color:`${color}30`,letterSpacing:.5}}>♪{peakFreq}Hz</span>}
-            <div style={{display:"flex",gap:4,alignItems:"center"}}>
-              <SignalBars level={.8} color={color}/>
-              {autoCapture&&<span style={{fontSize:6,color:"#ffdd00",animation:"rec-blink 1.5s step-end infinite"}}>AUTO</span>}
-              {recording&&<span style={{fontSize:6,color:"#ff2222",animation:"rec-blink 1s step-end infinite"}}>●REC</span>}
-            </div>
+
+          <ModeWheel modes={MODE_KEYS} meta={MODE_META} value={mode} onChange={setMode} color={color}/>
+          <ShutterBar color={color} zoom={zoom}
+            onShot={manualSnap} onRec={toggleRecord} recording={recording}
+            onTorch={toggleTorch} torchOn={torchOn}
+            onSentry={()=>setSentryOn(s=>!s)} sentryOn={sentryOn}
+            onZoomCycle={()=>setZoom(z=>{const i=ZOOM_STEPS.indexOf(z);return ZOOM_STEPS[(i+1)%ZOOM_STEPS.length];})}/>
+          <div style={{textAlign:"center",fontFamily:"'DM Mono',monospace",fontSize:7.5,
+            color:`${color}3a`,letterSpacing:.8,paddingBottom:2}}>
+            swipe ◀▶ mode · ▲▼ gain · pinch zoom · 2-tap magnify
           </div>
         </div>
 
-        {/* CAMERAS */}
-        {dualMode?(
-          dualLayout==="pip"?(
-            /* PIP: primary full, secondary as draggable inset */
-            <div style={{position:"relative",height:"45dvh",flexShrink:0}}>
-              <CameraPanel {...(primaryCam==="rear"?
-                {stream:rear.stream,ready:rear.ready,error:rear.error,label:"REAR",onRetry:rear.retry}:
-                {stream:front.stream,ready:front.ready,error:front.error,label:"FRONT",onRetry:front.retry})}
-                mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
-              noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
-              motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
-              showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
-              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample}
-              tfDetect={tfDetect} modelReady={modelReady} heatmapOn={heatmapOn}
-              starsOn={starsOn} showHist={showHist} stabOn={stabOn} srOn={srOn}
-              onLoiter={handleLoiter} onZoom={setZoom} onSwipeMode={cycleMode} onSwipeGain={bumpGain} compact={false} onTrackCount={setBlobsCount}/>
-              <div style={{position:"absolute",bottom:10,right:10,width:"34%",aspectRatio:"3/4",
-                zIndex:30,border:`1.5px solid ${color}55`,borderRadius:9,overflow:"hidden",
-                boxShadow:`0 3px 14px rgba(0,0,0,0.7)`}}>
-                <CameraPanel {...(primaryCam==="rear"?
-                  {stream:front.stream,ready:front.ready,error:front.error,label:"FRONT",onRetry:front.retry}:
-                  {stream:rear.stream,ready:rear.ready,error:rear.error,label:"REAR",onRetry:rear.retry})}
-                  mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
-              noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
-              motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
-              showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
-              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample}
-              tfDetect={tfDetect} modelReady={modelReady} heatmapOn={heatmapOn}
-              starsOn={starsOn} showHist={showHist} stabOn={stabOn} srOn={srOn}
-              onLoiter={handleLoiter} onZoom={setZoom} onSwipeMode={cycleMode} onSwipeGain={bumpGain} compact={true}/>
-              </div>
-            </div>
-          ):(
-            /* SPLIT: side-by-side equal panes */
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:1,background:`${color}08`,height:"38dvh",flexShrink:0}}>
-              <CameraPanel stream={rear.stream} ready={rear.ready} error={rear.error} label="REAR"
-                onRetry={rear.retry} mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
-              noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
-              motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
-              showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
-              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample}
-              tfDetect={tfDetect} modelReady={modelReady} heatmapOn={heatmapOn}
-              starsOn={starsOn} showHist={showHist} stabOn={stabOn} srOn={srOn}
-              onLoiter={handleLoiter} onZoom={setZoom} onSwipeMode={cycleMode} onSwipeGain={bumpGain} compact={true} onTrackCount={setBlobsCount}/>
-              <CameraPanel stream={front.stream} ready={front.ready} error={front.error} label="FRONT"
-                onRetry={front.retry} mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
-              noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
-              motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
-              showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
-              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample}
-              tfDetect={tfDetect} modelReady={modelReady} heatmapOn={heatmapOn}
-              starsOn={starsOn} showHist={showHist} stabOn={stabOn} srOn={srOn}
-              onLoiter={handleLoiter} onZoom={setZoom} onSwipeMode={cycleMode} onSwipeGain={bumpGain} compact={true}/>
-            </div>
-          )
-        ):(
-          <div style={{height:"45dvh",flexShrink:0,display:"flex",flexDirection:"column"}}>
-            <CameraPanel stream={rear.stream} ready={rear.ready} error={rear.error} label="REAR"
-              onRetry={rear.retry} mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
-              noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
-              motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
-              showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
-              onTripwireHit={handleTripwireHit} onRPPG={setRppgSample}
-              tfDetect={tfDetect} modelReady={modelReady} heatmapOn={heatmapOn}
-              starsOn={starsOn} showHist={showHist} stabOn={stabOn} srOn={srOn}
-              onLoiter={handleLoiter} onZoom={setZoom} onSwipeMode={cycleMode} onSwipeGain={bumpGain} compact={false} onTrackCount={setBlobsCount}/>
-            {(showRPPG||audioEnabled)&&(
-              <BiometricHUD hr={hr} audioLevel={audioLevel} audioSpike={audioSpike} color={color}/>
-            )}
-          </div>
-        )}
-        {dualMode&&(
-          <div style={{display:"flex",gap:6,padding:"6px 12px 0",alignItems:"center"}}>
-            {["split","pip"].map(l=>(
-              <button key={l} onClick={()=>setDualLayout(l)} style={{flex:1,padding:"8px 4px",
-                background:dualLayout===l?`${color}14`:"rgba(255,255,255,0.02)",
-                border:`1px solid ${dualLayout===l?color:`${color}22`}`,borderRadius:7,
-                fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:1.5,
-                color:dualLayout===l?color:`${color}55`,fontWeight:dualLayout===l?700:400}}>
-                {l==="split"?"◫ SPLIT":"⬓ PIP"}
-              </button>
-            ))}
-            {dualLayout==="pip"&&(
-              <button onClick={()=>setPrimaryCam(c=>c==="rear"?"front":"rear")} style={{flex:1,padding:"8px 4px",
-                background:"rgba(255,255,255,0.02)",border:`1px solid ${color}22`,borderRadius:7,
-                fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:1.5,color:`${color}70`}}>
-                ⇄ {primaryCam.toUpperCase()}
-              </button>
-            )}
-          </div>
-        )}
-        {dualMode&&front.error&&!front.stream&&(
-          <div style={{margin:"8px 12px 0",padding:"10px 12px",borderRadius:8,
-            border:"1px solid rgba(255,170,0,0.4)",background:"rgba(255,170,0,0.07)"}}>
-            <div style={{fontFamily:"'DM Mono',monospace",fontSize:9,color:"#ffaa00",letterSpacing:1,marginBottom:4}}>
-              ⚠ SECOND CAMERA UNAVAILABLE
-            </div>
-            <div style={{fontFamily:"'DM Mono',monospace",fontSize:8,color:"rgba(255,170,0,0.7)",lineHeight:1.5}}>
-              This device can only run one camera at a time (common on iOS Safari and most Android browsers).
-              Use ⇄ SWAP below to switch which camera is active, or turn DUAL CAM off.
-            </div>
-            <button onClick={()=>{setDualMode(false);front.retry?.();}} style={{marginTop:8,padding:"7px 12px",
-              background:"transparent",border:"1px solid rgba(255,170,0,0.4)",borderRadius:6,
-              color:"#ffaa00",fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:1.5}}>
-              USE SINGLE CAMERA
-            </button>
-          </div>
-        )}
+        {/* ══ SHEET ══ */}
+        <Sheet open={sheet} onClose={()=>setSheet(false)} color={color}
+          tab={sheetTab} onTab={setSheetTab}
+          tabs={[
+            {id:"vision",icon:"👁",label:"VISION"},
+            {id:"detect",icon:"◎",label:"DETECT"},
+            {id:"capture",icon:"📸",label:"CAPTURE",badge:captures.length},
+            {id:"data",icon:"🗂",label:"DATA",badge:events.length},
+            {id:"system",icon:"⚙",label:"SYSTEM"},
+          ]}>
 
-        {/* CONTROLS — scrollable deck below fixed camera */}
-        <div style={{
-          padding:"12px 12px 24px",
-          borderTop:`1px solid ${color}18`,
-          display:"flex",flexDirection:"column",gap:10,
-          background:"rgba(0,0,0,0.85)",
-          flex:1,minHeight:0,overflowY:"auto",
-          WebkitOverflowScrolling:"touch",
-        }}>
-
-          {/* ── MODE SELECTOR ── */}
-          {/* ── PRESETS ── */}
-          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:6}}>
-            {[
-              {n:"SURVEIL",i:"🛡",d:"NVG + sentry + heat"},
-              {n:"RECON",i:"🔭",d:"Tactical day + edges"},
-              {n:"ASTRO",i:"✨",d:"Long exposure + stars"},
-              {n:"SEARCH",i:"🔍",d:"White-hot + auto-cap"},
-            ].map(({n,i})=>(
-              <button key={n} onClick={()=>applyPreset(n)} style={{
-                display:"flex",flexDirection:"column",alignItems:"center",gap:3,padding:"10px 3px",
-                background:activePreset===n?`${color}16`:"rgba(255,255,255,0.02)",
-                border:`1px solid ${activePreset===n?color:`${color}20`}`,borderRadius:9,
-                boxShadow:activePreset===n?`0 0 8px ${color}25`:"none",transition:"all 0.12s",
-              }}>
-                <span style={{fontSize:13,lineHeight:1}}>{i}</span>
-                <span style={{fontFamily:"'DM Mono',monospace",fontSize:7,letterSpacing:1,
-                  color:activePreset===n?color:`${color}60`,fontWeight:activePreset===n?700:400}}>{n}</span>
-              </button>
-            ))}
-          </div>
-
-          {/* ── QUICK BAR — the four things you actually reach for ── */}
-          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:6}}>
-            {[
-              {l:"📷",sub:"SHOT",f:manualSnap,c:color},
-              {l:recording?"■":"●",sub:recording?"STOP":"REC",f:toggleRecord,c:recording?"#ff2222":"#ff5555"},
-              {l:"🔦",sub:"TORCH",f:toggleTorch,c:"#ffdd88",on:torchOn},
-              {l:"🛡",sub:"SENTRY",f:()=>setSentryOn(s=>!s),c:"#ff3355",on:sentryOn},
-            ].map(({l,sub,f,c,on})=>(
-              <button key={sub} onClick={f} style={{
-                display:"flex",flexDirection:"column",alignItems:"center",gap:3,
-                padding:"12px 4px",
-                background:on?`${c}1a`:"rgba(255,255,255,0.03)",
-                border:`1.5px solid ${on?c:`${c}30`}`,borderRadius:10,
-                boxShadow:on?`0 0 10px ${c}30`:"none",transition:"all 0.12s",
-              }}>
-                <span style={{fontSize:16,lineHeight:1,color:c}}>{l}</span>
-                <span style={{fontFamily:"'DM Mono',monospace",fontSize:7,letterSpacing:1.5,
-                  color:on?c:`${c}70`,fontWeight:on?700:400}}>{sub}</span>
-              </button>
-            ))}
-          </div>
-
-          {/* ── GESTURE HINT ── */}
-          <div style={{display:"flex",gap:10,justifyContent:"center",padding:"2px 0 0",flexWrap:"wrap"}}>
-            {["◀▶ swipe: mode","▲▼ swipe: gain","pinch: zoom","2-tap: magnify"].map(h=>(
-              <span key={h} style={{fontFamily:"'DM Mono',monospace",fontSize:7,color:`${color}30`,letterSpacing:.5}}>{h}</span>
-            ))}
-          </div>
-
-          <div style={{padding:"9px 10px",border:`1px solid ${color}12`,borderRadius:9,background:`${color}03`}}>
-            <SectionLabel color={color}>MODE</SectionLabel>
-            <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
-              {MODE_KEYS.map(m=>{
-                const mc=MODE_META[m].color;
-                return(
-                  <button key={m} onClick={()=>setMode(m)} style={{
-                    flex:"1 1 auto",minWidth:44,padding:"9px 2px",
-                    background:mode===m?`${mc}20`:"rgba(0,0,0,0.4)",
-                    border:`1.5px solid ${mode===m?mc:`${mc}28`}`,
-                    borderRadius:6,fontSize:8,fontWeight:700,
-                    color:mode===m?mc:`${mc}55`,
-                    letterSpacing:.5,transition:"all 0.15s",
-                    boxShadow:mode===m?`0 0 8px ${mc}30`:"none",
-                  }}>
-                    {MODE_META[m].label}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* ── ZOOM ── */}
-          <div style={{padding:"9px 10px",border:`1px solid ${color}12`,borderRadius:9,background:`${color}03`}}>
-            <SectionLabel color={color}>ZOOM</SectionLabel>
-            <div style={{display:"flex",gap:5}}>
-              {ZOOM_STEPS.map(z=>(
-                <button key={z} onClick={()=>setZoom(z)} style={{
-                  flex:1,padding:"10px 2px",
-                  background:zoom===z?`${color}18`:"rgba(0,0,0,0.4)",
-                  border:`1.5px solid ${zoom===z?color:`${color}20`}`,
-                  borderRadius:6,fontSize:9,fontWeight:700,
-                  color:zoom===z?color:`${color}45`,
-                  transition:"all 0.12s",
-                  boxShadow:zoom===z?`0 0 6px ${color}25`:"none",
-                }}>
-                  {z}×
-                </button>
-              ))}
-            </div>
+          {sheetTab==="vision"&&<>
+            <Slider color={color} label="GAIN" value={brightness} min={-1.5} max={1.5} step={0.375}
+              onChange={setBrightness} fmt={v=>`${v>0?"+":""}${v.toFixed(1)}`}/>
+            <Slider color={color} label="ZOOM" value={zoom} min={1} max={12} step={0.5}
+              onChange={setZoom} fmt={v=>`${v}×`}/>
             {hardZoom&&hzoomSupported&&(
-              <div style={{display:"flex",alignItems:"center",gap:10,marginTop:8}}>
-                <span style={{fontSize:9,color:`${color}60`,letterSpacing:1,whiteSpace:"nowrap"}}>HW ZOOM</span>
-                <input type="range" min="1" max={maxZoom} step="0.1" value={hzoom}
-                  onChange={e=>applyZoom(parseFloat(e.target.value))}
-                  style={{flex:1,accentColor:color,height:4}}/>
-                <span style={{fontSize:9,color:color,minWidth:34,fontWeight:700}}>{hzoom.toFixed(1)}×</span>
+              <Slider color={color} label="HW-Z" value={hzoom} min={1} max={maxZoom} step={0.1}
+                onChange={applyZoom} fmt={v=>`${v.toFixed(1)}×`}/>
+            )}
+            <GroupTitle color={color}>IMAGE</GroupTitle>
+            <Row color={color} label="STABILIZATION" hint="cancels handshake at high zoom" on={stabOn} onClick={()=>setStabOn(s=>!s)} c="#66ddff"/>
+            <Row color={color} label="SUPER-RESOLUTION" hint="hold still — recovers real detail" on={srOn} onClick={()=>setSrOn(s=>!s)} c="#ffaaff"/>
+            <Row color={color} label="NOISE REDUCTION" hint="temporal blend" on={noiseReduction} onClick={()=>setNoiseReduction(n=>!n)}/>
+            <Row color={color} label="EDGE OVERLAY" hint="sobel outlines" on={edgeOverlay} onClick={()=>setEdgeOverlay(e=>!e)}/>
+            <GroupTitle color={color}>OVERLAYS</GroupTitle>
+            <Row color={color} label="RETICLE" on={showReticle} onClick={()=>setShowReticle(r=>!r)}/>
+            <Row color={color} label="HISTOGRAM" hint="exposure graph + warnings" on={showHist} onClick={()=>setShowHist(h=>!h)} c="#88ff88"/>
+            <Row color={color} label="STAR TRACKER" hint="marks bright point sources" on={starsOn} onClick={()=>setStarsOn(s=>!s)} c="#a0d8ff"/>
+            <GroupTitle color={color}>CAMERA</GroupTitle>
+            <Row color={color} label="TORCH" on={torchOn} onClick={toggleTorch} c="#ffd27a"/>
+            <Row color={color} label="HARDWARE ZOOM" hint="true optical zoom if supported" on={hardZoom} onClick={()=>setHardZoom(h=>!h)} c="#44ffcc"/>
+            <Row color={color} label="DUAL CAMERA" hint="front + rear together" on={dualMode} onClick={()=>setDualMode(d=>!d)}/>
+            {dualMode&&(
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:7}}>
+                <Tile color={color} icon="◫" label="SPLIT" active={dualLayout==="split"} onClick={()=>setDualLayout("split")}/>
+                <Tile color={color} icon="⬓" label="PIP" active={dualLayout==="pip"} onClick={()=>setDualLayout("pip")}/>
+                <Tile color={color} icon="⇄" label={primaryCam.toUpperCase()} onClick={()=>setPrimaryCam(c=>c==="rear"?"front":"rear")}/>
               </div>
             )}
-          </div>
-
-          {/* ── SLIDERS ── */}
-          <div style={{display:"flex",flexDirection:"column",gap:8,padding:"9px 10px",
-            border:`1px solid ${color}12`,borderRadius:9,background:`${color}03`}}>
-            <SectionLabel color={color}>SIGNAL</SectionLabel>
-            <div style={{display:"flex",alignItems:"center",gap:10}}>
-              <span style={{fontSize:9,color:`${color}60`,letterSpacing:1,minWidth:36}}>SENS</span>
-              <input type="range" min="0" max="1" step="0.05" value={sensitivity}
-                onChange={e=>setSensitivity(parseFloat(e.target.value))}
-                style={{flex:1,accentColor:color,height:4}}/>
-              <span style={{fontSize:9,color:color,minWidth:32,fontWeight:700,textAlign:"right"}}>{Math.round(sensitivity*100)}%</span>
-            </div>
-            <div style={{display:"flex",alignItems:"center",gap:10}}>
-              <span style={{fontSize:9,color:`${color}60`,letterSpacing:1,minWidth:36}}>GAIN</span>
-              <div style={{flex:1,display:"flex",gap:4,alignItems:"flex-end",height:22}}>
-                {[-2,-1,0,1,2].map((v,i)=>(
-                  <div key={i} onClick={()=>setBrightness(v*0.75)} style={{
-                    flex:1,height:10+i*3,borderRadius:2,cursor:"pointer",
-                    background:brightness>=v*0.75?color:`${color}20`,
-                    transition:"background 0.1s",
-                    boxShadow:brightness>=v*0.75?`0 0 4px ${color}50`:"none",
-                  }}/>
-                ))}
+            {dualMode&&front.error&&!front.stream&&(
+              <div style={{padding:"11px 13px",borderRadius:11,border:"1px solid rgba(255,170,0,.4)",
+                background:"rgba(255,170,0,.07)",fontFamily:"'DM Mono',monospace"}}>
+                <div style={{fontSize:10,color:"#ffaa00",letterSpacing:1,marginBottom:4}}>⚠ SECOND CAMERA UNAVAILABLE</div>
+                <div style={{fontSize:8.5,color:"rgba(255,170,0,.75)",lineHeight:1.55}}>
+                  This device can only run one camera at a time (common on iOS Safari). Use ⇄ to switch, or turn DUAL off.
+                </div>
               </div>
-              <span style={{fontSize:9,color:color,minWidth:32,fontWeight:700,textAlign:"right"}}>
-                {brightness>0?"+":""}{(brightness).toFixed(1)}
+            )}
+          </>}
+
+          {sheetTab==="detect"&&<>
+            <Slider color={color} label="SENS" value={sensitivity} min={0} max={1} step={0.05}
+              onChange={setSensitivity} fmt={v=>`${Math.round(v*100)}%`}/>
+            <GroupTitle color={color}>DETECTION</GroupTitle>
+            <Row color={color} label="MOTION TRACKING" hint="blobs, IDs, trails, velocity" on={motionEnabled} onClick={()=>setMotionEnabled(m=>!m)}/>
+            <Row color={color} label="FACE DETECTION" on={faceDetect} onClick={()=>setFaceDetect(f=>!f)}/>
+            <Row color={color} label="HEATMAP" hint="where activity happened" on={heatmapOn} onClick={()=>setHeatmapOn(h=>!h)} c="#ff7700"/>
+            <GroupTitle color={color}>SENSORS</GroupTitle>
+            <Row color={color} label="MICROPHONE" hint="audio spikes + wind estimate" on={audioEnabled} onClick={()=>setAudioEnabled(a=>!a)}/>
+            <Row color={color} label="HEART RATE (rPPG)" hint="fingertip on lens + torch" on={showRPPG} onClick={()=>setShowRPPG(r=>!r)} c="#ff6688"/>
+            <Row color={color} label="SHAKE / IMPACT" on={shakeEnabled} onClick={()=>setShakeEnabled(s=>!s)} c="#ff8844"/>
+            <GroupTitle color={color}>AUTOMATION</GroupTitle>
+            <Row color={color} label="SENTRY" hint="auto-record when a person appears" on={sentryOn} onClick={()=>setSentryOn(s=>!s)} c="#ff3b62"/>
+            <Row color={color} label="AUTO CAPTURE" hint="snapshot on motion" on={autoCapture} onClick={()=>setAutoCapture(a=>!a)} c="#ffdd00"/>
+            <Row color={color} label="ALERT SOUNDS" on={alertsOn} onClick={()=>setAlertsOn(a=>!a)} c="#ffaa00"/>
+            <Tile color={color} icon="⚡" label="TRIPWIRES" sub={`${tripwires.length} zones`} onClick={()=>{setSheet(false);setModal("tripwire");}} c="#ffcc00"/>
+            <GroupTitle color={color}>GEOFENCE</GroupTitle>
+            <div style={{display:"flex",gap:8,alignItems:"center",padding:"11px 13px",borderRadius:12,
+              background:"rgba(255,255,255,.04)",border:`1px solid ${geo.anchor?(geo.inside?"#00ddaa66":"#ff444488"):`${color}1c`}`}}>
+              <span style={{flex:1,fontFamily:"'DM Mono',monospace",fontSize:10,
+                color:geo.anchor?(geo.inside?"#00ddaa":"#ff4444"):`${color}80`}}>
+                {geo.anchor?`${geo.inside?"SECURE":"BREACH"} · ${Math.round(geo.dist||0)}m / ${geo.radius}m`:"NO ANCHOR SET"}
               </span>
-            </div>
-          </div>
-
-          {/* ── SEARCH — type to find any control ── */}
-          <div style={{position:"relative"}}>
-            <input value={q} onChange={e=>setQ(e.target.value)}
-              placeholder="SEARCH CONTROLS — torch, sentry, zoom, map…"
-              style={{width:"100%",padding:"13px 38px 13px 13px",
-                background:"rgba(255,255,255,0.04)",border:`1.5px solid ${q?color:`${color}25`}`,
-                borderRadius:10,color:color,fontFamily:"'DM Mono',monospace",fontSize:10,
-                letterSpacing:.5,outline:"none"}}/>
-            <span style={{position:"absolute",right:12,top:"50%",transform:"translateY(-50%)",
-              fontSize:12,color:`${color}50`,pointerEvents:"none"}}>{q?"":"🔍"}</span>
-            {q&&(
-              <button onClick={()=>setQ("")} style={{position:"absolute",right:8,top:"50%",
-                transform:"translateY(-50%)",background:"transparent",border:"none",
-                color:`${color}70`,fontSize:13,cursor:"pointer",padding:4}}>✕</button>
-            )}
-          </div>
-
-          {/* ── FEATURE TOGGLES — grouped ── */}
-          {[
-            {id:"vision",label:"VISION",items:[
-              {l:"EDGE",v:edgeOverlay,f:()=>setEdgeOverlay(e=>!e)},
-              {l:"NOISE RED",v:noiseReduction,f:()=>setNoiseReduction(n=>!n)},
-              {l:"RETICLE",v:showReticle,f:()=>setShowReticle(r=>!r)},
-              {l:"🎯 STAB",v:stabOn,f:()=>setStabOn(s=>!s),c:"#66ddff"},
-              {l:"🔬 SUPER-R",v:srOn,f:()=>setSrOn(s=>!s),c:"#ffaaff"},
-              {l:"📊 HISTOGRAM",v:showHist,f:()=>setShowHist(h=>!h),c:"#88ff88"},
-              {l:"✨ STARS",v:starsOn,f:()=>setStarsOn(s=>!s),c:"#a0d8ff"},
-              {l:"🔦 TORCH",v:torchOn,f:toggleTorch,c:"#ffdd88"},
-              {l:"HW ZOOM",v:hardZoom,f:()=>setHardZoom(h=>!h),c:"#44ffcc"},
-              {l:"DUAL CAM",v:dualMode,f:()=>setDualMode(d=>!d)},
-            ]},
-            {id:"detect",label:"DETECTION",items:[
-              {l:"MOTION",v:motionEnabled,f:()=>setMotionEnabled(m=>!m)},
-              {l:"FACE",v:faceDetect,f:()=>setFaceDetect(fd=>!fd)},
-              {l:"🌡 HEATMAP",v:heatmapOn,f:()=>setHeatmapOn(h=>!h),c:"#ff7700"},
-              {l:"🎤 MIC",v:audioEnabled,f:()=>setAudioEnabled(a=>!a)},
-              {l:"❤️ rPPG",v:showRPPG,f:()=>setShowRPPG(r=>!r),c:"#ff6688"},
-              {l:"💥 SHAKE",v:shakeEnabled,f:()=>setShakeEnabled(s=>!s),c:"#ff8844"},
-            ]},
-            {id:"alert",label:"ALERTS & AUTOMATION",items:[
-              {l:"🛡 SENTRY",v:sentryOn,f:()=>setSentryOn(s=>!s),c:"#ff3355"},
-              {l:"🔔 ALERTS",v:alertsOn,f:()=>setAlertsOn(a=>!a),c:"#ffaa00"},
-              {l:"🎯 AUTO-CAP",v:autoCapture,f:()=>setAutoCapture(a=>!a),c:"#ffdd00"},
-            ]},
-            {id:"system",label:"SYSTEM",items:[
-              {l:"💾 VAULT",v:vaultOn,f:()=>setVaultOn(v=>!v),c:"#00ddaa"},
-              {l:"🎤 VOICE",v:voiceOn,f:()=>setVoiceOn(v=>!v),c:"#ff88ff"},
-              {l:"🔗 SYNC",v:multiSync,f:()=>setMultiSync(s=>!s),c:"#cc44ff"},
-              {l:"🏷 GEO-STAMP",v:stampOn,f:()=>setStampOn(s=>!s),c:"#00ddaa"},
-              {l:"🔴 NIGHT-SAFE UI",v:redUI,f:()=>setRedUI(r=>!r),c:"#ff2200"},
-              {l:"🌑 STEALTH",v:stealth,f:()=>setStealth(true),c:"#666666"},
-            ]},
-          ].map(group=>{
-            const qq=q.trim().toLowerCase();
-            const items=qq?group.items.filter(i=>i.l.toLowerCase().includes(qq)||group.label.toLowerCase().includes(qq)):group.items;
-            if(qq&&items.length===0)return null;
-            const open=qq?true:openGroups[group.id];
-            const activeCount=group.items.filter(i=>i.v).length;
-            return(
-              <div key={group.id} style={{border:`1px solid ${color}12`,borderRadius:9,background:`${color}03`,overflow:"hidden"}}>
-                <button onClick={()=>setOpenGroups(g=>({...g,[group.id]:!g[group.id]}))}
-                  style={{width:"100%",display:"flex",alignItems:"center",justifyContent:"space-between",
-                    padding:"13px 12px",background:`${color}08`,border:"none",cursor:"pointer",
-                    borderBottom:open?`1px solid ${color}12`:"none"}}>
-                  <span style={{display:"flex",alignItems:"center",gap:8}}>
-                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:11,color:`${color}cc`,letterSpacing:2.5,fontWeight:700}}>{group.label}</span>
-                    {activeCount>0&&(
-                      <span style={{fontSize:7,color:"#000",background:color,borderRadius:8,
-                        padding:"1px 6px",fontWeight:700,fontFamily:"'DM Mono',monospace"}}>{activeCount}</span>
-                    )}
-                  </span>
-                  <span style={{fontSize:9,color:`${color}50`,transform:open?"rotate(90deg)":"none",transition:"transform 0.15s"}}>▶</span>
-                </button>
-                {open&&(
-                  <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:7,padding:"0 10px 12px"}}>
-                    {items.map(({l,v,f,c})=>(
-                      <button key={l} onClick={f} style={{
-                        display:"flex",alignItems:"center",justifyContent:"space-between",gap:6,
-                        padding:"14px 12px",minHeight:50,
-                        background:v?`${c||color}1f`:"rgba(255,255,255,0.045)",
-                        border:`1.5px solid ${v?(c||color):`${c||color}33`}`,
-                        borderRadius:9,fontSize:10.5,fontWeight:v?700:500,
-                        color:v?(c||color):`${c||color}88`,
-                        letterSpacing:.4,transition:"all 0.12s",
-                        boxShadow:v?`0 0 10px ${c||color}2e`:"none",
-                      }}>
-                        <span style={{textAlign:"left",lineHeight:1.2}}>{l}</span>
-                        <span style={{width:22,height:12,borderRadius:7,flexShrink:0,
-                          background:v?(c||color):`${c||color}25`,position:"relative",transition:"background 0.15s"}}>
-                          <span style={{position:"absolute",top:2,left:v?12:2,width:8,height:8,borderRadius:"50%",
-                            background:v?"#000":`${c||color}70`,transition:"left 0.15s"}}/>
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-
-          {q.trim()&&(
-            <div style={{padding:"10px 12px",borderRadius:8,border:`1px dashed ${color}25`,
-              fontFamily:"'DM Mono',monospace",fontSize:9,color:`${color}60`,letterSpacing:.5}}>
-              Showing matches for “{q.trim()}” — clear the search to see everything.
-            </div>
-          )}
-
-          {/* ── CAPTURE ACTIONS ── */}
-          <div style={{padding:"9px 10px",border:`1px solid ${color}12`,borderRadius:9,background:`${color}03`}}>
-            <SectionLabel color={color}>CAPTURE</SectionLabel>
-            <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr",gap:5}}>
-              <button onClick={()=>setAutoCapture(a=>!a)} style={{
-                padding:"12px 6px",
-                background:autoCapture?"rgba(255,221,0,0.15)":"rgba(0,0,0,0.35)",
-                border:`1.5px solid ${autoCapture?"#ffdd00":"rgba(255,221,0,0.25)"}`,
-                borderRadius:7,fontSize:9,fontWeight:700,
-                color:autoCapture?"#ffdd00":"rgba(255,221,0,0.45)",
-                boxShadow:autoCapture?"0 0 8px rgba(255,221,0,0.2)":"none",
-                transition:"all 0.12s",
-              }}>
-                🎯 AUTO {autoCapture?"ON":"OFF"}
-              </button>
-              <button onClick={manualSnap} style={{
-                padding:"12px 4px",background:"rgba(0,0,0,0.35)",
-                border:`1.5px solid ${color}30`,borderRadius:7,
-                fontSize:14,color,
-              }}>📷</button>
-              <button onClick={burstSnap} style={{
-                padding:"12px 4px",
-                background:burstMode?"rgba(255,68,170,0.15)":"rgba(0,0,0,0.35)",
-                border:"1.5px solid rgba(255,68,170,0.35)",
-                borderRadius:7,fontSize:9,fontWeight:700,
-                color:"rgba(255,68,170,0.8)",
-              }}>×5</button>
-              <button onClick={toggleRecord} style={{
-                padding:"12px 4px",
-                background:recording?"rgba(255,34,34,0.15)":"rgba(0,0,0,0.35)",
-                border:`1.5px solid ${recording?"#ff2222":"rgba(255,34,34,0.25)"}`,
-                borderRadius:7,fontSize:9,fontWeight:700,
-                color:recording?"#ff2222":"rgba(255,34,34,0.45)",
-                boxShadow:recording?"0 0 8px rgba(255,34,34,0.2)":"none",
-              }}>
-                {recording?"■ STOP":"● REC"}
+              {geo.anchor&&<input type="range" min="25" max="500" step="25" value={geo.radius}
+                onChange={e=>geo.setRadius(+e.target.value)} style={{width:66,accentColor:color,height:4}}/>}
+              <button onClick={geo.anchor?geo.clear:geo.drop} disabled={!gps}
+                style={{padding:"8px 13px",borderRadius:9,background:"transparent",
+                  border:`1px solid ${geo.anchor?"#ff444455":`${color}33`}`,
+                  color:geo.anchor?"#ff6666":color,fontFamily:"'DM Mono',monospace",
+                  fontSize:9.5,letterSpacing:1,opacity:gps?1:.4}}>
+                {geo.anchor?"CLEAR":"DROP"}
               </button>
             </div>
-          </div>
+          </>}
 
-          {/* ── TOOLS ── */}
-          <div style={{padding:"9px 10px",border:`1px solid ${color}12`,borderRadius:9,background:`${color}03`}}>
-            <SectionLabel color={color}>TOOLS</SectionLabel>
-            <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:5}}>
-              {[
-                {l:"📁 Gallery",m:"gallery",c:newCapCount>0?color:undefined,badge:newCapCount>0?newCapCount:null},
-                {l:"🗺 Map",m:"map",c:"#00ccff"},
-                {l:"⏱ Log",m:"timeline",c:"#cc44ff",badge:newEventCount>0?newEventCount:null},
-                {l:"⚡ Tripwire",m:"tripwire",c:hasTripwire?"#ffcc00":"#ffcc0080"},
-                {l:"📷 QR Scan",m:"qrscan",c:"#44ffc8"},
-                {l:"📄 Report",m:"report",c:"#b464ff"},
-                {l:`🎞 Clips${clips.length?` (${clips.length})`:""}`,m:"clips",c:"#ff5588"},
-                {l:`🌐 Pano${pano.frames.length?` (${pano.frames.length})`:""}`,m:"panoadd",c:"#ffcc44"},
-                {l:"📊 Sensors",m:"sensors",c:"#44ffcc"},
-                {l:"📡 Cast",m:"cast",c:castOn?"#00ff88":"#00ff8880"},
-                {l:"? Manual",m:"manual",c:`${color}80`},
-              ].filter(t=>{const qq=q.trim().toLowerCase();return !qq||t.l.toLowerCase().includes(qq);}).map(({l,m,c,badge})=>(
-                <button key={m} onClick={()=>{
-                  if(m==="qrscan"){scanQR();return;}
-                  if(m==="panoadd"){
-                    const cv=document.querySelector("canvas[data-primary='true']");
-                    if(cv)pano.add(cv.toDataURL("image/jpeg",0.85));
-                    addEvent("pano",{label:`PANO FRAME ${pano.frames.length+1}/12 CAPTURED`});
-                    return;
-                  }
-                  if(m==="report"){exportPDF();return;}
-                  setModal(m);
-                }} style={{
-                  padding:"11px 4px",
-                  background:modal===m?`${c||color}15`:"rgba(0,0,0,0.35)",
-                  border:`1.5px solid ${c||color}${modal===m?"":"30"}`,
-                  borderRadius:7,fontSize:9,fontWeight:500,
-                  color:c||`${color}60`,
-                  letterSpacing:.2,transition:"all 0.12s",
-                  position:"relative",
-                }}>
-                  {l}
-                  {badge&&<span style={{
-                    position:"absolute",top:3,right:4,
-                    background:c||color,color:"#000",
-                    fontSize:6,fontWeight:700,borderRadius:8,
-                    padding:"1px 4px",lineHeight:1.2,
-                  }}>{badge}</span>}
-                </button>
-              ))}
+          {sheetTab==="capture"&&<>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:7}}>
+              <Tile color={color} icon="📷" label="SHOT" onClick={manualSnap}/>
+              <Tile color={color} icon="⚡" label="BURST" sub="×5" onClick={burstSnap} c="#ff44aa"/>
+              <Tile color={color} icon={recording?"⏹":"⏺"} label={recording?"STOP":"RECORD"} active={recording} onClick={toggleRecord} c="#ff4444"/>
             </div>
-          </div>
-
-          {/* Timelapse */}
-          <div style={{display:"flex",gap:6,alignItems:"center",padding:"8px 10px",
-            border:`1px solid ${timelapse.active?"rgba(255,204,68,0.45)":`${color}18`}`,borderRadius:8,
-            background:timelapse.active?"rgba(255,204,68,0.06)":"transparent"}}>
-            <span style={{fontFamily:"'DM Mono',monospace",fontSize:9,
-              color:timelapse.active?"#ffcc44":`${color}60`,flex:1,letterSpacing:.5}}>
-              ⏲ {timelapse.active?`TIMELAPSE · ${timelapse.count} SHOTS`:"TIMELAPSE OFF"}
-            </span>
-            <select value={timelapse.interval} onChange={e=>timelapse.setIntervalSec(+e.target.value)}
-              style={{background:"rgba(0,0,0,0.6)",border:`1px solid ${color}25`,borderRadius:5,
-                color:color,fontFamily:"'DM Mono',monospace",fontSize:9,padding:"5px 4px"}}>
-              {[2,5,10,30,60,300].map(s=><option key={s} value={s}>{s<60?`${s}s`:`${s/60}m`}</option>)}
-            </select>
-            <button onClick={timelapse.active?timelapse.stop:timelapse.start} style={{padding:"7px 12px",
-              background:"transparent",border:`1px solid ${timelapse.active?"rgba(255,68,68,0.4)":`${color}30`}`,
-              borderRadius:6,color:timelapse.active?"rgba(255,68,68,0.8)":color,
-              fontFamily:"'DM Mono',monospace",fontSize:9,letterSpacing:1}}>
-              {timelapse.active?"STOP":"START"}
-            </button>
-          </div>
-
-          {/* Geofence control */}
-          <div style={{display:"flex",gap:5,alignItems:"center",padding:"8px 10px",
-            border:`1px solid ${geo.anchor?(geo.inside?"rgba(0,221,170,0.35)":"rgba(255,68,68,0.5)"):`${color}18`}`,
-            borderRadius:7,background:geo.anchor?(geo.inside?"rgba(0,221,170,0.05)":"rgba(255,68,68,0.08)"):"transparent"}}>
-            <span style={{fontFamily:"'DM Mono',monospace",fontSize:9,
-              color:geo.anchor?(geo.inside?"#00ddaa":"#ff4444"):`${color}55`,flex:1}}>
-              📍 {geo.anchor?`GEOFENCE ${geo.inside?"SECURE":"BREACH"} · ${geo.dist!=null?Math.round(geo.dist)+"m":"--"}/${geo.radius}m`:"GEOFENCE OFF"}
-            </span>
-            {geo.anchor&&(
-              <input type="range" min="25" max="500" step="25" value={geo.radius}
-                onChange={e=>geo.setRadius(parseInt(e.target.value))}
-                style={{width:70,accentColor:color,height:4}}/>
-            )}
-            <button onClick={geo.anchor?geo.clear:geo.drop} disabled={!gps} style={{padding:"6px 10px",
-              background:"transparent",border:`1px solid ${geo.anchor?"rgba(255,68,68,0.3)":`${color}30`}`,
-              borderRadius:4,color:geo.anchor?"rgba(255,68,68,0.7)":color,
-              fontFamily:"'DM Mono',monospace",fontSize:9,cursor:"pointer",opacity:gps?1:0.4}}>
-              {geo.anchor?"✕":"DROP"}
-            </button>
-          </div>
-
-          {pano.frames.length>0&&(
-            <div style={{display:"flex",gap:5,alignItems:"center",padding:"8px 10px",
-              border:"1px solid rgba(255,204,68,0.3)",borderRadius:7,background:"rgba(255,204,68,0.05)"}}>
-              <span style={{fontFamily:"'DM Mono',monospace",fontSize:9,color:"#ffcc44",flex:1}}>
-                🌐 PANORAMA — {pano.frames.length}/12 frames
+            <GroupTitle color={color}>TIMELAPSE</GroupTitle>
+            <div style={{display:"flex",gap:8,alignItems:"center",padding:"11px 13px",borderRadius:12,
+              background:"rgba(255,255,255,.04)",border:`1px solid ${timelapse.active?"#ffcc4466":`${color}1c`}`}}>
+              <span style={{flex:1,fontFamily:"'DM Mono',monospace",fontSize:10,
+                color:timelapse.active?"#ffcc44":`${color}80`}}>
+                {timelapse.active?`RUNNING · ${timelapse.count} shots`:"STOPPED"}
               </span>
-              <button onClick={async()=>{
-                const url=await pano.stitch();
-                if(url){handleCapture(url,"PANORAMA",0,false);pano.reset();addEvent("pano",{label:"PANORAMA STITCHED"});}
-              }} disabled={pano.frames.length<2} style={{padding:"6px 10px",background:"transparent",
-                border:"1px solid rgba(255,204,68,0.4)",borderRadius:4,color:"#ffcc44",
-                fontFamily:"'DM Mono',monospace",fontSize:9,cursor:"pointer",
-                opacity:pano.frames.length<2?0.4:1}}>STITCH</button>
-              <button onClick={pano.reset} style={{padding:"6px 10px",background:"transparent",
-                border:"1px solid rgba(255,68,68,0.3)",borderRadius:4,color:"rgba(255,68,68,0.7)",
-                fontFamily:"'DM Mono',monospace",fontSize:9,cursor:"pointer"}}>✕</button>
+              <select value={timelapse.interval} onChange={e=>timelapse.setIntervalSec(+e.target.value)}
+                style={{background:"rgba(0,0,0,.6)",border:`1px solid ${color}2a`,borderRadius:8,
+                  color,fontFamily:"'DM Mono',monospace",fontSize:10,padding:"6px 5px"}}>
+                {[2,5,10,30,60,300].map(s=><option key={s} value={s}>{s<60?`${s}s`:`${s/60}m`}</option>)}
+              </select>
+              <button onClick={timelapse.active?timelapse.stop:timelapse.start}
+                style={{padding:"8px 13px",borderRadius:9,background:"transparent",
+                  border:`1px solid ${timelapse.active?"#ff444455":`${color}33`}`,
+                  color:timelapse.active?"#ff6666":color,fontFamily:"'DM Mono',monospace",fontSize:9.5,letterSpacing:1}}>
+                {timelapse.active?"STOP":"START"}
+              </button>
             </div>
-          )}
-
-          {/* QR result */}
-          {qrResult&&(
-            <div style={{
-              padding:"10px 12px",
-              background:"rgba(68,255,200,0.06)",
-              border:"1px solid rgba(68,255,200,0.3)",
-              borderRadius:7,display:"flex",alignItems:"center",gap:8,
-            }}>
-              <span style={{fontSize:9,color:"rgba(68,255,200,0.6)",letterSpacing:1,flexShrink:0}}>QR:</span>
-              <span style={{fontSize:9,color:"rgba(68,255,200,0.95)",flex:1,
-                overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{qrResult}</span>
-              <button onClick={()=>setQrResult(null)} style={{
-                background:"transparent",border:"1px solid rgba(68,255,200,0.3)",
-                color:"rgba(68,255,200,0.6)",fontSize:9,cursor:"pointer",
-                borderRadius:4,padding:"2px 8px",
-              }}>✕</button>
+            <GroupTitle color={color}>PANORAMA</GroupTitle>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:7}}>
+              <Tile color={color} icon="🌐" label="ADD FRAME" sub={`${pano.frames.length}/12`} c="#ffcc44"
+                onClick={()=>{const cv=document.querySelector("canvas[data-primary='true']");if(cv)pano.add(cv.toDataURL("image/jpeg",.85));}}/>
+              <Tile color={color} icon="🧵" label="STITCH" sub={pano.frames.length<2?"need 2+":"build"} c="#ffcc44"
+                onClick={async()=>{const u=await pano.stitch();if(u){handleCapture(u,"PANORAMA",0,false);pano.reset();}}}/>
             </div>
-          )}
+            <GroupTitle color={color}>EVIDENCE</GroupTitle>
+            <Row color={color} label="GEO-STAMP" hint="burn UTC + GPS + SHA-256 into every shot" on={stampOn} onClick={()=>setStampOn(s=>!s)} c="#00ddaa"/>
+            <Row color={color} label="VAULT" hint="keep photos & clips after reload" on={vaultOn} onClick={()=>setVaultOn(v=>!v)} c="#00ddaa"/>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:7}}>
+              <Tile color={color} icon="📁" label="GALLERY" sub={`${captures.length} shots`} badge={captures.length} onClick={()=>{setSheet(false);setModal("gallery");}}/>
+              <Tile color={color} icon="🎞" label="CLIPS" sub={`${clips.length} videos`} badge={clips.length} c="#ff5588" onClick={()=>{setSheet(false);setModal("clips");}}/>
+            </div>
+          </>}
 
-          {/* PEER STATUS */}
-          {multiSync&&(
-            <div style={{
-              padding:"8px 12px",
-              border:"1px solid rgba(204,68,255,0.2)",
-              borderRadius:7,background:"rgba(204,68,255,0.05)",
-            }}>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                <span style={{fontSize:9,color:"#cc44ff",letterSpacing:1}}>SYNC — ID:{PEER_ID.slice(-4)}</span>
-                <span style={{fontSize:8,color:"rgba(204,68,255,0.6)"}}>{peers.length} PEER{peers.length!==1?"S":""}</span>
+          {sheetTab==="data"&&<>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:7}}>
+              <Tile color={color} icon="🗺" label="TACTICAL MAP" sub={gps?"GPS locked":"no fix"} c="#00ccff" onClick={()=>{setSheet(false);setModal("map");}}/>
+              <Tile color={color} icon="⏱" label="EVENT LOG" sub={`${events.length} events`} badge={events.length} c="#cc44ff" onClick={()=>{setSheet(false);setModal("timeline");}}/>
+              <Tile color={color} icon="📊" label="SENSORS" sub="live readouts" c="#44ffcc" onClick={()=>{setSheet(false);setModal("sensors");}}/>
+              <Tile color={color} icon="📄" label="REPORT" sub="export .txt" c="#b464ff" onClick={exportPDF}/>
+              <Tile color={color} icon="📷" label="QR / BARCODE" sub="scan frame" c="#44ffc8" onClick={scanQR}/>
+              <Tile color={color} icon="📡" label="REMOTE CAST" sub={castOn?`${castViewers} viewing`:"off"} active={castOn} c="#66ddff" onClick={()=>{setSheet(false);setModal("cast");}}/>
+            </div>
+            {qrResult&&(
+              <div style={{padding:"11px 13px",borderRadius:11,background:"rgba(68,255,200,.07)",
+                border:"1px solid rgba(68,255,200,.3)",display:"flex",gap:9,alignItems:"center"}}>
+                <span style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"rgba(68,255,200,.95)",
+                  flex:1,overflow:"hidden",textOverflow:"ellipsis"}}>{qrResult}</span>
+                <button onClick={()=>setQrResult(null)} style={{background:"transparent",
+                  border:"1px solid rgba(68,255,200,.3)",borderRadius:7,color:"rgba(68,255,200,.8)",
+                  fontSize:10,padding:"4px 9px"}}>✕</button>
               </div>
-              {syncAlerts.slice(0,2).map((a,i)=>(
-                <div key={i} style={{fontSize:8,color:"rgba(204,68,255,0.7)",marginTop:3}}>
-                  ↳ {a.from.slice(-4)}: {a.payload?.label||"ALERT"}
+            )}
+            <GroupTitle color={color}>SESSION</GroupTitle>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:7}}>
+              {[["UPTIME",`${Math.floor(sessionStats.uptime/60)}m ${sessionStats.uptime%60}s`],
+                ["TRACKS",`${blobsCount}`],
+                ["STORAGE",storageInfo?`${(storageInfo.used/1048576).toFixed(1)} MB`:"--"],
+                ["GPS TRACK",`${gpsTrack.length} pts`]].map(([k,v])=>(
+                <div key={k} style={{padding:"11px 13px",borderRadius:11,background:"rgba(255,255,255,.035)",
+                  border:`1px solid ${color}18`,display:"flex",flexDirection:"column",gap:3}}>
+                  <span style={{fontFamily:"'DM Mono',monospace",fontSize:8.5,color:`${color}66`,letterSpacing:1.4}}>{k}</span>
+                  <span style={{fontFamily:"'DM Mono',monospace",fontSize:12,fontWeight:700,color}}>{v}</span>
                 </div>
               ))}
             </div>
-          )}
-        </div>
+          </>}
 
-        {/* FOOTER */}
-        <div style={{padding:"4px 12px",borderTop:`1px solid ${color}08`,display:"flex",justifyContent:"space-between"}}>
-          <span style={{fontSize:6,color:`${color}18`,letterSpacing:1}}>CLOUDYGETTY-AI // ENTROPY-ZERO</span>
-          <span style={{fontSize:6,color:`${color}18`,letterSpacing:1}}>NVS-7.5 // CLASSIFIED</span>
-        </div>
+          {sheetTab==="system"&&<>
+            <Row color={color} label="VOICE CONTROL" hint="41 spoken commands" on={voiceOn} onClick={()=>setVoiceOn(v=>!v)} c="#ff88ff"/>
+            <Row color={color} label="NIGHT-SAFE RED UI" hint="preserves dark adaptation" on={redUI} onClick={()=>setRedUI(r=>!r)} c="#ff2200"/>
+            <Row color={color} label="DEVICE SYNC" hint="link tabs on this device" on={multiSync} onClick={()=>setMultiSync(s=>!s)} c="#cc44ff"/>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:7}}>
+              <Tile color={color} icon="🌑" label="STEALTH" sub="dark screen, keeps running" c="#888888" onClick={()=>{setSheet(false);setStealth(true);}}/>
+              <Tile color={color} icon="?" label="MANUAL" sub="full operator guide" onClick={()=>{setSheet(false);setModal("manual");}}/>
+            </div>
+            <GroupTitle color={color}>STATUS</GroupTitle>
+            <div style={{padding:"12px 13px",borderRadius:11,background:"rgba(255,255,255,.035)",
+              border:`1px solid ${color}18`,display:"flex",flexDirection:"column",gap:7}}>
+              {[["AI MODEL",modelReady?"COCO-SSD READY":"LOADING…"],
+                ["CONNECTION",online?"ONLINE":"OFFLINE"],
+                ["CAMERA",rear.ready?"REAR ACTIVE":"ACQUIRING"],
+                ["MODE",MODE_META[mode].label]].map(([k,v])=>(
+                <div key={k} style={{display:"flex",justifyContent:"space-between"}}>
+                  <span style={{fontFamily:"'DM Mono',monospace",fontSize:9.5,color:`${color}6a`,letterSpacing:1.2}}>{k}</span>
+                  <span style={{fontFamily:"'DM Mono',monospace",fontSize:9.5,color:`${color}dd`}}>{v}</span>
+                </div>
+              ))}
+            </div>
+            <div style={{textAlign:"center",padding:"10px 0 2px",fontFamily:"'DM Mono',monospace",
+              fontSize:7.5,color:`${color}30`,letterSpacing:1.4}}>
+              CLOUDYGETTY-AI · ENTROPY-ZERO · NVS-14
+            </div>
+          </>}
+        </Sheet>
       </div>
 
       {/* STEALTH — screen dark, systems keep running */}
