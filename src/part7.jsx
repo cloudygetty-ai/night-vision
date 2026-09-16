@@ -43,7 +43,7 @@ export function ModeWheel({modes,meta,value,onChange,color}){
   const ref=useRef(null);
   useEffect(()=>{
     const el=ref.current?.querySelector(`[data-m="${value}"]`);
-    el?.scrollIntoView({behavior:"smooth",inline:"center",block:"nearest"});
+    try{el?.scrollIntoView?.({behavior:"smooth",inline:"center",block:"nearest"});}catch{}
   },[value]);
   return(
     <div ref={ref} style={{display:"flex",gap:0,overflowX:"auto",scrollSnapType:"x mandatory",
