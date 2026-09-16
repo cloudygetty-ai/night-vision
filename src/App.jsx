@@ -16,10 +16,11 @@ import{MODE_META,MODE_KEYS,ZOOM_STEPS,PEER_ID,Bezel,SectionLabel,BootSequence}fr
 // ═══════════════════════════════════════════════════════════════════════════════
 export default function NightVisionCamera(){
   const[booted,setBooted]=useState(false);
+  const[q,setQ]=useState("");
   const[stampOn,setStampOn]=useState(true);
   const[dualLayout,setDualLayout]=useState("pip");
   const[primaryCam,setPrimaryCam]=useState("rear");
-  const[openGroups,setOpenGroups]=useState({vision:false,detect:false,alert:false,system:false});
+  const[openGroups,setOpenGroups]=useState({vision:true,detect:true,alert:true,system:true});
   const cycleMode=useCallback(d=>setMode(m=>{
     const i=MODE_KEYS.indexOf(m);
     return MODE_KEYS[(i+d+MODE_KEYS.length)%MODE_KEYS.length];
@@ -735,7 +736,24 @@ export default function NightVisionCamera(){
             </div>
           </div>
 
-          {/* ── FEATURE TOGGLES — grouped & collapsible ── */}
+          {/* ── SEARCH — type to find any control ── */}
+          <div style={{position:"relative"}}>
+            <input value={q} onChange={e=>setQ(e.target.value)}
+              placeholder="SEARCH CONTROLS — torch, sentry, zoom, map…"
+              style={{width:"100%",padding:"13px 38px 13px 13px",
+                background:"rgba(255,255,255,0.04)",border:`1.5px solid ${q?color:`${color}25`}`,
+                borderRadius:10,color:color,fontFamily:"'DM Mono',monospace",fontSize:10,
+                letterSpacing:.5,outline:"none"}}/>
+            <span style={{position:"absolute",right:12,top:"50%",transform:"translateY(-50%)",
+              fontSize:12,color:`${color}50`,pointerEvents:"none"}}>{q?"":"🔍"}</span>
+            {q&&(
+              <button onClick={()=>setQ("")} style={{position:"absolute",right:8,top:"50%",
+                transform:"translateY(-50%)",background:"transparent",border:"none",
+                color:`${color}70`,fontSize:13,cursor:"pointer",padding:4}}>✕</button>
+            )}
+          </div>
+
+          {/* ── FEATURE TOGGLES — grouped ── */}
           {[
             {id:"vision",label:"VISION",items:[
               {l:"EDGE",v:edgeOverlay,f:()=>setEdgeOverlay(e=>!e)},
@@ -771,15 +789,19 @@ export default function NightVisionCamera(){
               {l:"🌑 STEALTH",v:stealth,f:()=>setStealth(true),c:"#666666"},
             ]},
           ].map(group=>{
-            const open=openGroups[group.id];
+            const qq=q.trim().toLowerCase();
+            const items=qq?group.items.filter(i=>i.l.toLowerCase().includes(qq)||group.label.toLowerCase().includes(qq)):group.items;
+            if(qq&&items.length===0)return null;
+            const open=qq?true:openGroups[group.id];
             const activeCount=group.items.filter(i=>i.v).length;
             return(
               <div key={group.id} style={{border:`1px solid ${color}12`,borderRadius:9,background:`${color}03`,overflow:"hidden"}}>
                 <button onClick={()=>setOpenGroups(g=>({...g,[group.id]:!g[group.id]}))}
                   style={{width:"100%",display:"flex",alignItems:"center",justifyContent:"space-between",
-                    padding:"11px 12px",background:"transparent",border:"none",cursor:"pointer"}}>
+                    padding:"13px 12px",background:`${color}08`,border:"none",cursor:"pointer",
+                    borderBottom:open?`1px solid ${color}12`:"none"}}>
                   <span style={{display:"flex",alignItems:"center",gap:8}}>
-                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:9,color:`${color}75`,letterSpacing:2.5,fontWeight:600}}>{group.label}</span>
+                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:11,color:`${color}cc`,letterSpacing:2.5,fontWeight:700}}>{group.label}</span>
                     {activeCount>0&&(
                       <span style={{fontSize:7,color:"#000",background:color,borderRadius:8,
                         padding:"1px 6px",fontWeight:700,fontFamily:"'DM Mono',monospace"}}>{activeCount}</span>
@@ -788,17 +810,17 @@ export default function NightVisionCamera(){
                   <span style={{fontSize:9,color:`${color}50`,transform:open?"rotate(90deg)":"none",transition:"transform 0.15s"}}>▶</span>
                 </button>
                 {open&&(
-                  <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:6,padding:"0 10px 11px"}}>
-                    {group.items.map(({l,v,f,c})=>(
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:7,padding:"0 10px 12px"}}>
+                    {items.map(({l,v,f,c})=>(
                       <button key={l} onClick={f} style={{
                         display:"flex",alignItems:"center",justifyContent:"space-between",gap:6,
-                        padding:"12px 11px",
-                        background:v?`${c||color}14`:"rgba(255,255,255,0.02)",
-                        border:`1px solid ${v?(c||color):`${c||color}20`}`,
-                        borderRadius:8,fontSize:9,fontWeight:v?700:400,
-                        color:v?(c||color):`${c||color}55`,
-                        letterSpacing:.3,transition:"all 0.12s",
-                        boxShadow:v?`0 0 8px ${c||color}22`:"none",
+                        padding:"14px 12px",minHeight:50,
+                        background:v?`${c||color}1f`:"rgba(255,255,255,0.045)",
+                        border:`1.5px solid ${v?(c||color):`${c||color}33`}`,
+                        borderRadius:9,fontSize:10.5,fontWeight:v?700:500,
+                        color:v?(c||color):`${c||color}88`,
+                        letterSpacing:.4,transition:"all 0.12s",
+                        boxShadow:v?`0 0 10px ${c||color}2e`:"none",
                       }}>
                         <span style={{textAlign:"left",lineHeight:1.2}}>{l}</span>
                         <span style={{width:22,height:12,borderRadius:7,flexShrink:0,
@@ -813,6 +835,13 @@ export default function NightVisionCamera(){
               </div>
             );
           })}
+
+          {q.trim()&&(
+            <div style={{padding:"10px 12px",borderRadius:8,border:`1px dashed ${color}25`,
+              fontFamily:"'DM Mono',monospace",fontSize:9,color:`${color}60`,letterSpacing:.5}}>
+              Showing matches for “{q.trim()}” — clear the search to see everything.
+            </div>
+          )}
 
           {/* ── CAPTURE ACTIONS ── */}
           <div style={{padding:"9px 10px",border:`1px solid ${color}12`,borderRadius:9,background:`${color}03`}}>
@@ -870,7 +899,7 @@ export default function NightVisionCamera(){
                 {l:"📊 Sensors",m:"sensors",c:"#44ffcc"},
                 {l:"📡 Cast",m:"cast",c:castOn?"#00ff88":"#00ff8880"},
                 {l:"? Manual",m:"manual",c:`${color}80`},
-              ].map(({l,m,c,badge})=>(
+              ].filter(t=>{const qq=q.trim().toLowerCase();return !qq||t.l.toLowerCase().includes(qq);}).map(({l,m,c,badge})=>(
                 <button key={m} onClick={()=>{
                   if(m==="qrscan"){scanQR();return;}
                   if(m==="panoadd"){
