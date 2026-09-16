@@ -657,3 +657,88 @@ export function useSessionStats(){
   },[]);
   return stats;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NVS-13.0 — EVIDENCE INTEGRITY, TIMELAPSE, OFFLINE, SHARE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Burn a forensic footer into a capture: UTC time, GPS, mode, device, hash-ready
+export async function watermarkCapture(dataUrl,meta){
+  const img=await new Promise((res,rej)=>{const i=new Image();i.onload=()=>res(i);i.onerror=rej;i.src=dataUrl;});
+  const c=document.createElement("canvas");
+  c.width=img.width;c.height=img.height;
+  const ctx=c.getContext("2d");
+  ctx.drawImage(img,0,0);
+  const pad=Math.max(8,Math.round(c.width*0.012));
+  const fs=Math.max(9,Math.round(c.width*0.019));
+  const lines=[
+    `${meta.utc}  ·  ${meta.mode}`,
+    meta.gps?`${meta.gps.lat.toFixed(6)}, ${meta.gps.lon.toFixed(6)}  ±${Math.round(meta.gps.acc||0)}m`:"GPS UNAVAILABLE",
+    `${meta.heading!=null?`HDG ${String(meta.heading).padStart(3,"0")}°  `:""}${meta.alt!=null?`ALT ${meta.alt}m  `:""}${meta.label}`,
+  ];
+  const boxH=lines.length*(fs*1.45)+pad*1.4;
+  ctx.fillStyle="rgba(0,0,0,0.62)";
+  ctx.fillRect(0,c.height-boxH,c.width,boxH);
+  ctx.fillStyle="rgba(0,255,80,0.92)";
+  ctx.font=`${fs}px "DM Mono",monospace`;
+  ctx.textBaseline="top";
+  lines.forEach((t,i)=>ctx.fillText(t,pad,c.height-boxH+pad*0.7+i*fs*1.45));
+  // corner tick marks — tamper-evident framing
+  ctx.strokeStyle="rgba(0,255,80,0.5)";ctx.lineWidth=Math.max(1,c.width*0.002);
+  const tl=c.width*0.035;
+  [[0,0,1,1],[c.width,0,-1,1],[0,c.height-boxH,1,-1],[c.width,c.height-boxH,-1,-1]].forEach(([x,y,sx,sy])=>{
+    ctx.beginPath();ctx.moveTo(x+sx*pad,y+sy*pad+sy*tl);
+    ctx.lineTo(x+sx*pad,y+sy*pad);ctx.lineTo(x+sx*pad+sx*tl,y+sy*pad);ctx.stroke();
+  });
+  return c.toDataURL("image/png");
+}
+
+// SHA-256 of a data URL — chain of custody
+export async function hashDataUrl(dataUrl){
+  try{
+    const b=await(await fetch(dataUrl)).arrayBuffer();
+    const d=await crypto.subtle.digest("SHA-256",b);
+    return[...new Uint8Array(d)].map(x=>x.toString(16).padStart(2,"0")).join("").slice(0,32);
+  }catch{return null;}
+}
+
+// Interval / timelapse capture
+export function useTimelapse(onShot){
+  const[active,setActive]=useState(false);
+  const[interval,setIntervalSec]=useState(10);
+  const[count,setCount]=useState(0);
+  const cbRef=useRef(onShot);cbRef.current=onShot;
+  useEffect(()=>{
+    if(!active)return;
+    const id=setInterval(()=>{cbRef.current?.();setCount(c=>c+1);},interval*1000);
+    return()=>clearInterval(id);
+  },[active,interval]);
+  const start=useCallback(()=>{setCount(0);setActive(true);},[]);
+  const stop=useCallback(()=>setActive(false),[]);
+  return{active,interval,setIntervalSec,count,start,stop};
+}
+
+// Native share sheet
+export async function shareCapture(dataUrl,text){
+  try{
+    const blob=await(await fetch(dataUrl)).blob();
+    const file=new File([blob],`nvs-${Date.now()}.png`,{type:"image/png"});
+    if(navigator.canShare?.({files:[file]})){
+      await navigator.share({files:[file],text});
+      return "shared";
+    }
+    if(navigator.share){await navigator.share({text});return "shared-text";}
+    return "unsupported";
+  }catch(e){return e.name==="AbortError"?"cancelled":"failed";}
+}
+
+// Online/offline status
+export function useOnline(){
+  const[online,setOnline]=useState(navigator.onLine!==false);
+  useEffect(()=>{
+    const up=()=>setOnline(true),down=()=>setOnline(false);
+    window.addEventListener("online",up);window.addEventListener("offline",down);
+    return()=>{window.removeEventListener("online",up);window.removeEventListener("offline",down);};
+  },[]);
+  return online;
+}
