@@ -1,2487 +1,55 @@
 import{useState,useEffect,useRef,useCallback,useMemo}from"react";
-import*as tf from"@tensorflow/tfjs";
-import*as cocoSsd from"@tensorflow-models/coco-ssd";
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// LUT BUILDER
-// ═══════════════════════════════════════════════════════════════════════════════
-function buildLUT(fn){
-  const l=new Uint8Array(256*3);
-  for(let i=0;i<256;i++){
-    const[r,g,b]=fn(i/255);
-    l[i*3]=Math.min(255,Math.max(0,Math.round(r)));
-    l[i*3+1]=Math.min(255,Math.max(0,Math.round(g)));
-    l[i*3+2]=Math.min(255,Math.max(0,Math.round(b)));
-  }
-  return l;
-}
-const LUTS={
-  THERMAL:buildLUT(t=>{
-    if(t<.2)return[0,0,t/.2*180];
-    if(t<.4){const s=(t-.2)/.2;return[s*160,0,180-s*180];}
-    if(t<.6){const s=(t-.4)/.2;return[160+s*95,s*60,0];}
-    if(t<.8){const s=(t-.6)/.2;return[255,60+s*140,0];}
-    const s=(t-.8)/.2;return[255,200+s*55,s*255];
-  }),
-  RAINBOW:buildLUT(t=>{
-    if(t<.25)return[0,t/.25*255,255];
-    if(t<.5){const s=(t-.25)/.25;return[0,255,255-s*255];}
-    if(t<.75){const s=(t-.5)/.25;return[s*255,255,0];}
-    const s=(t-.75)/.25;return[255,255-s*255,0];
-  }),
-  FUSION:buildLUT(t=>{
-    if(t<.33){const s=t/.33;return[s*80,0,80+s*175];}
-    if(t<.66){const s=(t-.33)/.33;return[80+s*175,s*100,255-s*200];}
-    const s=(t-.66)/.34;return[255,100+s*155,55+s*200];
-  }),
-};
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// IMAGE PROCESSING
-// ═══════════════════════════════════════════════════════════════════════════════
-function sobelEdges(data,w,h){
-  const e=new Float32Array(w*h);
-  for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){
-    const L=i=>{const d=i*4;return 0.299*data[d]+0.587*data[d+1]+0.114*data[d+2];};
-    const tl=L((y-1)*w+(x-1)),t=L((y-1)*w+x),tr=L((y-1)*w+(x+1));
-    const ml=L(y*w+(x-1)),mr=L(y*w+(x+1));
-    const bl=L((y+1)*w+(x-1)),b=L((y+1)*w+x),br=L((y+1)*w+(x+1));
-    const gx=-tl-2*ml-bl+tr+2*mr+br,gy=-tl-2*t-tr+bl+2*b+br;
-    e[y*w+x]=Math.min(255,Math.sqrt(gx*gx+gy*gy)*.5);
-  }
-  return e;
-}
-function applyCLAHE(data,w,h,tiles=6,clip=3.5){
-  const tW=Math.floor(w/tiles),tH=Math.floor(h/tiles);
-  for(let ty=0;ty<tiles;ty++)for(let tx=0;tx<tiles;tx++){
-    const x0=tx*tW,y0=ty*tH,x1=tx===tiles-1?w:x0+tW,y1=ty===tiles-1?h:y0+tH;
-    const hist=new Float32Array(256);let count=0;
-    for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){
-      const i=(y*w+x)*4;
-      hist[Math.round(0.299*data[i]+0.587*data[i+1]+0.114*data[i+2])]++;count++;
-    }
-    const lim=(count/256)*clip;let ex=0;
-    for(let i=0;i<256;i++){if(hist[i]>lim){ex+=hist[i]-lim;hist[i]=lim;}}
-    const add=ex/256;for(let i=0;i<256;i++)hist[i]+=add;
-    const cdf=new Float32Array(256);cdf[0]=hist[0];
-    for(let i=1;i<256;i++)cdf[i]=cdf[i-1]+hist[i];
-    const cMin=cdf[0];
-    for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){
-      const i=(y*w+x)*4;
-      const lum=Math.round(0.299*data[i]+0.587*data[i+1]+0.114*data[i+2]);
-      const eq=Math.round((cdf[lum]-cMin)/Math.max(1,count-cMin)*255);
-      const sc=lum>2?eq/lum:1;
-      data[i]=Math.min(255,data[i]*sc);data[i+1]=Math.min(255,data[i+1]*sc);data[i+2]=Math.min(255,data[i+2]*sc);
-    }
-  }
-}
-
-// NVG-specific extreme CLAHE — 10x10 tiles, high clip, on green channel only
-function applyNVGCLAHE(data,w,h){
-  const tiles=8,clip=6.0;
-  const tW=Math.floor(w/tiles),tH=Math.floor(h/tiles);
-  // Extract green channel into temp array, equalize it, write back
-  const green=new Uint8Array(w*h);
-  for(let i=0;i<data.length;i+=4) green[i/4]=data[i+1];
-  for(let ty=0;ty<tiles;ty++)for(let tx=0;tx<tiles;tx++){
-    const x0=tx*tW,y0=ty*tH,x1=tx===tiles-1?w:x0+tW,y1=ty===tiles-1?h:y0+tH;
-    const hist=new Float32Array(256);let count=0;
-    for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){hist[green[y*w+x]]++;count++;}
-    const lim=(count/256)*clip;let ex=0;
-    for(let i=0;i<256;i++){if(hist[i]>lim){ex+=hist[i]-lim;hist[i]=lim;}}
-    const add=ex/256;for(let i=0;i<256;i++)hist[i]+=add;
-    const cdf=new Float32Array(256);cdf[0]=hist[0];
-    for(let i=1;i<256;i++)cdf[i]=cdf[i-1]+hist[i];
-    const cMin=cdf[0],cRange=Math.max(1,count-cMin);
-    for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){
-      green[y*w+x]=Math.round((cdf[green[y*w+x]]-cMin)/cRange*255);
-    }
-  }
-  // Write equalized green back
-  for(let i=0;i<data.length;i+=4) data[i+1]=green[i/4];
-}
-
-// Temporal frame stacking — accumulates N frames, extracts signal from noise
-// Returns blended luminance map
-function stackFrames(data,stackBuf,stackIdx,stackSize){
-  const n=data.length/4;
-  if(!stackBuf.current||stackBuf.current.length!==stackSize*n){
-    stackBuf.current=new Float32Array(stackSize*n);
-    stackIdx.current=0;
-  }
-  const idx=stackIdx.current%stackSize;
-  for(let i=0;i<n;i++){
-    const d=i*4;
-    stackBuf.current[idx*n+i]=0.299*data[d]+0.587*data[d+1]+0.114*data[d+2];
-  }
-  stackIdx.current++;
-  const filled=Math.min(stackIdx.current,stackSize);
-  if(filled<2)return null;
-  // Average across stack
-  const avg=new Float32Array(n);
-  for(let f=0;f<filled;f++) for(let i=0;i<n;i++) avg[i]+=stackBuf.current[f*n+i];
-  for(let i=0;i<n;i++) avg[i]/=filled;
-  return avg;
-}
-function temporalBlend(data,history,alpha=0.75){
-  if(!history||history.length!==data.length)return;
-  for(let i=0;i<data.length;i+=4){
-    data[i]=data[i]*alpha+history[i]*(1-alpha);
-    data[i+1]=data[i+1]*alpha+history[i+1]*(1-alpha);
-    data[i+2]=data[i+2]*alpha+history[i+2]*(1-alpha);
-  }
-}
-
-// Phosphor bloom: soft-glow on bright green pixels (real NVG has halation)
-function applyPhosphorBloom(data,w,h){
-  const g=new Float32Array(w*h);
-  for(let i=0;i<data.length;i+=4) g[i/4]=data[i+1];
-  const r=4;
-  // Separable box blur — horizontal then vertical
-  const tmp=new Float32Array(w*h);
-  const blurred=new Float32Array(w*h);
-  for(let y=0;y<h;y++){
-    let sum=0;
-    for(let x=-r;x<=r;x++) sum+=g[y*w+Math.min(w-1,Math.max(0,x))];
-    for(let x=0;x<w;x++){
-      tmp[y*w+x]=sum/(r*2+1);
-      sum+=g[y*w+Math.min(w-1,x+r+1)]-g[y*w+Math.max(0,x-r)];
-    }
-  }
-  for(let x=0;x<w;x++){
-    let sum=0;
-    for(let y=-r;y<=r;y++) sum+=tmp[Math.min(h-1,Math.max(0,y))*w+x];
-    for(let y=0;y<h;y++){
-      blurred[y*w+x]=sum/(r*2+1);
-      sum+=tmp[Math.min(h-1,y+r+1)*w+x]-tmp[Math.max(0,y-r)*w+x];
-    }
-  }
-  for(let i=0;i<data.length;i+=4){
-    const pi=i/4;
-    const glow=blurred[pi]*0.35;
-    data[i+1]=Math.min(255,data[i+1]+glow);
-    if(data[i+1]>200) data[i]=Math.min(255,data[i]+data[i+1]*0.04);
-  }
-}
-function findBlobs(motionMap,w,h,minSize=60){
-  const visited=new Uint8Array(w*h);const blobs=[];
-  for(let start=0;start<motionMap.length;start++){
-    if(!motionMap[start]||visited[start])continue;
-    const queue=[start];visited[start]=1;
-    let minX=w,minY=h,maxX=0,maxY=0,size=0;
-    while(queue.length){
-      const idx=queue.pop();size++;
-      const x=idx%w,y=Math.floor(idx/w);
-      if(x<minX)minX=x;if(x>maxX)maxX=x;if(y<minY)minY=y;if(y>maxY)maxY=y;
-      for(const[dx,dy]of[[-1,0],[1,0],[0,-1],[0,1]]){
-        const nx=x+dx,ny=y+dy;
-        if(nx>=0&&nx<w&&ny>=0&&ny<h){const ni=ny*w+nx;if(motionMap[ni]&&!visited[ni]){visited[ni]=1;queue.push(ni);}}
-      }
-    }
-    if(size>=minSize)blobs.push({x:minX,y:minY,w:maxX-minX,h:maxY-minY,size,cx:(minX+maxX)/2,cy:(minY+maxY)/2});
-  }
-  return blobs.sort((a,b)=>b.size-a.size).slice(0,8);
-}
-
-// Heuristic fallback classifier (used when TF model not yet loaded)
-function classifyBlobFallback(blob,sw,sh){
-  const aspect=blob.w/(blob.h||1);
-  const area=(blob.w*blob.h)/(sw*sh);
-  const cy=blob.cy/sh;
-  if(area>0.25)return{label:"VEHICLE",conf:72,icon:"🚗"};
-  if(aspect>1.8&&area>0.05)return{label:"VEHICLE",conf:65,icon:"🚗"};
-  if(aspect>0.5&&aspect<2.2&&area>0.02&&cy>0.3)return{label:"PERSON",conf:70,icon:"🧍"};
-  if(area<0.005)return{label:"SMALL OBJ",conf:50,icon:"◈"};
-  if(aspect>2.5)return{label:"ANIMAL",conf:45,icon:"🐾"};
-  if(cy<0.25&&area>0.01)return{label:"DRONE/BIRD",conf:55,icon:"🦅"};
-  return{label:"UNKNOWN",conf:40,icon:"?"};
-}
-
-// Icon map for COCO-SSD class names
-const COCO_ICONS={
-  person:"🧍",car:"🚗",truck:"🚛",bus:"🚌",motorcycle:"🏍",bicycle:"🚲",
-  dog:"🐕",cat:"🐈",bird:"🦅",horse:"🐎",cow:"🐄",sheep:"🐑",
-  elephant:"🐘",bear:"🐻",zebra:"🦓",giraffe:"🦒",
-  bottle:"🍾",cup:"☕",fork:"🍴",knife:"🔪",spoon:"🥄",
-  chair:"🪑",couch:"🛋",bed:"🛏",toilet:"🚽",
-  laptop:"💻","cell phone":"📱",keyboard:"⌨️",mouse:"🖱",
-  tv:"📺",microwave:"📟",oven:"🍳",refrigerator:"🧊",
-  book:"📚",clock:"🕐",vase:"🏺",scissors:"✂️",
-  backpack:"🎒",umbrella:"☂️",handbag:"👜",suitcase:"🧳",
-  "fire hydrant":"🚒","stop sign":"🛑","parking meter":"🅿️",
-  bench:"🪑","traffic light":"🚦",
-};
-
-// useTFDetector — loads COCO-SSD once, exposes a detect() fn
-function useTFDetector(){
-  const modelRef=useRef(null);
-  const[modelReady,setModelReady]=useState(false);
-  useEffect(()=>{
-    let cancelled=false;
-    (async()=>{
-      try{
-        await tf.ready();
-        const m=await cocoSsd.load({base:"lite_mobilenet_v2"});
-        if(!cancelled){modelRef.current=m;setModelReady(true);}
-      }catch(e){console.warn("COCO-SSD load failed:",e);}
-    })();
-    return()=>{cancelled=true;};
-  },[]);
-  const busyRef=useRef(false);
-  const smallRef=useRef(null);
-  const detect=useCallback(async(canvas)=>{
-    if(!modelRef.current||!canvas||busyRef.current)return null;
-    busyRef.current=true;
-    try{
-      // Downscale to 320px-wide canvas — 8x fewer pixels than 720p, model
-      // internally resizes to 300x300 anyway so zero accuracy loss
-      if(!smallRef.current)smallRef.current=document.createElement("canvas");
-      const small=smallRef.current;
-      const scale=320/canvas.width;
-      small.width=320;small.height=Math.round(canvas.height*scale);
-      small.getContext("2d").drawImage(canvas,0,0,small.width,small.height);
-      const preds=await modelRef.current.detect(small,6,0.40);
-      const inv=1/scale;
-      return preds.map(p=>({
-        x:p.bbox[0]*inv,y:p.bbox[1]*inv,w:p.bbox[2]*inv,h:p.bbox[3]*inv,
-        cx:(p.bbox[0]+p.bbox[2]/2)*inv,cy:(p.bbox[1]+p.bbox[3]/2)*inv,
-        size:p.bbox[2]*p.bbox[3]*inv*inv,
-        label:p.class.toUpperCase(),
-        conf:Math.round(p.score*100),
-        icon:COCO_ICONS[p.class]||"◈",
-      }));
-    }catch{return null;}
-    finally{busyRef.current=false;}
-  },[]);
-  return{detect,modelReady};
-}
-
-// Distance estimation (pinhole camera model approximation)
-function estimateDistance(blobHeightPx,canvasH,mode){
-  // Assume avg human height 1.7m, typical phone VFOV ~60deg
-  const vfovRad=60*(Math.PI/180);
-  const focalPx=canvasH/(2*Math.tan(vfovRad/2));
-  const realH=mode==="PERSON"?1.7:mode==="VEHICLE"?1.5:0.5;
-  if(blobHeightPx<5)return null;
-  const dist=(realH*focalPx)/blobHeightPx;
-  return Math.max(0.5,Math.min(500,dist));
-}
-
-// rPPG heart-rate: sample green channel mean from face region over time
-function extractRPPG(data,w,h){
-  // sample center 20% of frame (face region when selfie)
-  const cx=Math.floor(w*0.4),cy=Math.floor(h*0.3);
-  const rw=Math.floor(w*0.2),rh=Math.floor(h*0.2);
-  let sum=0,count=0;
-  for(let y=cy;y<cy+rh&&y<h;y+=2)for(let x=cx;x<cx+rw&&x<w;x+=2){
-    const i=(y*w+x)*4;sum+=data[i+1];count++;
-  }
-  return count>0?sum/count:0;
-}
-
-function processFrame(video,rawCanvas,dispCanvas,cfg,refs){
-  const{mode,brightness,sensitivity,edgeOverlay,noiseReduction,lutName,tripwires,showRPPG}=cfg;
-  const vw=video.videoWidth,vh=video.videoHeight;
-  if(!vw||!vh||video.readyState<2)return null;
-  // Cap processing resolution — massive speedup, display upscales via CSS
-  const MAXW=854;
-  const pScale=vw>MAXW?MAXW/vw:1;
-  const sw=Math.round(vw*pScale),sh=Math.round(vh*pScale);
-  if(rawCanvas.width!==sw){rawCanvas.width=sw;rawCanvas.height=sh;}
-  if(dispCanvas.width!==sw){dispCanvas.width=sw;dispCanvas.height=sh;}
-  const rawCtx=rawCanvas.getContext("2d",{willReadFrequently:true});
-  rawCtx.drawImage(video,0,0,sw,sh);
-  const imageData=rawCtx.getImageData(0,0,sw,sh);
-  const data=imageData.data;
-  if(noiseReduction&&refs.prev.current&&refs.prev.current.length===data.length)temporalBlend(data,refs.prev.current,0.78);
-  if(!refs.prev.current||refs.prev.current.length!==data.length)refs.prev.current=new Uint8ClampedArray(data.length);
-  refs.prev.current.set(data);
-  const motionThresh=Math.round(15+(1-sensitivity)*40);
-  const motionMap=new Uint8Array(sw*sh);let motionPixels=0;
-  if(refs.motion.current&&refs.motion.current.length===data.length){
-    for(let i=0;i<data.length;i+=4){
-      const d=(Math.abs(data[i]-refs.motion.current[i])+Math.abs(data[i+1]-refs.motion.current[i+1])+Math.abs(data[i+2]-refs.motion.current[i+2]))/3;
-      if(d>motionThresh){motionMap[i/4]=255;motionPixels++;}
-    }
-  }
-  refs.motion.current=new Uint8ClampedArray(data);
-
-  // rPPG sample
-  const rppgVal=showRPPG?extractRPPG(data,sw,sh):0;
-
-  let edges=null;
-  if(edgeOverlay)edges=sobelEdges(data,sw,sh);
-
-  const lut=LUTS[lutName]||null;
-  const tempSamples=[];
-
-  // Day vision modes skip NVG/thermal pipeline entirely
-  const isDayMode=mode==="TACT"||mode==="HAZE"||mode==="POLAR"||mode==="RAW";
-  const isAstro=mode==="ASTRO";
-
-  // ASTRO: 30-frame additive long exposure — reveals stars & faint light
-  if(mode==="ASTRO"){
-    const stacked=stackFrames(data,refs.stackBuf,refs.stackIdx,30);
-    if(stacked){
-      for(let i=0;i<data.length;i+=4){
-        // Additive gain ×3.5 + gamma 0.55 deep shadow lift, cool blue-white palette
-        const v=Math.min(255,Math.pow(Math.min(255,stacked[i/4]*3.5)/255,0.55)*255);
-        data[i]=Math.min(255,v*0.85);
-        data[i+1]=Math.min(255,v*0.92);
-        data[i+2]=Math.min(255,v*1.06);
-      }
-    }
-  }
-
-  // NVG: extreme processing pipeline
-  let stackedLum=null;
-  if(mode==="NVG"&&!isDayMode){
-    // Step 1: frame stacking (8 frames) to pull signal from sensor noise
-    stackedLum=stackFrames(data,refs.stackBuf,refs.stackIdx,4);
-    // Step 2: apply stacked luminance back into green channel before CLAHE
-    if(stackedLum){
-      for(let i=0;i<data.length;i+=4){
-        const sl=Math.min(255,stackedLum[i/4]*1.6);
-        data[i]=sl*0.03; data[i+1]=sl; data[i+2]=sl*0.02;
-      }
-    }
-    // Step 3: extreme CLAHE on green channel only
-    applyNVGCLAHE(data,sw,sh);
-  } else if((mode==="WHITE"||mode==="FUSION")&&!isDayMode){
-    applyCLAHE(data,sw,sh,6,3.5);
-  }
-
-  const bri=isDayMode?1.0:(mode==="NVG"?4.5:mode==="WHITE"?3.0:2.0)+brightness*1.5;
-  const con=isDayMode?1.0:(mode==="NVG"?2.8:mode==="WHITE"?2.4:2.1);
-  const mid=128;
-
-  for(let i=0;i<data.length;i+=4){
-    const r=data[i],g=data[i+1],b=data[i+2];
-    const lum=0.299*r+0.587*g+0.114*b;
-    const boosted=Math.max(0,Math.min(255,(lum*bri-mid)*con+mid));
-    const pIdx=i/4;
-    if(mode==="NVG"){
-      // High-clarity green channel — use stacked lum if available for cleaner signal
-      const src=stackedLum?Math.min(255,stackedLum[pIdx]*1.8):boosted;
-      // Gamma correction for shadow lift (gamma 0.7 pulls dark regions up)
-      const gamma=Math.pow(src/255,0.70)*255;
-      const v=Math.min(255,gamma);
-      data[i]=Math.min(255,v*0.02);      // crush red near-zero
-      data[i+1]=Math.min(255,v*1.08);   // green slightly above lum for punch
-      data[i+2]=Math.min(255,v*0.015);  // crush blue
-      // Noise: signal-adaptive — quiet at mid/high signal
-      const noiseAmt=v<60?12:v<120?6:v<200?2:0;
-      if(noiseAmt>0){const n=(Math.random()-.5)*noiseAmt;data[i+1]=Math.max(0,Math.min(255,data[i+1]+n));}
-    }else if(mode==="THERMAL"||mode==="RAINBOW"||mode==="FUSION"){
-      const al=lut||LUTS.THERMAL;const li=Math.min(255,Math.round(boosted));
-      data[i]=al[li*3];data[i+1]=al[li*3+1];data[i+2]=al[li*3+2];
-      const px=pIdx%sw,py=Math.floor(pIdx/sw);
-      if(px%8===0&&py%8===0)tempSamples.push({lum,px,py});
-    }else if(mode==="BLUE"){
-      data[i]=Math.min(255,boosted*0.12);data[i+1]=Math.min(255,boosted*0.32);data[i+2]=Math.min(255,boosted*1.15+b*0.25);
-      const n=(Math.random()-.5)*7;data[i+2]=Math.max(0,Math.min(255,data[i+2]+n));
-    }else if(mode==="TACT"||mode==="HAZE"||mode==="POLAR"||mode==="RAW"||mode==="ASTRO"){
-      // Day / raw / astro: already handled — pass through
-      data[i]=r;data[i+1]=g;data[i+2]=b;
-    }else{const w2=Math.min(255,boosted);data[i]=data[i+1]=data[i+2]=w2;}
-
-    if(edgeOverlay&&edges){
-      const e=edges[pIdx];
-      if(e>40){
-        const ef=(e-40)/215;
-        const ec=mode==="NVG"?[0,255,80]:mode==="BLUE"?[0,160,255]:[255,255,200];
-        data[i]=Math.min(255,data[i]*(1-ef)+ec[0]*ef);
-        data[i+1]=Math.min(255,data[i+1]*(1-ef)+ec[1]*ef);
-        data[i+2]=Math.min(255,data[i+2]*(1-ef)+ec[2]*ef);
-      }
-    }
-    if(motionMap[pIdx]){
-      data[i]=Math.min(255,data[i]*0.4+255*0.6);
-      data[i+1]=Math.min(255,data[i+1]*0.4+100*0.6);
-      data[i+2]=Math.min(255,data[i+2]*0.1);
-    }
-  }
-
-  // Motion heatmap: accumulate motion into decaying heat buffer, blend as overlay
-  if(refs.heatOn){
-    if(!refs.heat.current||refs.heat.current.length!==sw*sh)refs.heat.current=new Float32Array(sw*sh);
-    const heat=refs.heat.current;
-    for(let p=0;p<sw*sh;p++){
-      if(motionMap[p])heat[p]=Math.min(1,heat[p]+0.08);
-      else heat[p]*=0.995; // slow decay — zones persist ~30s
-    }
-    for(let p=0;p<sw*sh;p++){
-      const hv=heat[p];
-      if(hv>0.05){
-        const i=p*4;
-        // cold→hot: blue→yellow→red
-        data[i]  =Math.min(255,data[i]+hv*220);
-        data[i+1]=Math.min(255,data[i+1]+(hv<0.5?hv*160:(1-hv)*160));
-        data[i+2]=Math.min(255,data[i+2]+(hv<0.3?hv*200:0));
-      }
-    }
-  }
-
-  // Digital stabilization — estimate global shift, apply counter-translation
-  let shift=null;
-  if(refs.stabOn&&refs.stabPrev){
-    shift=estimateGlobalShift(data,refs.stabPrev.current,sw,sh);
-    if(!refs.stabSmooth.current)refs.stabSmooth.current={x:0,y:0};
-    const sm=refs.stabSmooth.current;
-    sm.x=sm.x*0.82+shift.dx*0.18;
-    sm.y=sm.y*0.82+shift.dy*0.18;
-    if(!refs.stabPrev.current||refs.stabPrev.current.length!==data.length)
-      refs.stabPrev.current=new Uint8ClampedArray(data.length);
-    refs.stabPrev.current.set(data);
-  }
-
-  // Super-resolution accumulate (static scene detail recovery)
-  if(refs.srOn)superResolve(data,sw,sh,refs.srBuf,refs.srCount,shift);
-
-  // Exposure histogram (every 15th frame, cheap sampled)
-  let expo=null;
-  if(refs.expoTick){
-    refs.expoTick.current=(refs.expoTick.current||0)+1;
-    if(refs.expoTick.current%15===0)expo=computeHistogram(data);
-  }
-
-  // Star/satellite point detection (ASTRO only)
-  let starPts=null;
-  if(mode==="ASTRO"&&refs.starsOn)starPts=detectPoints(data,sw,sh,200);
-
-  // Phosphor bloom pass (NVG only) — after pixel processing, before output
-  if(mode==="NVG") applyPhosphorBloom(data,sw,sh);
-
-  // Day vision bulk passes (operate on full frame after pixel loop)
-  if(mode==="TACT") applyTactical(data,sw,sh,brightness);
-  if(mode==="HAZE") { applyDehaze(data,sw,sh,0.65); applyUnsharpMask(data,sw,sh,1.2,2); }
-  if(mode==="POLAR") applyPolarize(data,sw,sh);
-
-  rawCtx.putImageData(imageData,0,0);
-  const dCtx=dispCanvas.getContext("2d");
-  dCtx.drawImage(rawCanvas,0,0);
-
-  if(mode==="NVG"){
-    // Scanlines: alternating rows dark (real image intensifier tube artifact)
-    dCtx.fillStyle="rgba(0,0,0,0.10)";
-    for(let y=0;y<sh;y+=2)dCtx.fillRect(0,y,sw,1);
-    // Center brightness falloff (tube curvature)
-    const cg=dCtx.createRadialGradient(sw/2,sh/2,sh*0.05,sw/2,sh/2,sh*0.75);
-    cg.addColorStop(0,"rgba(0,20,0,0)");
-    cg.addColorStop(0.7,"rgba(0,10,0,0.1)");
-    cg.addColorStop(1,"rgba(0,0,0,0.55)");
-    dCtx.fillStyle=cg;dCtx.fillRect(0,0,sw,sh);
-    // Subtle green ambient glow overlay
-    dCtx.fillStyle="rgba(0,255,60,0.03)";dCtx.fillRect(0,0,sw,sh);
-  } else if(mode==="RAW"){
-    // No overlay — pure passthrough, minimal vignette only
-  } else if(mode==="TACT"){
-    // Tactical: amber HUD tint + faint grid overlay
-    dCtx.fillStyle="rgba(255,220,50,0.03)";dCtx.fillRect(0,0,sw,sh);
-    dCtx.strokeStyle="rgba(255,220,50,0.05)";dCtx.lineWidth=1;
-    for(let x=0;x<sw;x+=40){dCtx.beginPath();dCtx.moveTo(x,0);dCtx.lineTo(x,sh);dCtx.stroke();}
-    for(let y=0;y<sh;y+=40){dCtx.beginPath();dCtx.moveTo(0,y);dCtx.lineTo(sw,y);dCtx.stroke();}
-    // Sharp vignette
-    const tv=dCtx.createRadialGradient(sw/2,sh/2,sh*0.3,sw/2,sh/2,sh*0.75);
-    tv.addColorStop(0,"rgba(0,0,0,0)");tv.addColorStop(1,"rgba(0,0,0,0.45)");
-    dCtx.fillStyle=tv;dCtx.fillRect(0,0,sw,sh);
-  } else if(mode==="HAZE"){
-    // Dehaze: cool blue clarifying tint
-    dCtx.fillStyle="rgba(80,200,255,0.04)";dCtx.fillRect(0,0,sw,sh);
-    const hv=dCtx.createRadialGradient(sw/2,sh/2,sh*0.4,sw/2,sh/2,sh*0.85);
-    hv.addColorStop(0,"rgba(0,0,0,0)");hv.addColorStop(1,"rgba(0,0,0,0.35)");
-    dCtx.fillStyle=hv;dCtx.fillRect(0,0,sw,sh);
-  } else if(mode==="POLAR"){
-    // Polarize: pink-magenta frame tint
-    dCtx.fillStyle="rgba(255,80,180,0.04)";dCtx.fillRect(0,0,sw,sh);
-    const pv=dCtx.createRadialGradient(sw/2,sh/2,sh*0.35,sw/2,sh/2,sh*0.8);
-    pv.addColorStop(0,"rgba(0,0,0,0)");pv.addColorStop(1,"rgba(0,0,0,0.40)");
-    dCtx.fillStyle=pv;dCtx.fillRect(0,0,sw,sh);
-  } else {
-    dCtx.fillStyle="rgba(0,0,0,0.04)";
-    for(let y=0;y<sh;y+=3)dCtx.fillRect(0,y,sw,1);
-  }
-  const vg=dCtx.createRadialGradient(sw/2,sh/2,sh*0.1,sw/2,sh/2,sh*0.9);
-  vg.addColorStop(0,"rgba(0,0,0,0)");vg.addColorStop(.7,"rgba(0,0,0,0)");vg.addColorStop(1,"rgba(0,0,0,0.75)");
-  dCtx.fillStyle=vg;dCtx.fillRect(0,0,sw,sh);
-
-  // Draw tripwires on canvas
-  if(tripwires&&tripwires.length){
-    for(const tw of tripwires){
-      if(tw.points.length<2)continue;
-      dCtx.beginPath();
-      dCtx.moveTo(tw.points[0].x/100*sw,tw.points[0].y/100*sh);
-      for(let i=1;i<tw.points.length;i++)dCtx.lineTo(tw.points[i].x/100*sw,tw.points[i].y/100*sh);
-      dCtx.strokeStyle=tw.triggered?"rgba(255,30,30,0.9)":"rgba(255,200,0,0.7)";
-      dCtx.lineWidth=2;dCtx.setLineDash([6,4]);dCtx.stroke();dCtx.setLineDash([]);
-      // label
-      const lx=tw.points[0].x/100*sw,ly=tw.points[0].y/100*sh;
-      dCtx.fillStyle=tw.triggered?"#ff2222":"#ffcc00";
-      dCtx.font="bold 9px DM Mono, monospace";
-      dCtx.fillText(tw.label,lx+4,ly-4);
-    }
-  }
-
-  let tempData=null;
-  if(tempSamples.length>0){
-    let hot=-Infinity,cold=Infinity,sum=0,hotPx=50,hotPy=50;
-    for(const{lum,px,py}of tempSamples){
-      const t=18+(lum/255)*22;
-      if(t>hot){hot=t;hotPx=px/sw*100;hotPy=py/sh*100;}
-      if(t<cold)cold=t;sum+=t;
-    }
-    tempData={hot,cold,avg:sum/tempSamples.length,hotX:hotPx,hotY:hotPy};
-  }
-
-  const blobs=motionPixels>20?findBlobs(motionMap,sw,sh,60):[];
-  // Classify and add distance to each blob
-  const enrichedBlobs=blobs.map(b=>{
-    const cls=classifyBlobFallback(b,sw,sh);
-    const dist=estimateRange(cls.label,b.h,sh)??estimateDistance(b.h,sh,cls.label);
-    return{...b,...cls,dist};
-  });
-
-  // Check tripwire intersections
-  const triggeredWires=[];
-  if(tripwires&&blobs.length){
-    for(const tw of tripwires){
-      if(tw.points.length<2)continue;
-      for(const blob of blobs){
-        const bx=blob.cx/sw*100,by=blob.cy/sh*100;
-        // Simple: check if blob center is near any wire segment
-        for(let i=0;i<tw.points.length-1;i++){
-          const p1=tw.points[i],p2=tw.points[i+1];
-          const dx=p2.x-p1.x,dy=p2.y-p1.y;
-          const len=Math.sqrt(dx*dx+dy*dy);
-          if(len<0.1)continue;
-          const t=Math.max(0,Math.min(1,((bx-p1.x)*dx+(by-p1.y)*dy)/(len*len)));
-          const cx2=p1.x+t*dx,cy2=p1.y+t*dy;
-          const dist2=Math.sqrt((bx-cx2)**2+(by-cy2)**2);
-          if(dist2<4)triggeredWires.push(tw.id);
-        }
-      }
-    }
-  }
-
-  return{motionFrac:motionPixels/(sw*sh),blobs:enrichedBlobs,tempData,sw,sh,triggeredWires,rppgVal,expo,starPts,shift:refs.stabSmooth?.current||null};
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// HOOKS
-// ═══════════════════════════════════════════════════════════════════════════════
-function useClock(){
-  const[t,setT]=useState(new Date());
-  useEffect(()=>{const id=setInterval(()=>setT(new Date()),1000);return()=>clearInterval(id);},[]);
-  return t;
-}
-function useDeviceOrientation(){
-  const[h,setH]=useState(null);
-  useEffect(()=>{
-    const fn=e=>{if(e.alpha!==null)setH(Math.round(e.alpha));};
-    window.addEventListener("deviceorientationabsolute",fn,true);
-    window.addEventListener("deviceorientation",fn,true);
-    return()=>{window.removeEventListener("deviceorientationabsolute",fn,true);window.removeEventListener("deviceorientation",fn,true);};
-  },[]);
-  return h;
-}
-function useGPS(){
-  const[pos,setPos]=useState(null);
-  const[track,setTrack]=useState([]);
-  useEffect(()=>{
-    if(!navigator.geolocation)return;
-    const id=navigator.geolocation.watchPosition(p=>{
-      const next={lat:p.coords.latitude,lon:p.coords.longitude,acc:p.coords.accuracy,
-        alt:p.coords.altitude,speed:p.coords.speed,heading:p.coords.heading,t:Date.now()};
-      setPos(next);
-      setTrack(tr=>{
-        const last=tr[tr.length-1];
-        if(!last)return[next];
-        const d=Math.hypot((next.lat-last.lat)*111320,(next.lon-last.lon)*111320*Math.cos(next.lat*Math.PI/180));
-        return d>3?[...tr.slice(-499),next]:tr;
-      });
-    },()=>{},{enableHighAccuracy:true,maximumAge:2000,timeout:10000});
-    return()=>navigator.geolocation.clearWatch(id);
-  },[]);
-  return{pos,track};
-}
-function useMicrophone(enabled,analyserOut){
-  const[level,setLevel]=useState(0);
-  const[spike,setSpike]=useState(false);
-  const[peakFreq,setPeakFreq]=useState(0);
-  const baseRef=useRef(0);
-  useEffect(()=>{
-    if(!enabled){setLevel(0);setSpike(false);return;}
-    let ctx,src,analyser,raf,stream;
-    navigator.mediaDevices?.getUserMedia({audio:true,video:false}).then(s=>{
-      stream=s;
-      ctx=new(window.AudioContext||window.webkitAudioContext)();
-      src=ctx.createMediaStreamSource(s);
-      analyser=ctx.createAnalyser();
-      analyser.fftSize=1024;analyser.smoothingTimeConstant=0.6;
-      src.connect(analyser);
-      if(analyserOut)analyserOut.current=analyser;
-      const freq=new Uint8Array(analyser.frequencyBinCount);
-      const time=new Uint8Array(analyser.fftSize);
-      const tick=()=>{
-        analyser.getByteTimeDomainData(time);
-        let sum=0;
-        for(let i=0;i<time.length;i++){const d=(time[i]-128)/128;sum+=d*d;}
-        const rms=Math.sqrt(sum/time.length);
-        setLevel(rms);
-        baseRef.current=baseRef.current*0.97+rms*0.03;
-        setSpike(rms>baseRef.current*2.2&&rms>0.02);
-        analyser.getByteFrequencyData(freq);
-        let mi=0,mv=0;
-        for(let i=1;i<freq.length;i++)if(freq[i]>mv){mv=freq[i];mi=i;}
-        setPeakFreq(Math.round(mi*ctx.sampleRate/analyser.fftSize));
-        raf=requestAnimationFrame(tick);
-      };
-      tick();
-    }).catch(()=>{});
-    return()=>{cancelAnimationFrame(raf);stream?.getTracks().forEach(t=>t.stop());ctx?.close?.();if(analyserOut)analyserOut.current=null;};
-  },[enabled,analyserOut]);
-  return{level,spike,peakFreq};
-}
-function useRPPG(samples){
-  const[hr,setHr]=useState(null);
-  const[quality,setQuality]=useState(0);
-  const[spo2,setSpo2]=useState(null);
-  const bufRef=useRef([]);
-  useEffect(()=>{
-    if(samples==null)return;
-    const b=bufRef.current;
-    b.push({v:samples,t:Date.now()});
-    if(b.length>256)b.shift();
-    if(b.length<128)return;
-    // Detrend (remove DC + linear drift)
-    const n=b.length,vals=b.map(x=>x.v);
-    const mean=vals.reduce((s,v)=>s+v,0)/n;
-    const det=vals.map((v,i)=>v-mean);
-    // Hamming window
-    const win=det.map((v,i)=>v*(0.54-0.46*Math.cos(2*Math.PI*i/(n-1))));
-    // Effective sample rate from timestamps
-    const dur=(b[n-1].t-b[0].t)/1000;
-    if(dur<4)return;
-    const fs=n/dur;
-    // Goertzel scan over physiological band 0.7-3.5 Hz (42-210 BPM)
-    let bestF=0,bestP=0,total=0;
-    for(let f=0.7;f<=3.5;f+=0.02){
-      const k=2*Math.PI*f/fs;
-      const c=2*Math.cos(k);
-      let s0=0,s1=0,s2=0;
-      for(let i=0;i<n;i++){s0=win[i]+c*s1-s2;s2=s1;s1=s0;}
-      const p=s1*s1+s2*s2-c*s1*s2;
-      total+=p;
-      if(p>bestP){bestP=p;bestF=f;}
-    }
-    // Signal quality = peak dominance over band energy
-    const q=Math.min(1,(bestP/Math.max(1e-9,total/140))/8);
-    setQuality(q);
-    if(q>0.25){
-      const bpm=Math.round(bestF*60);
-      if(bpm>=42&&bpm<=210)setHr(prev=>prev?Math.round(prev*0.7+bpm*0.3):bpm);
-      // Crude SpO2 proxy from AC/DC ratio (illustrative only)
-      const ac=Math.sqrt(det.reduce((s,v)=>s+v*v,0)/n);
-      const ratio=ac/Math.max(1,mean);
-      setSpo2(Math.max(90,Math.min(99,Math.round(99-ratio*180))));
-    }
-  },[samples]);
-  return{hr,quality,spo2};
-}
-// Hardware torch control
-function useTorch(){
-  const trackRef=useRef(null);
-  const[torchOn,setTorchOn]=useState(false);
-  const[supported,setSupported]=useState(false);
-  const toggle=useCallback(async()=>{
-    if(!trackRef.current){
-      try{
-        const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"}});
-        const t=s.getVideoTracks()[0];
-        const caps=t.getCapabilities?.();
-        if(caps?.torch){trackRef.current=t;setSupported(true);}
-        else{s.getTracks().forEach(t=>t.stop());return;}
-      }catch{return;}
-    }
-    const next=!torchOn;
-    try{await trackRef.current.applyConstraints({advanced:[{torch:next}]});setTorchOn(next);}catch{}
-  },[torchOn]);
-  useEffect(()=>()=>{if(trackRef.current){trackRef.current.applyConstraints({advanced:[{torch:false}]}).catch(()=>{});}},[]);
-  return{torchOn,toggle,supported:true};
-}
-
-// Accelerometer shake detection
-function useShake(enabled){
-  const[shakeCount,setShakeCount]=useState(0);
-  const[impact,setImpact]=useState(false);
-  const lastRef=useRef({x:0,y:0,z:0,t:0});
-  useEffect(()=>{
-    if(!enabled)return;
-    const handler=e=>{
-      const{x,y,z}=e.accelerationIncludingGravity||e.acceleration||{};
-      if(x==null)return;
-      const now=Date.now();
-      const last=lastRef.current;
-      const dt=Math.max(1,now-last.t);
-      const jerk=Math.sqrt((x-last.x)**2+(y-last.y)**2+(z-last.z)**2)/dt*100;
-      lastRef.current={x,y,z,t:now};
-      if(jerk>18){
-        setShakeCount(c=>c+1);
-        setImpact(true);
-        setTimeout(()=>setImpact(false),800);
-      }
-    };
-    window.addEventListener("devicemotion",handler);
-    return()=>window.removeEventListener("devicemotion",handler);
-  },[enabled]);
-  return{shakeCount,impact};
-}
-
-// Wind speed estimation via mic FFT (low-freq rumble)
-function useWindSpeed(enabled,analyserRef){
-  const[wind,setWind]=useState(0);
-  useEffect(()=>{
-    if(!enabled||!analyserRef?.current)return;
-    const interval=setInterval(()=>{
-      const analyser=analyserRef.current;
-      if(!analyser)return;
-      const buf=new Uint8Array(analyser.frequencyBinCount);
-      analyser.getByteFrequencyData(buf);
-      // Wind = low freq energy (bins 0-10, ~0-200Hz)
-      const lowFreq=buf.slice(0,10).reduce((s,v)=>s+v,0)/10;
-      // Map 0-80 avg amplitude → 0-25 m/s (Beaufort estimation)
-      const ms=Math.min(25,lowFreq/3.2);
-      setWind(ms);
-    },500);
-    return()=>clearInterval(interval);
-  },[enabled,analyserRef]);
-  return wind;
-}
-
-// Barometric pressure + altitude via DevicePressure or fallback
-function useBarometer(){
-  const[pressure,setPressure]=useState(null);
-  const[altitude,setAltitude]=useState(null);
-  useEffect(()=>{
-    // Try generic sensor API
-    try{
-      // @ts-ignore
-      if(typeof AbsoluteOrientationSensor!=="undefined"||typeof window.DeviceOrientationEvent!=="undefined"){
-        // Use GPS altitude as fallback
-      }
-    }catch{}
-    // GPS-derived altitude from watchPosition
-    const id=navigator.geolocation?.watchPosition(p=>{
-      if(p.coords.altitude!=null){
-        setAltitude(Math.round(p.coords.altitude));
-        // Barometric formula: P = 101325 * (1 - 2.25577e-5 * h)^5.25588
-        const h=p.coords.altitude;
-        const P=101325*Math.pow(1-2.25577e-5*h,5.25588)/100;
-        setPressure(Math.round(P));
-      }
-    },()=>{},{enableHighAccuracy:true});
-    return()=>{if(id!=null)navigator.geolocation.clearWatch(id);};
-  },[]);
-  return{pressure,altitude};
-}
-
-// Native hardware zoom via camera constraints
-function useHardwareZoom(stream){
-  const[hzoom,setHzoom]=useState(1);
-  const[maxZoom,setMaxZoom]=useState(1);
-  const[supported,setSupported]=useState(false);
-  useEffect(()=>{
-    if(!stream)return;
-    const track=stream.getVideoTracks()[0];
-    if(!track)return;
-    const caps=track.getCapabilities?.();
-    if(caps?.zoom){setSupported(true);setMaxZoom(caps.zoom.max||10);}
-  },[stream]);
-  const applyZoom=useCallback(async(val)=>{
-    if(!stream)return;
-    const track=stream.getVideoTracks()[0];
-    if(!track)return;
-    try{await track.applyConstraints({advanced:[{zoom:val}]});setHzoom(val);}catch{}
-  },[stream]);
-  return{hzoom,maxZoom,supported,applyZoom};
-}
-
-function useCameraStream(constraints,enabled=true){
-  const[stream,setStream]=useState(null);
-  const[error,setError]=useState(null);
-  const[ready,setReady]=useState(false);
-  const key=JSON.stringify(constraints)+String(enabled);
-  const acquire=useCallback((active,onStream,onErr)=>{
-    navigator.mediaDevices?.getUserMedia({video:{...constraints,width:{ideal:1280},height:{ideal:720}},audio:false})
-      .then(s=>{if(!active())return s.getTracks().forEach(t=>t.stop());onStream(s);})
-      .catch(e=>{if(active())onErr(e.message||"Camera unavailable");});
-  // eslint-disable-next-line
-  },[key]);
-
-  const[retryKey,setRetryKey]=useState(0);
-  const retry=useCallback(()=>setRetryKey(k=>k+1),[]);
-
-  useEffect(()=>{
-    if(!enabled){setStream(s=>{s?.getTracks().forEach(t=>t.stop());return null;});setReady(false);return;}
-    let live=true;
-    const isLive=()=>live;
-    setReady(false);setError(null);
-
-    let gotStream=false;
-    const start=()=>acquire(isLive,s=>{
-      gotStream=true;
-      setStream(s);setReady(true);
-      s.getVideoTracks().forEach(t=>{
-        t.onended=()=>{if(live){setReady(false);setTimeout(()=>start(),800);}};
-      });
-    },e=>setError(e));
-    start();
-
-    // iOS hang guard: if no stream and no error after 6s, surface tap-to-start
-    const initTimeout=setTimeout(()=>{
-      if(live&&!gotStream)setError("TAP TO START CAMERA");
-    },6000);
-    const clearInit=()=>clearTimeout(initTimeout);
-    // clear timeout when stream arrives
-    const checkInterval=setInterval(()=>{if(gotStream){clearInit();clearInterval(checkInterval);}},500);
-
-    // visibilitychange: resume when tab comes back
-    const onVisible=()=>{
-      if(document.visibilityState==="visible"&&live){
-        setStream(s=>{
-          if(s){
-            const t=s.getVideoTracks()[0];
-            if(t&&t.readyState==="live")return s;
-            s.getTracks().forEach(t=>t.stop());
-          }
-          return null;
-        });
-        setReady(false);
-        setTimeout(()=>start(),300);
-      }
-    };
-    document.addEventListener("visibilitychange",onVisible);
-    return()=>{live=false;clearTimeout(initTimeout);clearInterval(checkInterval);document.removeEventListener("visibilitychange",onVisible);};
-  // eslint-disable-next-line
-  },[key,acquire,retryKey]);
-
-  useEffect(()=>()=>stream?.getTracks().forEach(t=>t.stop()),[stream]);
-  return{stream,error,ready,retry};
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// NVS-8.0 — TARGET TRACKER (persistent IDs, trails, velocity)
-// ═══════════════════════════════════════════════════════════════════════════════
-class TargetTracker{
-  constructor(){this.tracks=[];this.nextId=1;}
-  update(detections,now){
-    const MAXDIST=120,MAXAGE=1500,TRAIL=24;
-    const unmatched=[...detections];
-    // Associate nearest detection to each live track
-    for(const tr of this.tracks){
-      let best=-1,bestD=MAXDIST;
-      for(let i=0;i<unmatched.length;i++){
-        const d=Math.hypot(unmatched[i].cx-tr.cx,unmatched[i].cy-tr.cy);
-        if(d<bestD){bestD=d;best=i;}
-      }
-      if(best>=0){
-        const det=unmatched.splice(best,1)[0];
-        const dt=Math.max(16,now-tr.t);
-        tr.vx=0.7*tr.vx+0.3*((det.cx-tr.cx)/dt*1000);
-        tr.vy=0.7*tr.vy+0.3*((det.cy-tr.cy)/dt*1000);
-        Object.assign(tr,det);tr.t=now;
-        tr.trail.push({x:det.cx,y:det.cy});
-        if(tr.trail.length>TRAIL)tr.trail.shift();
-      }
-    }
-    // Spawn new tracks
-    for(const det of unmatched){
-      this.tracks.push({...det,id:this.nextId++,t:now,vx:0,vy:0,trail:[{x:det.cx,y:det.cy}]});
-    }
-    // Reap stale
-    this.tracks=this.tracks.filter(tr=>now-tr.t<MAXAGE);
-    return this.tracks;
-  }
-}
-
-// Screen wake lock — keeps display on during surveillance
-function useWakeLock(){
-  useEffect(()=>{
-    let lock=null,active=true;
-    const acquire=async()=>{
-      try{lock=await navigator.wakeLock?.request("screen");}catch{}
-    };
-    acquire();
-    const onVis=()=>{if(document.visibilityState==="visible"&&active)acquire();};
-    document.addEventListener("visibilitychange",onVis);
-    return()=>{active=false;document.removeEventListener("visibilitychange",onVis);lock?.release?.().catch(()=>{});};
-  },[]);
-}
-
-// Battery status
-function useBattery(){
-  const[bat,setBat]=useState(null);
-  useEffect(()=>{
-    let b=null;
-    navigator.getBattery?.().then(battery=>{
-      b=battery;
-      const upd=()=>setBat({level:Math.round(battery.level*100),charging:battery.charging});
-      upd();
-      battery.addEventListener("levelchange",upd);
-      battery.addEventListener("chargingchange",upd);
-    }).catch(()=>{});
-    return()=>{};
-  },[]);
-  return bat;
-}
-
-// Voice control — Web Speech API
-function useVoiceControl(enabled,commands){
-  const[listening,setListening]=useState(false);
-  const[lastCmd,setLastCmd]=useState(null);
-  const cmdRef=useRef(commands);
-  cmdRef.current=commands;
-  useEffect(()=>{
-    if(!enabled){setListening(false);return;}
-    const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-    if(!SR)return;
-    const rec=new SR();
-    rec.continuous=true;rec.interimResults=false;rec.lang="en-US";
-    rec.onresult=e=>{
-      const text=e.results[e.results.length-1][0].transcript.toLowerCase().trim();
-      for(const[phrase,fn]of Object.entries(cmdRef.current)){
-        if(text.includes(phrase)){fn();setLastCmd(phrase.toUpperCase());setTimeout(()=>setLastCmd(null),2000);break;}
-      }
-    };
-    rec.onend=()=>{if(enabled)try{rec.start();}catch{}};
-    try{rec.start();setListening(true);}catch{}
-    return()=>{rec.onend=null;try{rec.stop();}catch{};setListening(false);};
-  },[enabled]);
-  return{listening,lastCmd};
-}
-
-// Threat audio alert — synthesized beep via WebAudio
-function useThreatBeep(){
-  const ctxRef=useRef(null);
-  return useCallback((kind="alert")=>{
-    try{
-      if(!ctxRef.current)ctxRef.current=new(window.AudioContext||window.webkitAudioContext)();
-      const ctx=ctxRef.current;
-      const o=ctx.createOscillator(),g=ctx.createGain();
-      o.connect(g);g.connect(ctx.destination);
-      if(kind==="person"){o.frequency.value=880;g.gain.value=0.15;}
-      else if(kind==="wire"){o.frequency.value=1320;g.gain.value=0.2;}
-      else{o.frequency.value=660;g.gain.value=0.12;}
-      o.type="square";
-      const t=ctx.currentTime;
-      o.start(t);
-      g.gain.setValueAtTime(g.gain.value,t);
-      g.gain.exponentialRampToValueAtTime(0.001,t+0.18);
-      o.stop(t+0.2);
-      if(kind==="wire"){ // double beep
-        const o2=ctx.createOscillator(),g2=ctx.createGain();
-        o2.connect(g2);g2.connect(ctx.destination);
-        o2.frequency.value=1320;o2.type="square";
-        o2.start(t+0.25);
-        g2.gain.setValueAtTime(0.2,t+0.25);
-        g2.gain.exponentialRampToValueAtTime(0.001,t+0.43);
-        o2.stop(t+0.45);
-      }
-    }catch{}
-  },[]);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// NVS-10.0 — PERSISTENCE (IndexedDB) + NEW SUBSYSTEMS
-// ═══════════════════════════════════════════════════════════════════════════════
-const DB_NAME="nvs_vault",DB_VER=1;
-function openDB(){
-  return new Promise((res,rej)=>{
-    const rq=indexedDB.open(DB_NAME,DB_VER);
-    rq.onupgradeneeded=()=>{
-      const db=rq.result;
-      if(!db.objectStoreNames.contains("captures"))db.createObjectStore("captures",{keyPath:"ts"});
-      if(!db.objectStoreNames.contains("clips"))db.createObjectStore("clips",{keyPath:"ts"});
-      if(!db.objectStoreNames.contains("events"))db.createObjectStore("events",{keyPath:"ts"});
-      if(!db.objectStoreNames.contains("kv"))db.createObjectStore("kv",{keyPath:"k"});
-    };
-    rq.onsuccess=()=>res(rq.result);
-    rq.onerror=()=>rej(rq.error);
-  });
-}
-async function dbPut(store,val){try{const db=await openDB();return new Promise(r=>{const tx=db.transaction(store,"readwrite");tx.objectStore(store).put(val);tx.oncomplete=()=>r(true);tx.onerror=()=>r(false);});}catch{return false;}}
-async function dbAll(store){try{const db=await openDB();return new Promise(r=>{const tx=db.transaction(store,"readonly");const rq=tx.objectStore(store).getAll();rq.onsuccess=()=>r(rq.result||[]);rq.onerror=()=>r([]);});}catch{return[];}}
-async function dbDel(store,key){try{const db=await openDB();return new Promise(r=>{const tx=db.transaction(store,"readwrite");tx.objectStore(store).delete(key);tx.oncomplete=()=>r(true);tx.onerror=()=>r(false);});}catch{return false;}}
-async function dbClear(store){try{const db=await openDB();return new Promise(r=>{const tx=db.transaction(store,"readwrite");tx.objectStore(store).clear();tx.oncomplete=()=>r(true);tx.onerror=()=>r(false);});}catch{return false;}}
-async function dbUsage(){try{const e=await navigator.storage?.estimate?.();return e?{used:e.usage,quota:e.quota}:null;}catch{return null;}}
-
-// Persisted settings — survives reload
-function usePersistedSettings(defaults){
-  const[loaded,setLoaded]=useState(false);
-  const[settings,setSettings]=useState(defaults);
-  useEffect(()=>{
-    (async()=>{
-      const rows=await dbAll("kv");
-      const saved=rows.find(r=>r.k==="settings");
-      if(saved?.v)setSettings(s=>({...s,...saved.v}));
-      setLoaded(true);
-    })();
-  },[]);
-  const save=useCallback((patch)=>{
-    setSettings(s=>{const next={...s,...patch};dbPut("kv",{k:"settings",v:next});return next;});
-  },[]);
-  return{settings,save,loaded};
-}
-
-// ── LASER RANGEFINDER: reference-object scaling ──
-const REF_HEIGHTS={PERSON:1.7,CAR:1.5,TRUCK:3.2,BUS:3.2,DOG:0.5,CAT:0.3,BICYCLE:1.0,MOTORCYCLE:1.3,"STOP SIGN":2.1,"FIRE HYDRANT":0.8,CHAIR:0.9,BOTTLE:0.25};
-function estimateRange(label,pxHeight,frameHeight,vFovDeg=55){
-  const real=REF_HEIGHTS[label];
-  if(!real||!pxHeight)return null;
-  const anglePerPx=(vFovDeg*Math.PI/180)/frameHeight;
-  const subtended=pxHeight*anglePerPx;
-  if(subtended<=0)return null;
-  return real/(2*Math.tan(subtended/2));
-}
-
-// ── PANORAMA STITCHER ──
-function usePanorama(){
-  const[frames,setFrames]=useState([]);
-  const add=useCallback(dataUrl=>setFrames(f=>[...f,dataUrl].slice(-12)),[]);
-  const reset=useCallback(()=>setFrames([]),[]);
-  const stitch=useCallback(async()=>{
-    if(frames.length<2)return null;
-    const imgs=await Promise.all(frames.map(src=>new Promise(r=>{const i=new Image();i.onload=()=>r(i);i.src=src;})));
-    const h=imgs[0].height,OVER=0.18;
-    const step=Math.round(imgs[0].width*(1-OVER));
-    const c=document.createElement("canvas");
-    c.width=step*(imgs.length-1)+imgs[0].width;c.height=h;
-    const ctx=c.getContext("2d");
-    imgs.forEach((im,i)=>{
-      const x=i*step;
-      if(i===0){ctx.drawImage(im,0,0);return;}
-      // feather blend the overlap
-      const ow=im.width-step;
-      const g=ctx.createLinearGradient(x,0,x+ow,0);
-      g.addColorStop(0,"rgba(0,0,0,0)");g.addColorStop(1,"rgba(0,0,0,1)");
-      ctx.save();ctx.globalCompositeOperation="source-over";
-      ctx.drawImage(im,x,0);ctx.restore();
-    });
-    return c.toDataURL("image/jpeg",0.9);
-  },[frames]);
-  return{frames,add,reset,stitch};
-}
-
-// ── STAR / SATELLITE TRACKER (bright-point detection + drift) ──
-function detectPoints(data,w,h,thresh=210){
-  const pts=[];const seen=new Uint8Array(w*h);
-  for(let y=2;y<h-2;y+=2)for(let x=2;x<w-2;x+=2){
-    const i=(y*w+x)*4;
-    const lum=0.299*data[i]+0.587*data[i+1]+0.114*data[i+2];
-    if(lum<thresh)continue;
-    const p=y*w+x;if(seen[p])continue;
-    // local max check
-    let isMax=true;
-    for(let dy=-2;dy<=2&&isMax;dy++)for(let dx=-2;dx<=2;dx++){
-      const j=((y+dy)*w+(x+dx))*4;
-      if(0.299*data[j]+0.587*data[j+1]+0.114*data[j+2]>lum){isMax=false;break;}
-    }
-    if(isMax){pts.push({x,y,lum});for(let dy=-3;dy<=3;dy++)for(let dx=-3;dx<=3;dx++){const q=(y+dy)*w+(x+dx);if(q>=0&&q<seen.length)seen[q]=1;}}
-    if(pts.length>120)return pts;
-  }
-  return pts;
-}
-
-// ── HISTOGRAM / EXPOSURE ANALYSIS ──
-function computeHistogram(data){
-  const hist=new Uint32Array(64);
-  let clipLow=0,clipHigh=0,sum=0,n=0;
-  for(let i=0;i<data.length;i+=16){ // sample every 4th pixel
-    const lum=0.299*data[i]+0.587*data[i+1]+0.114*data[i+2];
-    hist[Math.min(63,lum>>2)]++;
-    if(lum<4)clipLow++;if(lum>251)clipHigh++;
-    sum+=lum;n++;
-  }
-  return{hist,mean:sum/Math.max(1,n),clipLow:clipLow/Math.max(1,n),clipHigh:clipHigh/Math.max(1,n)};
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// NVS-11.0 — STABILIZATION, SUPER-RES, LOITER ANALYTICS, GEOFENCE
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// ── DIGITAL STABILIZATION: phase-correlation-lite global motion estimate ──
-// Samples a sparse grid, finds best integer shift within ±8px, smooths it.
-function estimateGlobalShift(cur,prev,w,h){
-  if(!prev||prev.length!==cur.length)return{dx:0,dy:0};
-  const STEP=12,R=8;
-  let bestDx=0,bestDy=0,bestErr=Infinity;
-  for(let dy=-R;dy<=R;dy+=2)for(let dx=-R;dx<=R;dx+=2){
-    let err=0,n=0;
-    for(let y=R;y<h-R;y+=STEP)for(let x=R;x<w-R;x+=STEP){
-      const i=(y*w+x)*4;
-      const j=((y+dy)*w+(x+dx))*4;
-      err+=Math.abs(cur[i+1]-prev[j+1]);n++;
-      if(err>bestErr*n/Math.max(1,n))break;
-    }
-    const norm=err/Math.max(1,n);
-    if(norm<bestErr){bestErr=norm;bestDx=dx;bestDy=dy;}
-  }
-  return{dx:bestDx,dy:bestDy,err:bestErr};
-}
-
-// ── SUPER-RESOLUTION: multi-frame accumulate with sub-pixel offsets ──
-// Averages N registered frames at 2x grid for real detail recovery on static scenes.
-function superResolve(data,w,h,srBuf,srCount,shift){
-  const n=w*h;
-  if(!srBuf.current||srBuf.current.length!==n*3){
-    srBuf.current=new Float32Array(n*3);srCount.current=0;
-  }
-  const buf=srBuf.current;
-  // register incoming frame by inverse shift, accumulate
-  for(let y=0;y<h;y++){
-    const sy=Math.min(h-1,Math.max(0,y+(shift?.dy||0)));
-    for(let x=0;x<w;x++){
-      const sx=Math.min(w-1,Math.max(0,x+(shift?.dx||0)));
-      const s=(sy*w+sx)*4,d=(y*w+x)*3;
-      buf[d]+=data[s];buf[d+1]+=data[s+1];buf[d+2]+=data[s+2];
-    }
-  }
-  srCount.current++;
-  const c=srCount.current;
-  if(c<2)return false;
-  for(let p=0;p<n;p++){
-    const d=p*3,i=p*4;
-    data[i]=Math.min(255,buf[d]/c);
-    data[i+1]=Math.min(255,buf[d+1]/c);
-    data[i+2]=Math.min(255,buf[d+2]/c);
-  }
-  return true;
-}
-
-// ── LOITER / DWELL ANALYTICS ──
-// Flags tracks that stay within a radius beyond a dwell threshold.
-class LoiterAnalyzer{
-  constructor(){this.dwell=new Map();}
-  update(tracks,now,radiusPx=70,thresholdMs=8000){
-    const flagged=[];
-    const live=new Set();
-    for(const t of tracks){
-      if(!t.id)continue;
-      live.add(t.id);
-      const rec=this.dwell.get(t.id);
-      if(!rec){this.dwell.set(t.id,{ox:t.cx,oy:t.cy,since:now,flagged:false});continue;}
-      const d=Math.hypot(t.cx-rec.ox,t.cy-rec.oy);
-      if(d>radiusPx){rec.ox=t.cx;rec.oy=t.cy;rec.since=now;rec.flagged=false;}
-      else{
-        const dwellMs=now-rec.since;
-        if(dwellMs>thresholdMs){
-          rec.flagged=true;
-          flagged.push({...t,dwellMs});
-        }
-      }
-    }
-    for(const id of[...this.dwell.keys()])if(!live.has(id))this.dwell.delete(id);
-    return flagged;
-  }
-  dwellFor(id,now){const r=this.dwell.get(id);return r?now-r.since:0;}
-}
-
-// ── GEOFENCE: radius alarm around an anchor point ──
-function haversine(a,b){
-  const R=6371000,toR=Math.PI/180;
-  const dLat=(b.lat-a.lat)*toR,dLon=(b.lon-a.lon)*toR;
-  const s=Math.sin(dLat/2)**2+Math.cos(a.lat*toR)*Math.cos(b.lat*toR)*Math.sin(dLon/2)**2;
-  return 2*R*Math.asin(Math.sqrt(s));
-}
-function useGeofence(pos,onBreach){
-  const[anchor,setAnchor]=useState(null);
-  const[radius,setRadius]=useState(100);
-  const[inside,setInside]=useState(true);
-  const wasInside=useRef(true);
-  const dist=useMemo(()=>anchor&&pos?haversine(anchor,pos):null,[anchor,pos]);
-  useEffect(()=>{
-    if(dist==null)return;
-    const now=dist<=radius;
-    setInside(now);
-    if(wasInside.current!==now){
-      wasInside.current=now;
-      onBreach?.(now?"ENTERED":"EXITED",Math.round(dist));
-    }
-  },[dist,radius,onBreach]);
-  const drop=useCallback(()=>{if(pos){setAnchor({lat:pos.lat,lon:pos.lon});wasInside.current=true;}},[pos]);
-  const clear=useCallback(()=>setAnchor(null),[]);
-  return{anchor,radius,setRadius,dist,inside,drop,clear};
-}
-
-// ── SESSION STATS ──
-function useSessionStats(){
-  const startRef=useRef(Date.now());
-  const[stats,setStats]=useState({uptime:0});
-  useEffect(()=>{
-    const i=setInterval(()=>setStats(s=>({...s,uptime:Math.floor((Date.now()-startRef.current)/1000)})),1000);
-    return()=>clearInterval(i);
-  },[]);
-  return stats;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// DAY VISION PROCESSING
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// Unsharp mask — sharpens fine detail (tactical clarity enhancement)
-function applyUnsharpMask(data,w,h,amount=1.8,radius=2){
-  const n=w*h;
-  const lum=new Float32Array(n);
-  for(let i=0;i<data.length;i+=4)
-    lum[i/4]=0.299*data[i]+0.587*data[i+1]+0.114*data[i+2];
-  // Separable box blur: horizontal pass then vertical pass — O(n) not O(n*r^2)
-  const tmp=new Float32Array(n);
-  const blurred=new Float32Array(n);
-  for(let y=0;y<h;y++){
-    let sum=0;
-    for(let x=-radius;x<=radius;x++) sum+=lum[y*w+Math.min(w-1,Math.max(0,x))];
-    for(let x=0;x<w;x++){
-      tmp[y*w+x]=sum/(radius*2+1);
-      const add=lum[y*w+Math.min(w-1,x+radius+1)];
-      const rem=lum[y*w+Math.max(0,x-radius)];
-      sum+=add-rem;
-    }
-  }
-  for(let x=0;x<w;x++){
-    let sum=0;
-    for(let y=-radius;y<=radius;y++) sum+=tmp[Math.min(h-1,Math.max(0,y))*w+x];
-    for(let y=0;y<h;y++){
-      blurred[y*w+x]=sum/(radius*2+1);
-      const add=tmp[Math.min(h-1,y+radius+1)*w+x];
-      const rem=tmp[Math.max(0,y-radius)*w+x];
-      sum+=add-rem;
-    }
-  }
-  for(let i=0;i<data.length;i+=4){
-    const pi=i/4;
-    const diff=lum[pi]-blurred[pi];
-    const scale=lum[pi]>0?(lum[pi]+diff*amount)/lum[pi]:1;
-    data[i]  =Math.max(0,Math.min(255,data[i]  *scale));
-    data[i+1]=Math.max(0,Math.min(255,data[i+1]*scale));
-    data[i+2]=Math.max(0,Math.min(255,data[i+2]*scale));
-  }
-}
-
-// Dark channel prior dehaze — removes atmospheric haze/glare
-function applyDehaze(data,w,h,strength=0.7){
-  // Fast approximate dark-channel: downsample to 1/4 resolution grid,
-  // patch radius reduced, then upsample transmission map
-  const step=4; // sample every 4th pixel
-  const patch=2; // small patch on downsampled grid (~8px effective)
-  const gw=Math.ceil(w/step),gh=Math.ceil(h/step);
-  const dark=new Float32Array(gw*gh);
-  for(let gy=0;gy<gh;gy++)for(let gx=0;gx<gw;gx++){
-    let minV=255;
-    for(let dy=-patch;dy<=patch;dy++)for(let dx=-patch;dx<=patch;dx++){
-      const sx=Math.min(w-1,Math.max(0,(gx+dx)*step));
-      const sy=Math.min(h-1,Math.max(0,(gy+dy)*step));
-      const i=(sy*w+sx)*4;
-      const m=Math.min(data[i],data[i+1],data[i+2]);
-      if(m<minV)minV=m;
-    }
-    dark[gy*gw+gx]=minV;
-  }
-  // Estimate atmospheric light: max of dark channel grid (approximation)
-  let A=0;
-  for(let i=0;i<dark.length;i++) if(dark[i]>A)A=dark[i];
-  A=Math.max(A,10);
-  // Apply transmission per-pixel using nearest grid sample (no expensive interpolation)
-  for(let i=0;i<data.length;i+=4){
-    const pi=i/4;
-    const x=pi%w,y=(pi-x)/w|0;
-    const gx=Math.min(gw-1,x/step|0),gy=Math.min(gh-1,y/step|0);
-    const t=Math.max(0.15,1-(strength*dark[gy*gw+gx]/A));
-    data[i]  =Math.min(255,Math.max(0,(data[i]  -A)/t+A));
-    data[i+1]=Math.min(255,Math.max(0,(data[i+1]-A)/t+A));
-    data[i+2]=Math.min(255,Math.max(0,(data[i+2]-A)/t+A));
-  }
-}
-
-// Polarize: cut specular highlights, boost saturation (polarized lens simulation)
-function applyPolarize(data,w,h){
-  for(let i=0;i<data.length;i+=4){
-    let r=data[i],g=data[i+1],b=data[i+2];
-    // Convert to HSL, boost S, reduce L on highlights
-    const max=Math.max(r,g,b)/255,min=Math.min(r,g,b)/255;
-    const l=(max+min)/2;
-    const d=max-min;
-    let s=d===0?0:d/(1-Math.abs(2*l-1));
-    // Boost saturation by 60%, crush glare (highlights above 0.85 L)
-    s=Math.min(1,s*1.6);
-    const lAdj=l>0.85?(l-0.85)*0.4+0.85*0.9:l; // compress highlights
-    // Back to RGB
-    const c=(1-Math.abs(2*lAdj-1))*s;
-    const hue=max===min?0:max===r/255?((g-b)/255/d+6)%6:max===g/255?(b-r)/255/d+2:(r-g)/255/d+4;
-    const x=c*(1-Math.abs(hue%2-1));
-    let r2=0,g2=0,b2=0;
-    if(hue<1){r2=c;g2=x;}else if(hue<2){r2=x;g2=c;}
-    else if(hue<3){g2=c;b2=x;}else if(hue<4){g2=x;b2=c;}
-    else if(hue<5){r2=x;b2=c;}else{r2=c;b2=x;}
-    const m=lAdj-c/2;
-    data[i]  =Math.min(255,Math.max(0,Math.round((r2+m)*255)));
-    data[i+1]=Math.min(255,Math.max(0,Math.round((g2+m)*255)));
-    data[i+2]=Math.min(255,Math.max(0,Math.round((b2+m)*255)));
-  }
-}
-
-// Tactical day enhancement: contrast stretch + color fidelity + HUD-safe palette
-function applyTactical(data,w,h,brightness){
-  // Auto-levels: stretch histogram per channel
-  const rMin=new Array(3).fill(255),rMax=new Array(3).fill(0);
-  for(let i=0;i<data.length;i+=4){
-    for(let c=0;c<3;c++){
-      if(data[i+c]<rMin[c])rMin[c]=data[i+c];
-      if(data[i+c]>rMax[c])rMax[c]=data[i+c];
-    }
-  }
-  // Apply levels + brightness boost + slight yellow-green tint (military CMOS filter)
-  const bBoost=1.15+brightness*0.5;
-  for(let i=0;i<data.length;i+=4){
-    const stretch=c=>{
-      const range=Math.max(1,rMax[c]-rMin[c]);
-      return Math.min(255,Math.max(0,Math.round(((data[i+c]-rMin[c])/range)*255*bBoost)));
-    };
-    data[i]  =Math.min(255,stretch(0)*0.88); // slight red reduction
-    data[i+1]=Math.min(255,stretch(1)*1.05); // slight green boost
-    data[i+2]=Math.min(255,stretch(2)*0.92); // slight blue reduction
-  }
-  // Unsharp mask for tactical clarity
-  applyUnsharpMask(data,w,h,1.4,2);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// MULTI-DEVICE SYNC (WebRTC signaling via BroadcastChannel + PeerJS-less peer)
-// Uses localStorage as simple signaling bus for same-device tabs
-// ═══════════════════════════════════════════════════════════════════════════════
-function useMultiSync(enabled,myId){
-  const[peers,setPeers]=useState([]);
-  const[alerts,setAlerts]=useState([]);
-  const chRef=useRef(null);
-  useEffect(()=>{
-    if(!enabled||typeof BroadcastChannel==="undefined")return;
-    const ch=new BroadcastChannel("nvs7_sync");
-    chRef.current=ch;
-    ch.onmessage=e=>{
-      const{type,from,payload}=e.data;
-      if(from===myId)return;
-      if(type==="HEARTBEAT")setPeers(p=>{const exists=p.find(x=>x.id===from);if(exists)return p.map(x=>x.id===from?{...x,ts:Date.now()}:x);return[...p,{id:from,ts:Date.now(),label:payload?.label||from}];});
-      if(type==="MOTION_ALERT")setAlerts(a=>[{from,payload,ts:Date.now()},...a].slice(0,20));
-    };
-    const beat=setInterval(()=>ch.postMessage({type:"HEARTBEAT",from:myId,payload:{label:`NVS-${myId.slice(-4)}`}})
-    ,3000);
-    const prune=setInterval(()=>setPeers(p=>p.filter(x=>Date.now()-x.ts<10000)),5000);
-    return()=>{ch.close();clearInterval(beat);clearInterval(prune);};
-  },[enabled,myId]);
-  const broadcast=useCallback((type,payload)=>{
-    chRef.current?.postMessage({type,from:myId,payload});
-  },[myId]);
-  return{peers,alerts,broadcast};
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// TIMELINE STORE
-// ═══════════════════════════════════════════════════════════════════════════════
-function useTimeline(){
-  const[events,setEvents]=useState([]);
-  const add=useCallback((type,data)=>setEvents(e=>[{id:Date.now(),type,data,ts:Date.now()},...e].slice(0,200)),[]);
-  return{events,add};
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// GPS MAP MODAL
-// ═══════════════════════════════════════════════════════════════════════════════
-// Face detection using Canvas + heuristic skin-tone blob analysis
-// (No ML model — uses YCbCr skin tone range detection)
-function detectFaces(data,w,h){
-  const mask=new Uint8Array(w*h);
-  // YCbCr skin tone: Y>80, Cb 85-135, Cr 135-180
-  for(let i=0;i<data.length;i+=4){
-    const r=data[i],g=data[i+1],b=data[i+2];
-    const Y=0.299*r+0.587*g+0.114*b;
-    const Cb=-0.168736*r-0.331264*g+0.5*b+128;
-    const Cr=0.5*r-0.418688*g-0.081312*b+128;
-    if(Y>80&&Cb>85&&Cb<135&&Cr>135&&Cr<180)mask[i/4]=1;
-  }
-  // Find largest connected skin blob
-  const visited=new Uint8Array(w*h);const faces=[];
-  for(let start=0;start<mask.length;start++){
-    if(!mask[start]||visited[start])continue;
-    const queue=[start];visited[start]=1;
-    let minX=w,minY=h,maxX=0,maxY=0,size=0;
-    while(queue.length){
-      const idx=queue.pop();size++;
-      const x=idx%w,y=Math.floor(idx/w);
-      if(x<minX)minX=x;if(x>maxX)maxX=x;if(y<minY)minY=y;if(y>maxY)maxY=y;
-      for(const[dx,dy]of[[-1,0],[1,0],[0,-1],[0,1]]){
-        const nx=x+dx,ny=y+dy;
-        if(nx>=0&&nx<w&&ny>=0&&ny<h){const ni=ny*w+nx;if(mask[ni]&&!visited[ni]){visited[ni]=1;queue.push(ni);}}
-      }
-    }
-    // Face-like: roughly square, not too small/large, upper half of frame preferred
-    const bw=maxX-minX,bh=maxY-minY,aspect=bw/Math.max(1,bh);
-    const area=(bw*bh)/(w*h);
-    if(size>300&&area>0.005&&area<0.4&&aspect>0.5&&aspect<2.0)
-      faces.push({x:minX,y:minY,w:bw,h:bh,cx:(minX+maxX)/2,cy:(minY+maxY)/2});
-  }
-  return faces.sort((a,b)=>b.w*b.h-a.w*a.h).slice(0,4);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// INSTRUCTIONS MODAL
-// ═══════════════════════════════════════════════════════════════════════════════
-function InstructionsModal({color,onClose}){
-  const[tab,setTab]=useState("start");
-  const tabs={
-    start:"START",
-    modes:"MODES",
-    ai:"AI/TRACK",
-    auto:"AUTOMATION",
-    tools:"TOOLS",
-    voice:"VOICE",
-    vault:"STORAGE",
-  };
-  const content={
-    vault:[
-      {icon:"💾",title:"WHERE EVERYTHING GOES",body:"With VAULT on (default), photos and video clips are written to IndexedDB on this device and survive reloads, tab closes, and phone restarts. Nothing is ever uploaded — no server, no cloud."},
-      {icon:"🎞",title:"CLIP VAULT",body:"Tools → Clips: every recording (manual ⏺ REC and 🛡 SENTRY auto-clips) with inline playback, duration, size, and mode. ↓ saves to your device Downloads, ✕ deletes one, CLEAR wipes all."},
-      {icon:"📁",title:"PHOTO VAULT",body:"Gallery holds up to 200 stills across sessions. ↓ ALL downloads every shot, CLEAR wipes the store."},
-      {icon:"📊",title:"STORAGE BUDGET",body:"Sensors panel shows MB used and total quota (usually several GB). The app requests persistent storage so the browser will not silently evict your vault."},
-      {icon:"⬇",title:"GETTING DATA OUT",body:"Photos/clips: ↓ buttons. Events: ↓ CSV in the Event Log. Full session: 📄 Report. Turn VAULT off to revert to instant-download-on-stop behavior instead of storing."},
-    ],
-    start:[
-      {icon:"📷",title:"ALLOW CAMERA",body:"Open in Chrome/Safari and tap Allow on the camera prompt. Also Allow location (GPS map, altitude) and microphone (audio spike, wind) when asked. iOS: Settings → Safari → Camera → Allow."},
-      {icon:"▶",title:"IF CAMERA WON'T START",body:"After 6s a TAP TO START CAMERA button appears — tap it. Any error screen also has a ↻ RETRY button. Tapping counts as a user gesture, which iOS always honors."},
-      {icon:"📱",title:"INSTALL AS APP",body:"Share button → Add to Home Screen for full-screen with no browser chrome. Screen stays awake automatically while the app is open (wake lock)."},
-      {icon:"🔍",title:"TAP TO MAGNIFY",body:"Tap anywhere on the camera view for a live 3× magnified inset of that spot (top-right, with crosshair). Tap the inset to close. Works in every mode."},
-      {icon:"🌙",title:"SEEING IN THE DARK",body:"NVG mode + GAIN at +2. Hold steady — 4-frame stacking pulls signal from noise. For extreme darkness or stars use ASTRO (30-frame long exposure, hold very still or brace the phone)."},
-      {icon:"🔋",title:"HUD READOUTS",body:"Header shows battery %, compass bearing, GPS, altitude, wind estimate, AI status (AI▸ loading / AI✓ ready), and active systems: 🔦 torch, 🎤VOX voice, 🛡SENTRY."},
-    ],
-    modes:[
-      {icon:"⬜",title:"RAW",body:"Pure passthrough. Zero processing — exactly what the sensor sees."},
-      {icon:"🟢",title:"NVG",body:"Realistic night vision: 4-frame temporal stacking, extreme green-channel CLAHE, 4.5× gain, gamma shadow lift, phosphor bloom, tube vignette, scanlines. Use GAIN bars to push further."},
-      {icon:"🔥",title:"THERMAL / RAINBOW / FUSION / ARCTIC / WHT-HOT",body:"False-color luminance palettes. THERMAL maps brightness to heat colors; WHT-HOT is classic military white-hot; FUSION blends thermal with edge data."},
-      {icon:"☀️",title:"TACT",body:"Daytime tactical: per-channel auto-levels, unsharp sharpening, military CMOS tint, amber grid HUD."},
-      {icon:"🌫",title:"DEHAZE",body:"Dark-channel-prior haze removal — cuts fog, mist, and atmospheric scatter, then sharpens."},
-      {icon:"🕶",title:"POLARIZ",body:"Polarized-lens simulation: crushes specular glare from water/glass/metal, boosts saturation 60%."},
-      {icon:"✨",title:"ASTRO",body:"30-frame additive long exposure with deep shadow lift — reveals stars and faint light invisible to the eye. Brace the phone; motion blurs the stack."},
-    ],
-    ai:[
-      {icon:"🧠",title:"REAL OBJECT NAMES",body:"TensorFlow COCO-SSD (loads once, ~3MB — AI▸ becomes AI✓) identifies 80 object types by name: PERSON, CAR, DOG, LAPTOP, CELL PHONE, BIRD… Detection runs every 500ms without slowing the feed."},
-      {icon:"#",title:"PERSISTENT TRACK IDs",body:"Every target keeps its ID (#1, #2…) as it moves. Boxes are color-ranked by threat order. Main target gets the large label."},
-      {icon:"〰",title:"MOTION TRAILS",body:"Dashed line shows each target's last 24 positions — see patrol routes and movement history at a glance."},
-      {icon:"➤",title:"VELOCITY VECTORS",body:"Yellow-tipped arrow shows direction and speed of moving targets, smoothed with momentum. Longer arrow = faster."},
-      {icon:"📏",title:"DISTANCE ESTIMATE",body:"Pinhole-model range estimate under each label (assumes human-scale target). Rough guide, not a rangefinder."},
-      {icon:"📏",title:"REFERENCE RANGEFINDER",body:"Distance now comes from known real-world object heights (person 1.7m, car 1.5m, stop sign 2.1m…) against pixel height and camera FOV — far more accurate than the old generic estimate."},
-      {icon:"✨",title:"STAR / SATELLITE TRACKER",body:"Toggle STARS (best with ASTRO): finds bright point sources via local-maxima detection, circles each with its brightness value. Watch a marked point drift between frames to identify a satellite."},
-      {icon:"📊",title:"LIVE HISTOGRAM",body:"Toggle HIST for a 64-bin luminance histogram bottom-left. Blue bars = crushed shadows, red = blown highlights. An ⚠ banner warns when the frame is badly under- or over-exposed."},
-      {icon:"🌐",title:"PANORAMA",body:"Tools → Pano captures a frame each tap (up to 12). Pan roughly 15% between shots. Press STITCH to blend them into one wide image saved to Gallery."},
-      {icon:"🎯",title:"DIGITAL STABILIZATION",body:"Toggle STAB: estimates global frame-to-frame shift via sparse phase correlation and counter-translates the view with 1.08x overscan. Cancels handshake — essential at 8x+ zoom and for ASTRO."},
-      {icon:"🔬",title:"SUPER-RESOLUTION",body:"Toggle SUPER-R on a static scene: registers and averages successive frames to recover real detail and crush sensor noise. Keeps improving the longer you hold still. Resets on mode change."},
-      {icon:"⏳",title:"LOITER DETECTION",body:"Any tracked target that stays within ~70px for over 8 seconds is flagged as loitering and logged with its dwell time. Fires an alert beep. Catches someone casing a location."},
-      {icon:"📍",title:"GEOFENCE",body:"DROP plants an anchor at your current GPS position with an adjustable 25-500m radius. Crossing the boundary either way fires a double beep, a header BREACH indicator, and a log entry with distance."},
-      {icon:"🌡",title:"HEAT OVERLAY",body:"Toggle HEAT: motion accumulates into a decaying blue→yellow→red heatmap showing WHERE activity happened over the last ~30s. Stacks with any mode."},
-    ],
-    auto:[
-      {icon:"🛡",title:"SENTRY MODE",body:"Arm SENTRY and walk away. When a PERSON is detected: alert beep + auto-record starts. Recording extends while the person remains, stops 10s after last sighting. Every trigger is logged. HUD is burned into the clip."},
-      {icon:"🎯",title:"AUTO CAPTURE",body:"AUTO ON: any significant motion → 600ms lock → white flash → PNG saved to Gallery. 3s cooldown per camera."},
-      {icon:"⚡",title:"TRIPWIRES",body:"Tools → Tripwire: draw lines on the scene. Any tracked object crossing a line triggers a double beep, ⚠WIRE header alert, and a log entry. Auto-resets after 3s."},
-      {icon:"🔔",title:"THREAT BEEPS",body:"880Hz beep when a PERSON appears (4s throttle), double 1320Hz on tripwire cross. Toggle ALERTS to silence everything."},
-      {icon:"💥",title:"SHAKE + BURST",body:"SHAKE detects impacts via accelerometer. With BURST also on, a hard shake fires a 5-shot burst — shake-to-shoot."},
-      {icon:"⏺",title:"RECORDING",body:"● REC captures the processed view as WebM — every filter, box, trail, and label is in the video. SENTRY uses the same recorder."},
-    ],
-    tools:[
-      {icon:"📁",title:"GALLERY",body:"All captures (manual, auto, burst, sentry) with timestamps and target counts. Tap to view full-screen, ↓ to download."},
-      {icon:"🗺",title:"TACTICAL MAP",body:"Live OSM map in night-ops green: your position, accuracy ring, motion-event pins. Drag to pan, +/− zoom, ◎ recenter."},
-      {icon:"⏱",title:"EVENT LOG",body:"Timestamped feed of everything: motion, tripwires, sentry triggers, QR reads, captures. Last 200 events."},
-      {icon:"📷",title:"QR SCAN",body:"Reads QR / Code-128 / EAN-13 / DataMatrix from the live view (Chrome Android). Result shows inline and logs."},
-      {icon:"📄",title:"SESSION REPORT",body:"Downloads a .txt report: mode, GPS, altitude, pressure, full event log, capture list, tripwire inventory."},
-      {icon:"📊",title:"SENSORS",body:"Live readout: GPS, altitude, barometric pressure, compass, wind, heart rate, torch, zoom, shake count, totals."},
-      {icon:"❤️",title:"rPPG HEART RATE",body:"Fingertip over the rear lens with torch on → BPM in ~8s via Goertzel frequency analysis with Hamming windowing. Shows signal quality % and an estimated SpO2 proxy. Hold still; quality above 50% is reliable."},
-      {icon:"🧭",title:"GPS BREADCRUMB TRACK",body:"Your movement path is logged (3m resolution, last 500 points) and drawn as a dashed trail on the map with total distance. Speed and heading appear in the HUD when moving."},
-      {icon:"📊",title:"CSV EXPORT",body:"Event Log → ↓ CSV exports every event with ISO timestamp, type, label, GPS coords, and confidence for spreadsheet analysis."},
-      {icon:"🗂",title:"GALLERY BULK ACTIONS",body:"↓ ALL downloads every capture in sequence. CLEAR wipes the gallery. Filter chips in the Event Log narrow by event type."},
-      {icon:"🔦",title:"TORCH / HW ZOOM",body:"TORCH drives the phone flashlight. HW ZOOM exposes true optical/sensor zoom via slider where the device supports it."},
-    ],
-    voice:[
-      {icon:"🎤",title:"ENABLE VOICE",body:"Toggle 🎤 VOICE and allow the mic. 🎤VOX blinks in the header while listening. Recognized commands flash as »COMMAND."},
-      {icon:"🗣",title:"MODE COMMANDS",body:'"night vision" · "thermal" · "raw" · "astro" · "tactical" · "dehaze" · "polarize" · "rainbow" · "arctic" · "white hot" · "fusion"'},
-      {icon:"📸",title:"CAPTURE COMMANDS",body:'"capture" · "burst" · "record" · "auto capture" · "scan code" · "report"'},
-      {icon:"⚙️",title:"SYSTEM COMMANDS",body:'"torch" · "zoom in" · "zoom out" · "gain up" · "gain down" · "sentry on" · "sentry off" · "heat map" · "silence"'},
-      {icon:"📂",title:"NAVIGATION COMMANDS",body:'"show map" · "show log" · "gallery" · "sensors" · "close"'},
-      {icon:"🔗",title:"SAME-DEVICE SYNC",body:"SYNC links tabs on the same device via BroadcastChannel — motion alerts propagate between them. Cross-device: open the URL on each device independently; WebRTC streaming is planned."},
-      {icon:"⚠️",title:"BROWSER SUPPORT",body:"Voice uses Web Speech API — best on Chrome (Android/desktop) and iOS Safari 16+. If 🎤VOX never appears, the browser lacks speech recognition."},
-    ],
-  };
-  return(
-    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.97)",zIndex:200,display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease"}}>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0}}>
-        <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>NVS-11.0 OPERATOR MANUAL</span>
-        <button onClick={onClose} style={{padding:"6px 12px",background:"transparent",border:`1px solid ${color}30`,borderRadius:4,color:`${color}70`,fontFamily:"'DM Mono',monospace",fontSize:9,letterSpacing:2,cursor:"pointer"}}>CLOSE</button>
-      </div>
-      <div style={{display:"flex",gap:4,padding:"8px 12px",borderBottom:`1px solid ${color}10`,flexShrink:0,overflowX:"auto"}}>
-        {Object.entries(tabs).map(([k,label])=>(
-          <button key={k} onClick={()=>setTab(k)} style={{padding:"8px 12px",whiteSpace:"nowrap",
-            background:tab===k?`${color}12`:"transparent",border:`1px solid ${tab===k?color:`${color}20`}`,
-            borderRadius:5,fontSize:8,letterSpacing:1,color:tab===k?color:`${color}45`,
-            fontFamily:"'DM Mono',monospace",cursor:"pointer",fontWeight:tab===k?700:400}}>
-            {label}
-          </button>
-        ))}
-      </div>
-      <div style={{flex:1,overflowY:"auto",padding:"12px 14px",display:"flex",flexDirection:"column",gap:10}}>
-        {content[tab].map((item,i)=>(
-          <div key={i} style={{display:"flex",gap:12,padding:"12px",border:`1px solid ${color}12`,borderRadius:7,background:`${color}04`}}>
-            <span style={{fontSize:18,flexShrink:0,lineHeight:1}}>{item.icon}</span>
-            <div style={{display:"flex",flexDirection:"column",gap:4}}>
-              <span style={{fontFamily:"'DM Mono',monospace",fontSize:10,fontWeight:700,color,letterSpacing:1.5}}>{item.title}</span>
-              <span style={{fontFamily:"'DM Mono',monospace",fontSize:9,color:`${color}75`,lineHeight:1.65}}>{item.body}</span>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// Tile helpers for OSM slippy map
-function latLonToTile(lat,lon,z){
-  const n=Math.pow(2,z);
-  const x=Math.floor((lon+180)/360*n);
-  const y=Math.floor((1-Math.log(Math.tan(lat*Math.PI/180)+1/Math.cos(lat*Math.PI/180))/Math.PI)/2*n);
-  return{x,y,z};
-}
-function tileToLatLon(tx,ty,z){
-  const n=Math.pow(2,z);
-  const lon=tx/n*360-180;
-  const latRad=Math.atan(Math.sinh(Math.PI*(1-2*ty/n)));
-  return{lat:latRad*180/Math.PI,lon};
-}
-
-function GPSMap({pos,events,track=[],color,onClose}){
-  const mapRef=useRef(null);
-  const canvasRef=useRef(null);
-  const[zoom,setZoom]=useState(16);
-  const[center,setCenter]=useState(null);
-  const[pins,setPins]=useState([]);
-  const trackDist=useMemo(()=>{
-    if(!track||track.length<2)return 0;
-    let d=0;
-    for(let i=1;i<track.length;i++){
-      const a=track[i-1],b=track[i];
-      d+=Math.hypot((b.lat-a.lat)*111320,(b.lon-a.lon)*111320*Math.cos(b.lat*Math.PI/180));
-    }
-    return d;
-  },[track]);
-  const tileCache=useRef({});
-  const dragging=useRef(null);
-  const centerRef=useRef(null);
-
-  // sync center ref
-  useEffect(()=>{centerRef.current=center;},[center]);
-
-  // init center from GPS
-  useEffect(()=>{
-    if(pos&&!center)setCenter({lat:pos.lat,lon:pos.lon});
-  },[pos]);// eslint-disable-line
-
-  // update pins from events
-  useEffect(()=>{
-    const m=events.filter(e=>e.type==="motion"&&e.data?.lat).slice(0,50);
-    setPins(m.map(e=>({lat:e.data.lat,lon:e.data.lon,label:e.data.label||"MOT"})));
-  },[events]);
-
-  const draw=useCallback(()=>{
-    const c=canvasRef.current;
-    if(!c)return;
-    const ctr=centerRef.current;
-    const ctx=c.getContext("2d");
-    const W=c.parentElement?.clientWidth||window.innerWidth;
-    const H=c.parentElement?.clientHeight||400;
-    c.width=W;c.height=H;
-    ctx.fillStyle="#0a0f0a";ctx.fillRect(0,0,W,H);
-
-    if(!ctr){
-      ctx.fillStyle=color;ctx.font="bold 11px DM Mono,monospace";ctx.textAlign="center";
-      ctx.fillText("GPS ACQUIRING...",W/2,H/2-8);
-      ctx.font="9px DM Mono,monospace";ctx.fillStyle=`${color}60`;
-      ctx.fillText("Allow location permission",W/2,H/2+10);
-      return;
-    }
-
-    // tile size in pixels
-    const TILE=256;
-    const z=zoom;
-    const cTile=latLonToTile(ctr.lat,ctr.lon,z);
-    // pixel offset of center within its tile
-    const n=Math.pow(2,z);
-    const cx_exact=(ctr.lon+180)/360*n;
-    const cy_exact=(1-Math.log(Math.tan(ctr.lat*Math.PI/180)+1/Math.cos(ctr.lat*Math.PI/180))/Math.PI)/2*n;
-    const offX=(cx_exact-cTile.x)*TILE;
-    const offY=(cy_exact-cTile.y)*TILE;
-
-    // how many tiles needed
-    const tilesX=Math.ceil(W/TILE)+2;
-    const tilesY=Math.ceil(H/TILE)+2;
-    const startTX=cTile.x-Math.floor(tilesX/2);
-    const startTY=cTile.y-Math.floor(tilesY/2);
-
-    // draw tiles
-    for(let ty=0;ty<tilesY;ty++){
-      for(let tx=0;tx<tilesX;tx++){
-        const tileX=((startTX+tx)%n+n)%n;
-        const tileY=startTY+ty;
-        if(tileY<0||tileY>=n)continue;
-        const px=W/2-offX+(tx-Math.floor(tilesX/2))*TILE;
-        const py=H/2-offY+(ty-Math.floor(tilesY/2))*TILE;
-        const key=`${z}/${tileX}/${tileY}`;
-        if(tileCache.current[key]&&tileCache.current[key].complete){
-          ctx.drawImage(tileCache.current[key],px,py,TILE,TILE);
-          // NVG green tint over tile
-          ctx.fillStyle="rgba(0,30,0,0.55)";ctx.fillRect(px,py,TILE,TILE);
-          // green channel boost via globalCompositeOperation already applied above
-        } else if(!tileCache.current[key]){
-          const img=new Image();img.crossOrigin="anonymous";
-          img.src=`https://tile.openstreetmap.org/${z}/${tileX}/${tileY}.png`;
-          img.onload=()=>draw();
-          tileCache.current[key]=img;
-          ctx.fillStyle="#0a120a";ctx.fillRect(px,py,TILE,TILE);
-          ctx.strokeStyle="rgba(0,255,80,0.06)";ctx.strokeRect(px,py,TILE,TILE);
-        } else {
-          ctx.fillStyle="#0a120a";ctx.fillRect(px,py,TILE,TILE);
-        }
-      }
-    }
-
-    // Grid overlay
-    ctx.strokeStyle="rgba(0,255,80,0.07)";ctx.lineWidth=1;
-    for(let x=0;x<W;x+=60){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}
-    for(let y=0;y<H;y+=60){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
-
-    // lat/lon to pixel helper
-    const toScreen=(lat,lon)=>{
-      const lx=(lon+180)/360*n;
-      const ly=(1-Math.log(Math.tan(lat*Math.PI/180)+1/Math.cos(lat*Math.PI/180))/Math.PI)/2*n;
-      return{x:W/2+(lx-cx_exact)*TILE,y:H/2+(ly-cy_exact)*TILE};
-    };
-
-    // Breadcrumb track (movement history)
-    if(track&&track.length>1){
-      ctx.strokeStyle=color;ctx.globalAlpha=0.5;ctx.lineWidth=2;ctx.setLineDash([6,4]);
-      ctx.beginPath();
-      track.forEach((p,i)=>{const s=toScreen(p.lat,p.lon);i?ctx.lineTo(s.x,s.y):ctx.moveTo(s.x,s.y);});
-      ctx.stroke();ctx.setLineDash([]);ctx.globalAlpha=1;
-      // start marker
-      const s0=toScreen(track[0].lat,track[0].lon);
-      ctx.beginPath();ctx.arc(s0.x,s0.y,4,0,Math.PI*2);
-      ctx.fillStyle=`${color}90`;ctx.fill();
-    }
-
-    // Motion pins
-    for(const pin of pins){
-      const{x,y}=toScreen(pin.lat,pin.lon);
-      ctx.beginPath();ctx.arc(x,y,5,0,Math.PI*2);
-      ctx.fillStyle="#ff5500";ctx.fill();
-      ctx.beginPath();ctx.arc(x,y,10,0,Math.PI*2);
-      ctx.strokeStyle="rgba(255,85,0,0.5)";ctx.lineWidth=1;ctx.stroke();
-      ctx.fillStyle="#ff8800";ctx.font="bold 8px DM Mono,monospace";ctx.textAlign="left";
-      ctx.fillText(pin.label,x+7,y+3);
-    }
-
-    // GPS position dot (live)
-    if(pos){
-      const{x,y}=toScreen(pos.lat,pos.lon);
-      // Accuracy circle
-      if(pos.acc){
-        const metersPerPx=156543.03392*Math.cos(pos.lat*Math.PI/180)/Math.pow(2,z);
-        const r=Math.min(80,(pos.acc/metersPerPx));
-        ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);
-        ctx.fillStyle="rgba(0,255,80,0.07)";ctx.fill();
-        ctx.strokeStyle="rgba(0,255,80,0.25)";ctx.lineWidth=1;ctx.setLineDash([3,4]);ctx.stroke();ctx.setLineDash([]);
-      }
-      // Outer ring pulse
-      ctx.beginPath();ctx.arc(x,y,14,0,Math.PI*2);
-      ctx.strokeStyle=`${color}60`;ctx.lineWidth=1.5;ctx.stroke();
-      // Inner dot
-      ctx.beginPath();ctx.arc(x,y,6,0,Math.PI*2);
-      ctx.fillStyle=color;ctx.shadowColor=color;ctx.shadowBlur=12;ctx.fill();
-      ctx.shadowBlur=0;
-      // You-are-here label
-      ctx.fillStyle=color;ctx.font="bold 8px DM Mono,monospace";ctx.textAlign="center";
-      ctx.fillText("YOU",x,y-18);
-    }
-
-    // Crosshair center
-    ctx.strokeStyle=`${color}30`;ctx.lineWidth=1;
-    ctx.beginPath();ctx.moveTo(W/2-20,H/2);ctx.lineTo(W/2+20,H/2);ctx.stroke();
-    ctx.beginPath();ctx.moveTo(W/2,H/2-20);ctx.lineTo(W/2,H/2+20);ctx.stroke();
-
-    // Coords footer
-    ctx.fillStyle=`${color}80`;ctx.font="9px DM Mono,monospace";ctx.textAlign="left";
-    ctx.fillText(`${ctr.lat.toFixed(5)}°N  ${ctr.lon.toFixed(5)}°W`,8,H-8);
-    ctx.textAlign="right";
-    ctx.fillText(`Z${z}`,W-8,H-8);
-  },[zoom,pins,pos,color,track]);
-
-  // Redraw on any change
-  useEffect(()=>{draw();},[draw,center]);
-
-  // ResizeObserver so canvas fills container correctly
-  useEffect(()=>{
-    const el=canvasRef.current?.parentElement;
-    if(!el)return;
-    const ro=new ResizeObserver(()=>draw());
-    ro.observe(el);
-    return()=>ro.disconnect();
-  },[draw]);
-
-  // Touch/mouse pan
-  const onPointerDown=e=>{
-    dragging.current={x:e.clientX,y:e.clientY,center:{...centerRef.current}};
-  };
-  const onPointerMove=e=>{
-    if(!dragging.current)return;
-    const dx=e.clientX-dragging.current.x;
-    const dy=e.clientY-dragging.current.y;
-    const n=Math.pow(2,zoom);
-    const metersPerPx=156543.03392*Math.cos(dragging.current.center.lat*Math.PI/180)/Math.pow(2,zoom);
-    const degPerPx=metersPerPx/111320;
-    const newLat=dragging.current.center.lat+dy*degPerPx;
-    const newLon=dragging.current.center.lon-dx*degPerPx*Math.cos(dragging.current.center.lat*Math.PI/180);
-    setCenter({lat:newLat,lon:newLon});
-  };
-  const onPointerUp=()=>{dragging.current=null;};
-
-  return(
-    <div style={{position:"fixed",inset:0,background:"#0a0f0a",zIndex:200,
-      display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease"}}>
-      {/* Header */}
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
-        padding:"8px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0,
-        background:"rgba(0,0,0,0.8)"}}>
-        <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>
-          GPS TACTICAL MAP
-        </span>
-        <div style={{display:"flex",gap:8,alignItems:"center"}}>
-          {pos&&<span style={{fontSize:7,color:`${color}60`,fontFamily:"'DM Mono',monospace",letterSpacing:1}}>
-            {pos.lat.toFixed(4)}°N {pos.lon.toFixed(4)}°W ±{pos.acc?.toFixed(0)}m
-          </span>}
-          {/* Zoom controls */}
-          <button onClick={()=>setZoom(z=>Math.min(19,z+1))} style={{width:24,height:24,background:`${color}15`,
-            border:`1px solid ${color}40`,borderRadius:2,color,fontSize:14,cursor:"pointer",lineHeight:1}}>+</button>
-          <span style={{fontSize:8,color:`${color}70`,fontFamily:"'DM Mono',monospace",minWidth:20,textAlign:"center"}}>Z{zoom}</span>
-          <button onClick={()=>setZoom(z=>Math.max(2,z-1))} style={{width:24,height:24,background:`${color}15`,
-            border:`1px solid ${color}40`,borderRadius:2,color,fontSize:14,cursor:"pointer",lineHeight:1}}>−</button>
-          {pos&&<button onClick={()=>setCenter({lat:pos.lat,lon:pos.lon})} style={{padding:"2px 8px",background:`${color}10`,
-            border:`1px solid ${color}30`,borderRadius:2,color:`${color}90`,
-            fontFamily:"'DM Mono',monospace",fontSize:7,letterSpacing:1,cursor:"pointer"}}>
-            ◎ CTR
-          </button>}
-          <button onClick={onClose} style={{padding:"4px 10px",background:"transparent",
-            border:`1px solid ${color}30`,borderRadius:2,color:`${color}70`,
-            fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:2,cursor:"pointer"}}>
-            ✕
-          </button>
-        </div>
-      </div>
-      {/* Map canvas */}
-      <div style={{flex:1,position:"relative",overflow:"hidden",cursor:"grab"}}
-        onPointerDown={onPointerDown} onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp} onPointerLeave={onPointerUp}>
-        <canvas ref={canvasRef} style={{display:"block",width:"100%",height:"100%"}}/>
-      </div>
-      {/* Footer */}
-      <div style={{padding:"5px 14px",borderTop:`1px solid ${color}10`,
-        display:"flex",justifyContent:"space-between",background:"rgba(0,0,0,0.8)",flexShrink:0}}>
-        <span style={{fontFamily:"'DM Mono',monospace",fontSize:7,color:`${color}40`,letterSpacing:1}}>
-          🟠 {pins.length} PINS • {trackDist>0?`${trackDist<1000?Math.round(trackDist)+"m":(trackDist/1000).toFixed(2)+"km"} TRACK • `:""}DRAG TO PAN
-        </span>
-        <span style={{fontFamily:"'DM Mono',monospace",fontSize:7,color:`${color}25`,letterSpacing:1}}>
-          OSM TILES
-        </span>
-      </div>
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// TIMELINE MODAL
-// ═══════════════════════════════════════════════════════════════════════════════
-function TimelineModal({events,captures,color,onClose}){
-  const[filter,setFilter]=useState("all");
-  const types=useMemo(()=>{
-    const t={};events.forEach(e=>{t[e.type]=(t[e.type]||0)+1;});
-    return t;
-  },[events]);
-  const shown=useMemo(()=>filter==="all"?events:events.filter(e=>e.type===filter),[events,filter]);
-  const ICON={motion:"🎯",tripwire:"⚡",sentry:"🛡",qr:"📷",export:"📄",capture:"📸"};
-  const exportCSV=()=>{
-    const rows=[["timestamp","type","label","lat","lon","confidence"]];
-    events.forEach(e=>rows.push([
-      new Date(e.ts).toISOString(),e.type,
-      (e.data?.label||"").replace(/,/g,";"),
-      e.data?.lat??"",e.data?.lon??"",e.data?.conf??""]));
-    const csv=rows.map(r=>r.join(",")).join("\n");
-    const url=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
-    const a=document.createElement("a");
-    a.href=url;a.download=`nvs-events-${Date.now()}.csv`;a.click();
-    URL.revokeObjectURL(url);
-  };
-  return(
-    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.97)",zIndex:200,display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease"}}>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0}}>
-        <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>EVENT LOG</span>
-        <div style={{display:"flex",gap:6}}>
-          <button onClick={exportCSV} style={{padding:"6px 12px",background:"transparent",border:`1px solid ${color}30`,borderRadius:4,color:`${color}70`,fontFamily:"'DM Mono',monospace",fontSize:9,letterSpacing:1,cursor:"pointer"}}>↓ CSV</button>
-          <button onClick={onClose} style={{padding:"6px 12px",background:"transparent",border:`1px solid ${color}30`,borderRadius:4,color:`${color}70`,fontFamily:"'DM Mono',monospace",fontSize:9,letterSpacing:2,cursor:"pointer"}}>CLOSE</button>
-        </div>
-      </div>
-      <div style={{display:"flex",gap:5,padding:"8px 12px",borderBottom:`1px solid ${color}10`,overflowX:"auto",flexShrink:0}}>
-        {[["all",`ALL ${events.length}`],...Object.entries(types).map(([t,c])=>[t,`${ICON[t]||"•"} ${t.toUpperCase()} ${c}`])].map(([k,label])=>(
-          <button key={k} onClick={()=>setFilter(k)} style={{padding:"6px 10px",whiteSpace:"nowrap",
-            background:filter===k?`${color}12`:"transparent",border:`1px solid ${filter===k?color:`${color}20`}`,
-            borderRadius:5,fontSize:8,color:filter===k?color:`${color}45`,fontFamily:"'DM Mono',monospace",cursor:"pointer"}}>
-            {label}
-          </button>
-        ))}
-      </div>
-      <div style={{flex:1,overflowY:"auto",padding:"8px 12px",display:"flex",flexDirection:"column",gap:4}}>
-        {shown.length===0&&<div style={{padding:24,textAlign:"center",fontFamily:"'DM Mono',monospace",fontSize:9,color:`${color}40`}}>NO EVENTS</div>}
-        {shown.map((e,i)=>(
-          <div key={i} style={{display:"flex",gap:10,alignItems:"flex-start",padding:"8px 10px",border:`1px solid ${color}10`,borderRadius:5,background:`${color}03`}}>
-            <span style={{fontSize:13,flexShrink:0}}>{e.data?.icon||ICON[e.type]||"•"}</span>
-            <div style={{flex:1,display:"flex",flexDirection:"column",gap:2}}>
-              <span style={{fontFamily:"'DM Mono',monospace",fontSize:9,color:`${color}90`,lineHeight:1.4}}>{e.data?.label||e.type}</span>
-              <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-                <span style={{fontFamily:"'DM Mono',monospace",fontSize:7,color:`${color}45`}}>
-                  {new Date(e.ts).toLocaleTimeString("en-US",{hour12:false})}
-                </span>
-                {e.data?.conf&&<span style={{fontSize:7,color:`${color}40`}}>{e.data.conf}%</span>}
-                {e.data?.lat&&<span style={{fontSize:7,color:`${color}40`}}>📍{e.data.lat.toFixed(4)}</span>}
-              </div>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function TripwireEditor({tripwires,onUpdate,color,onClose}){
-  const[drawing,setDrawing]=useState(false);
-  const[current,setCurrent]=useState([]);
-  const svgRef=useRef(null);
-  const handleSVGClick=e=>{
-    if(!drawing)return;
-    const rect=svgRef.current.getBoundingClientRect();
-    const x=((e.clientX-rect.left)/rect.width)*100;
-    const y=((e.clientY-rect.top)/rect.height)*100;
-    setCurrent(p=>[...p,{x,y}]);
-  };
-  const finishWire=()=>{
-    if(current.length<2){setDrawing(false);setCurrent([]);return;}
-    const id=Date.now().toString();
-    onUpdate([...tripwires,{id,label:`ZONE-${tripwires.length+1}`,points:current,triggered:false}]);
-    setDrawing(false);setCurrent([]);
-  };
-  return(
-    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.97)",zIndex:200,
-      display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease"}}>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
-        padding:"10px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0}}>
-        <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>
-          TRIPWIRE EDITOR
-        </span>
-        <div style={{display:"flex",gap:6}}>
-          {!drawing?(
-            <button onClick={()=>setDrawing(true)} style={{padding:"4px 10px",background:`${color}10`,
-              border:`1px solid ${color}`,borderRadius:2,color,
-              fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:1,cursor:"pointer"}}>
-              + DRAW
-            </button>
-          ):(
-            <button onClick={finishWire} style={{padding:"4px 10px",background:"rgba(0,255,80,0.15)",
-              border:"1px solid #00ff50",borderRadius:2,color:"#00ff50",
-              fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:1,cursor:"pointer"}}>
-              ✓ DONE ({current.length}pts)
-            </button>
-          )}
-          {tripwires.length>0&&(
-            <button onClick={()=>onUpdate([])} style={{padding:"4px 10px",background:"transparent",
-              border:"1px solid rgba(255,50,50,0.4)",borderRadius:2,color:"rgba(255,50,50,0.7)",
-              fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:1,cursor:"pointer"}}>
-              CLR ALL
-            </button>
-          )}
-          <button onClick={onClose} style={{padding:"4px 10px",background:"transparent",
-            border:`1px solid ${color}30`,borderRadius:2,color:`${color}70`,
-            fontFamily:"'DM Mono',monospace",fontSize:8,letterSpacing:2,cursor:"pointer"}}>
-            CLOSE
-          </button>
-        </div>
-      </div>
-      <div style={{flex:1,position:"relative",background:"#0a0f0a"}}>
-        <svg ref={svgRef} onClick={handleSVGClick}
-          style={{width:"100%",height:"100%",cursor:drawing?"crosshair":"default"}}>
-          {/* Grid */}
-          <defs>
-            <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
-              <path d="M 40 0 L 0 0 0 40" fill="none" stroke="rgba(0,255,80,0.06)" strokeWidth="1"/>
-            </pattern>
-          </defs>
-          <rect width="100%" height="100%" fill="url(#grid)"/>
-          {/* Existing wires */}
-          {tripwires.map(tw=>(
-            <g key={tw.id}>
-              {tw.points.length>1&&(
-                <polyline
-                  points={tw.points.map(p=>`${p.x}%,${p.y}%`).join(" ")}
-                  fill="none" stroke={tw.triggered?"#ff2222":"#ffcc00"} strokeWidth="2"
-                  strokeDasharray="6,4"/>
-              )}
-              {tw.points.map((p,i)=>(
-                <circle key={i} cx={`${p.x}%`} cy={`${p.y}%`} r="4"
-                  fill={tw.triggered?"#ff2222":"#ffcc00"} opacity="0.8"/>
-              ))}
-              {tw.points.length>0&&(
-                <text x={`${tw.points[0].x}%`} y={`${tw.points[0].y - 2}%`}
-                  fill="#ffcc00" fontSize="9" fontFamily="DM Mono, monospace">{tw.label}</text>
-              )}
-            </g>
-          ))}
-          {/* Current drawing */}
-          {current.length>1&&(
-            <polyline points={current.map(p=>`${p.x}%,${p.y}%`).join(" ")}
-              fill="none" stroke={`${color}90`} strokeWidth="2" strokeDasharray="4,3"/>
-          )}
-          {current.map((p,i)=>(
-            <circle key={i} cx={`${p.x}%`} cy={`${p.y}%`} r="4" fill={color} opacity="0.9"/>
-          ))}
-        </svg>
-        {drawing&&(
-          <div style={{position:"absolute",bottom:14,left:"50%",transform:"translateX(-50%)",
-            fontFamily:"'DM Mono',monospace",fontSize:8,color:`${color}80`,letterSpacing:2,
-            background:"rgba(0,0,0,0.7)",padding:"4px 10px",borderRadius:2}}>
-            TAP TO ADD POINTS → TAP ✓ DONE WHEN FINISHED
-          </div>
-        )}
-      </div>
-      <div style={{padding:"8px 14px",borderTop:`1px solid ${color}10`,
-        display:"flex",gap:6,overflowX:"auto"}}>
-        {tripwires.map(tw=>(
-          <div key={tw.id} style={{display:"flex",alignItems:"center",gap:4,flexShrink:0,
-            padding:"3px 8px",border:`1px solid ${tw.triggered?"#ff2222":"#ffcc0040"}`,
-            borderRadius:2,background:tw.triggered?"rgba(255,34,34,0.1)":"transparent"}}>
-            <span style={{fontSize:7,fontFamily:"'DM Mono',monospace",
-              color:tw.triggered?"#ff2222":"#ffcc00",letterSpacing:1}}>{tw.label}</span>
-            <button onClick={()=>onUpdate(tripwires.filter(t=>t.id!==tw.id))}
-              style={{background:"transparent",border:"none",color:"rgba(255,50,50,0.6)",
-                fontSize:9,cursor:"pointer",lineHeight:1,padding:0}}>×</button>
-          </div>
-        ))}
-        {!tripwires.length&&<span style={{fontSize:7,color:`${color}30`,fontFamily:"'DM Mono',monospace",letterSpacing:1}}>
-          NO TRIPWIRES — TAP + DRAW
-        </span>}
-      </div>
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// BIOMETRIC HUD
-// ═══════════════════════════════════════════════════════════════════════════════
-function BiometricHUD({hr,audioLevel,audioSpike,color}){
-  const hrColor=!hr?"#444":hr<60?"#0088ff":hr<100?"#00ff50":hr<140?"#ffaa00":"#ff3333";
-  const hrLabel=!hr?"--":hr<60?"BRADYCARDIA":hr<100?"NORMAL":hr<140?"ELEVATED":"TACHYCARDIA";
-  return(
-    <div style={{
-      position:"absolute",bottom:50,left:"50%",transform:"translateX(-50%)",
-      zIndex:26,display:"flex",gap:10,alignItems:"flex-end",
-    }}>
-      {/* HR */}
-      <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:1,
-        padding:"4px 8px",background:"rgba(0,0,0,0.75)",border:`1px solid ${hrColor}30`,
-        borderRadius:3}}>
-        <span style={{fontSize:6,color:`${hrColor}80`,letterSpacing:1,fontFamily:"'DM Mono',monospace"}}>rPPG HR</span>
-        <span style={{fontSize:16,color:hrColor,fontFamily:"'DM Mono',monospace",fontWeight:700,lineHeight:1,
-          textShadow:`0 0 8px ${hrColor}60`}}>
-          {hr||"--"}
-        </span>
-        <span style={{fontSize:5,color:`${hrColor}70`,letterSpacing:1,fontFamily:"'DM Mono',monospace"}}>{hrLabel}</span>
-      </div>
-      {/* Audio */}
-      <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:2,
-        padding:"4px 8px",background:"rgba(0,0,0,0.75)",
-        border:`1px solid ${audioSpike?"#ff2222":"rgba(0,204,255,0.2)"}`,
-        borderRadius:3,animation:audioSpike?"rec-blink 0.3s step-end infinite":"none"}}>
-        <span style={{fontSize:6,color:"rgba(0,204,255,0.7)",letterSpacing:1,fontFamily:"'DM Mono',monospace"}}>
-          {audioSpike?"⚡ SPIKE":"AUDIO"}
-        </span>
-        <div style={{display:"flex",gap:1,alignItems:"flex-end",height:14}}>
-          {Array.from({length:8},(_,i)=>(
-            <div key={i} style={{
-              width:3,height:2+i*1.5,borderRadius:.5,
-              background:(audioLevel/255)*8>i?(audioSpike?"#ff2222":"#00ccff"):"rgba(0,204,255,0.15)",
-            }}/>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// COMMON HUD COMPONENTS
-// ═══════════════════════════════════════════════════════════════════════════════
-function Corners({color}){
-  const s={position:"absolute",width:20,height:20,opacity:.8};
-  return(<>
-    <div style={{...s,top:10,left:10,borderTop:`2px solid ${color}`,borderLeft:`2px solid ${color}`}}/>
-    <div style={{...s,top:10,right:10,borderTop:`2px solid ${color}`,borderRight:`2px solid ${color}`}}/>
-    <div style={{...s,bottom:10,left:10,borderBottom:`2px solid ${color}`,borderLeft:`2px solid ${color}`}}/>
-    <div style={{...s,bottom:10,right:10,borderBottom:`2px solid ${color}`,borderRight:`2px solid ${color}`}}/>
-  </>);
-}
-function Reticle({color}){
-  return(
-    <svg width={64} height={64} viewBox="0 0 64 64" style={{position:"absolute",top:"50%",left:"50%",transform:"translate(-50%,-50%)",pointerEvents:"none",zIndex:15}}>
-      <circle cx={32} cy={32} r={20} fill="none" stroke={color} strokeWidth={.8} opacity={.45}/>
-      <circle cx={32} cy={32} r={8} fill="none" stroke={color} strokeWidth={.5} strokeDasharray="2 3" opacity={.4}/>
-      <circle cx={32} cy={32} r={1.8} fill={color} opacity={.9}/>
-      {[[32,4,32,16],[32,48,32,60],[4,32,16,32],[48,32,60,32]].map(([x1,y1,x2,y2],i)=>
-        <line key={i} x1={x1} y1={y1} x2={x2} y2={y2} stroke={color} strokeWidth={1} opacity={.5}/>
-      )}
-    </svg>
-  );
-}
-function SignalBars({level=.8,color}){
-  return(
-    <div style={{display:"flex",gap:1,alignItems:"flex-end",height:12}}>
-      {[.2,.4,.6,.8,1].map((t,i)=>(
-        <div key={i} style={{width:3,height:3+i*2,borderRadius:.5,background:level>=t?color:`${color}20`}}/>
-      ))}
-    </div>
-  );
-}
-
-// AI Object boxes
-const THREAT_L=["CRITICAL","HIGH","MED","LOW","TRACE","TRACK","--","--"];
-const THREAT_C=["#ff2222","#ff5500","#ffaa00","#ffdd00","#aaffaa","#00ffcc","#00ccff","#aaaaaa"];
-// PIP Magnifier — 3x zoomed inset of tapped region, live
-function MagnifierPIP({source,fx,fy,color,onClose}){
-  const pipRef=useRef(null);
-  useEffect(()=>{
-    let raf;
-    const draw=()=>{
-      const src=source.current,pip=pipRef.current;
-      if(src&&pip&&src.width>0){
-        const ctx=pip.getContext("2d");
-        const MAG=3,VW=src.width/MAG,VH=src.height/MAG;
-        const sx=Math.max(0,Math.min(src.width-VW,fx*src.width-VW/2));
-        const sy=Math.max(0,Math.min(src.height-VH,fy*src.height-VH/2));
-        pip.width=300;pip.height=300*(VH/VW);
-        ctx.imageSmoothingEnabled=false;
-        ctx.drawImage(src,sx,sy,VW,VH,0,0,pip.width,pip.height);
-        // crosshair
-        ctx.strokeStyle=color;ctx.lineWidth=1;ctx.globalAlpha=0.7;
-        ctx.beginPath();ctx.moveTo(pip.width/2,0);ctx.lineTo(pip.width/2,pip.height);
-        ctx.moveTo(0,pip.height/2);ctx.lineTo(pip.width,pip.height/2);ctx.stroke();
-        ctx.globalAlpha=1;
-      }
-      raf=requestAnimationFrame(draw);
-    };
-    raf=requestAnimationFrame(draw);
-    return()=>cancelAnimationFrame(raf);
-  },[source,fx,fy,color]);
-  return(
-    <div onClick={onClose} style={{position:"absolute",top:8,right:8,zIndex:40,
-      border:`2px solid ${color}`,borderRadius:8,overflow:"hidden",
-      boxShadow:`0 0 16px ${color}50`,cursor:"pointer",width:"42%",maxWidth:220}}>
-      <canvas ref={pipRef} style={{width:"100%",display:"block"}}/>
-      <div style={{position:"absolute",top:3,left:6,fontSize:8,color,fontFamily:"'DM Mono',monospace",
-        letterSpacing:1,textShadow:"0 0 4px #000"}}>3× MAG — TAP TO CLOSE</div>
-    </div>
-  );
-}
-
-function TargetBoxes({blobs,cw,ch,color,autoCapPending}){
-  if(!blobs||!blobs.length)return null;
-  return(
-    <div style={{position:"absolute",inset:0,pointerEvents:"none",zIndex:22}}>
-      {/* Motion trails + velocity vectors */}
-      <svg style={{position:"absolute",inset:0,width:"100%",height:"100%"}} viewBox={`0 0 ${cw} ${ch}`} preserveAspectRatio="none">
-        {blobs.map((b,i)=>{
-          const tc=THREAT_C[Math.min(i,7)];
-          return(
-            <g key={`tr${b.id||i}`}>
-              {b.trail&&b.trail.length>1&&(
-                <polyline points={b.trail.map(p=>`${p.x},${p.y}`).join(" ")}
-                  fill="none" stroke={tc} strokeWidth={cw/300} strokeOpacity="0.55"
-                  strokeDasharray={`${cw/150},${cw/300}`} strokeLinecap="round"/>
-              )}
-              {(Math.abs(b.vx)>15||Math.abs(b.vy)>15)&&(
-                <line x1={b.cx} y1={b.cy}
-                  x2={b.cx+Math.max(-cw/4,Math.min(cw/4,b.vx*0.8))}
-                  y2={b.cy+Math.max(-ch/4,Math.min(ch/4,b.vy*0.8))}
-                  stroke={tc} strokeWidth={cw/250} strokeOpacity="0.85"
-                  markerEnd="url(#vhead)"/>
-              )}
-            </g>
-          );
-        })}
-        <defs>
-          <marker id="vhead" markerWidth="6" markerHeight="6" refX="4" refY="3" orient="auto">
-            <path d="M0,0 L6,3 L0,6 Z" fill="#ffdd00"/>
-          </marker>
-        </defs>
-      </svg>
-      {blobs.map((b,i)=>{
-        const x=(b.x/cw)*100,y=(b.y/ch)*100,bw=(b.w/cw)*100,bh=(b.h/ch)*100,pad=1.2;
-        const tc=THREAT_C[Math.min(i,7)],thr=THREAT_L[Math.min(i,7)];
-        const isMain=i===0;
-        return(
-          <div key={i} style={{position:"absolute",left:`${x-pad}%`,top:`${y-pad}%`,
-            width:`${bw+pad*2}%`,height:`${bh+pad*2}%`,
-            border:`${isMain?"2px":"1px"} solid ${tc}`,
-            boxShadow:`0 0 ${isMain?10:4}px ${tc}${isMain?"50":"25"}`,
-            boxSizing:"border-box",
-            animation:isMain&&autoCapPending?"lock-flash 0.3s step-end infinite":"none"}}>
-            {[[-1,-1],[1,-1],[1,1],[-1,1]].map(([sx,sy],ci)=>(
-              <div key={ci} style={{position:"absolute",width:7,height:7,
-                top:sy<0?-1:"auto",bottom:sy>0?-1:"auto",
-                left:sx<0?-1:"auto",right:sx>0?-1:"auto",
-                borderTop:sy<0?`2px solid ${tc}`:"none",borderBottom:sy>0?`2px solid ${tc}`:"none",
-                borderLeft:sx<0?`2px solid ${tc}`:"none",borderRight:sx>0?`2px solid ${tc}`:"none"}}/>
-            ))}
-            {/* AI label */}
-            {/* Object name label — positioned above box */}
-            <div style={{
-              position:"absolute",top:-38,left:0,
-              display:"flex",flexDirection:"column",gap:2,
-            }}>
-              <div style={{display:"flex",gap:3,alignItems:"center",flexWrap:"wrap"}}>
-                <span style={{
-                  fontSize:isMain?10:8,fontWeight:700,
-                  color:"#000",letterSpacing:.5,
-                  background:tc,
-                  padding:isMain?"2px 6px":"1px 4px",
-                  borderRadius:3,fontFamily:"'DM Mono',monospace",
-                  boxShadow:`0 0 8px ${tc}60`,
-                  whiteSpace:"nowrap",
-                }}>
-                  {b.icon} {b.label}{b.id?` #${b.id}`:""}
-                </span>
-                <span style={{
-                  fontSize:isMain?9:7,fontWeight:600,
-                  color:tc,background:"rgba(0,0,0,0.85)",
-                  padding:"1px 4px",borderRadius:3,
-                  fontFamily:"'DM Mono',monospace",border:`1px solid ${tc}50`,
-                }}>
-                  {b.conf}%
-                </span>
-                {isMain&&autoCapPending&&(
-                  <span style={{fontSize:8,color:"#fff",background:"rgba(255,34,34,0.9)",
-                    padding:"2px 5px",borderRadius:3,animation:"rec-blink 0.3s step-end infinite",
-                    fontFamily:"'DM Mono',monospace",fontWeight:700}}>📷</span>
-                )}
-              </div>
-              {b.dist&&(
-                <span style={{
-                  fontSize:isMain?8:7,color:`${tc}`,fontWeight:600,
-                  background:"rgba(0,0,0,0.8)",
-                  padding:"1px 5px",borderRadius:3,fontFamily:"'DM Mono',monospace",
-                  letterSpacing:1,border:`1px solid ${tc}30`,width:"fit-content",
-                }}>
-                  📏 ~{b.dist<10?b.dist.toFixed(1):Math.round(b.dist)}m
-                </span>
-              )}
-            </div>
-            <div style={{position:"absolute",top:"50%",left:"50%",width:4,height:4,borderRadius:"50%",
-              transform:"translate(-50%,-50%)",background:tc,boxShadow:`0 0 6px ${tc}`,
-              animation:"tgt-pulse 1.2s ease-in-out infinite"}}/>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-function ThermalOverlay({tempData,mode}){
-  if(!tempData||(mode!=="THERMAL"&&mode!=="RAINBOW"&&mode!=="FUSION"))return null;
-  const{hot,cold,avg,hotX,hotY}=tempData;
-  const gm={THERMAL:"linear-gradient(90deg,#000080,#800080,#ff0000,#ff8800,#ffff00,#fff)",RAINBOW:"linear-gradient(90deg,#0000ff,#00ffff,#00ff00,#ffff00,#ff0000)",FUSION:"linear-gradient(90deg,#1400ff,#8800ff,#ff4400,#ff8800,#ffe0c0)"};
-  return(
-    <div style={{position:"absolute",inset:0,pointerEvents:"none",zIndex:24}}>
-      <div style={{position:"absolute",left:`${hotX}%`,top:`${hotY}%`,transform:"translate(-50%,-50%)",zIndex:25,
-        display:"flex",flexDirection:"column",alignItems:"center",gap:2,animation:"tgt-pulse 1s ease-in-out infinite"}}>
-        <div style={{width:12,height:12,borderRadius:"50%",border:"2px solid #fff",boxShadow:"0 0 16px #ff5500,0 0 6px #fff"}}/>
-        <span style={{fontFamily:"'DM Mono',monospace",fontSize:8,color:"#fff",background:"rgba(0,0,0,0.75)",
-          padding:"1px 4px",borderRadius:2,letterSpacing:1,whiteSpace:"nowrap"}}>{hot.toFixed(1)}°C ▲</span>
-      </div>
-      <div style={{position:"absolute",bottom:14,left:"50%",transform:"translateX(-50%)",
-        display:"flex",flexDirection:"column",alignItems:"center",gap:2}}>
-        <div style={{width:100,height:7,borderRadius:3,border:"1px solid rgba(255,255,255,0.15)",background:gm[mode]||gm.THERMAL}}/>
-        <div style={{display:"flex",justifyContent:"space-between",width:100}}>
-          <span style={{fontSize:7,color:"rgba(255,255,255,0.55)",fontFamily:"'DM Mono',monospace"}}>{cold.toFixed(0)}°C</span>
-          <span style={{fontSize:7,color:"rgba(255,255,255,0.7)",fontFamily:"'DM Mono',monospace"}}>~{avg.toFixed(1)}°</span>
-          <span style={{fontSize:7,color:"#ff8800",fontFamily:"'DM Mono',monospace"}}>{hot.toFixed(0)}°C</span>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CAMERA PANEL
-// ═══════════════════════════════════════════════════════════════════════════════
-function CameraPanel({stream,ready,error,label,mode,brightness,sensitivity,edgeOverlay,
-  noiseReduction,color,zoom,showReticle,motionEnabled,autoCapture,tripwires,showRPPG,
-  onCapture,onMotionEvent,onTripwireHit,onRPPG,compact=false,tfDetect,modelReady,onRetry,heatmapOn=false,onTrackCount,starsOn=false,showHist=false,stabOn=false,srOn=false,onLoiter}){
-  const videoRef=useRef(null),rawRef=useRef(null),dispRef=useRef(null),rafRef=useRef(null);
-  const prevRef=useRef(null),motRef=useRef(null),cooldown=useRef(0),fpsRef=useRef({frames:0,last:performance.now()});
-  const stackBuf=useRef(null),stackIdx=useRef(0);
-  const lastTfRef=useRef(0);const lastMlRef=useRef(0);const expoTick=useRef(0);
-  const stabPrev=useRef(null),stabSmooth=useRef({x:0,y:0}),srBuf=useRef(null),srCount=useRef(0);
-  const loiterRef=useRef(new LoiterAnalyzer());
-  const[expo,setExpo]=useState(null);const[stars,setStars]=useState(null);
-  useEffect(()=>{srBuf.current=null;srCount.current=0;},[srOn,mode]);
-  const trackerRef=useRef(new TargetTracker());
-  const heatRef=useRef(null);
-  const[magnify,setMagnify]=useState(null);
-  const[blobs,setBlobs]=useState([]);const[motionLevel,setMotionLevel]=useState(0);
-  const[tempData,setTempData]=useState(null);const[cameraSize,setCameraSize]=useState({w:1280,h:720});
-  const[fps,setFps]=useState(0);const[flash,setFlash]=useState(false);const[autoCapPending,setAutoCapPending]=useState(false);
-  const MODE_LUT={NVG:null,THERMAL:"THERMAL",RAINBOW:"RAINBOW",FUSION:"FUSION",BLUE:null,WHITE:null,ASTRO:null};
-
-  useEffect(()=>{
-    if(!videoRef.current||!stream)return;
-    const v=videoRef.current;
-    v.srcObject=stream;
-    v.play().catch(()=>{});
-    // stall watchdog: replay after 2 stalls, full rebind after 4
-    let lastTime=-1,stallCount=0;
-    const watchdog=setInterval(()=>{
-      if(!v.srcObject)return;
-      if(v.currentTime===lastTime&&v.readyState>=2){
-        stallCount++;
-        if(stallCount===2){
-          v.play().catch(()=>{});
-        } else if(stallCount>=4){
-          stallCount=0;
-          // Hard rebind — detach and re-attach the stream
-          const s=v.srcObject;
-          v.srcObject=null;
-          requestAnimationFrame(()=>{v.srcObject=s;v.play().catch(()=>{});});
-        }
-      } else { stallCount=0; }
-      lastTime=v.currentTime;
-    },2000);
-    return()=>clearInterval(watchdog);
-  },[stream]);
-
-  const renderLoop=useCallback(()=>{
-    try{
-    const video=videoRef.current,raw=rawRef.current,disp=dispRef.current;
-    if(video&&raw&&disp){
-      const result=processFrame(video,raw,disp,
-        {mode,brightness,sensitivity,edgeOverlay,noiseReduction,lutName:MODE_LUT[mode]||null,tripwires,showRPPG},
-        {prev:prevRef,motion:motRef,stackBuf,stackIdx,heat:heatRef,heatOn:heatmapOn,expoTick,starsOn,stabOn,stabPrev,stabSmooth,srOn,srBuf,srCount}
-      );
-      if(result){
-        setCameraSize(cs=>cs.w===result.sw&&cs.h===result.sh?cs:{w:result.sw,h:result.sh});
-        if(result.expo)setExpo(result.expo);
-        if(result.starPts)setStars(result.starPts);
-        if(stabOn&&result.shift&&disp){
-          disp.style.transform=`scale(${zoom*1.08}) translate(${-result.shift.x}px,${-result.shift.y}px)`;
-        }
-        if(motionEnabled){
-          const nowMl=performance.now();
-          if(nowMl-lastMlRef.current>200){lastMlRef.current=nowMl;setMotionLevel(result.motionFrac);}
-          // TF detection: time-throttled (500ms), non-blocking, busy-guarded
-          const nowTf=performance.now();
-          if(modelReady&&tfDetect&&disp&&nowTf-lastTfRef.current>500){
-            lastTfRef.current=nowTf;
-            tfDetect(disp).then(preds=>{
-              const nowTr=performance.now();
-              if(preds&&preds.length>0){
-                const sx=result.sw/disp.width,sy=result.sh/disp.height;
-                const dets=preds.map(p=>({...p,
-                  x:p.x*sx,y:p.y*sy,w:p.w*sx,h:p.h*sy,cx:p.cx*sx,cy:p.cy*sy}));
-                const t=trackerRef.current.update(dets,nowTr).slice();setBlobs(t);onTrackCount?.(t.length);
-                const loit=loiterRef.current.update(t,nowTr);
-                if(loit.length)onLoiter?.(loit,label);
-              } else if(preds){
-                const dets=result.blobs.map(b=>({...b,...classifyBlobFallback(b,result.sw,result.sh)}));
-                const t=trackerRef.current.update(dets,nowTr).slice();setBlobs(t);onTrackCount?.(t.length);
-                const loit=loiterRef.current.update(t,nowTr);
-                if(loit.length)onLoiter?.(loit,label);
-              }
-            }).catch(()=>{});
-          } else if(!modelReady){
-            const dets=result.blobs.map(b=>({...b,...classifyBlobFallback(b,result.sw,result.sh)}));
-            const t2=trackerRef.current.update(dets,performance.now()).slice();setBlobs(t2);onTrackCount?.(t2.length);
-          }
-          const now=Date.now();
-          if(autoCapture&&result.blobs.length>0&&result.motionFrac>0.008&&now-cooldown.current>3000){
-            cooldown.current=now;setAutoCapPending(true);
-            onMotionEvent&&onMotionEvent(result.blobs[0],label);
-            setTimeout(()=>{
-              if(disp){setFlash(true);setTimeout(()=>setFlash(false),400);
-                onCapture&&onCapture(disp.toDataURL("image/png"),label,result.blobs.length,true);}
-              setAutoCapPending(false);
-            },600);
-          }
-          if(result.triggeredWires?.length)onTripwireHit&&onTripwireHit(result.triggeredWires,label);
-        }
-        if(result.tempData)setTempData(result.tempData);
-        if(showRPPG&&result.rppgVal)onRPPG&&onRPPG(result.rppgVal);
-        const fc=fpsRef.current;fc.frames++;
-        const n=performance.now();if(n-fc.last>=1000){setFps(fc.frames);fc.frames=0;fc.last=n;}
-      }
-    }
-    }catch(e){/* never let one bad frame kill the loop */}
-    rafRef.current=requestAnimationFrame(renderLoop);
-  // eslint-disable-next-line
-  },[mode,brightness,sensitivity,edgeOverlay,noiseReduction,motionEnabled,autoCapture,showRPPG,JSON.stringify(tripwires)]);
-
-  useEffect(()=>{rafRef.current=requestAnimationFrame(renderLoop);return()=>cancelAnimationFrame(rafRef.current);},[renderLoop]);
-
-  return(
-    <div style={{position:"relative",width:"100%",flex:1,minHeight:0,background:"#010801",overflow:"hidden",border:`1px solid ${color}12`}}>
-      <video ref={videoRef} muted playsInline autoPlay style={{position:"absolute",opacity:0,pointerEvents:"none",width:"100%",height:"100%",objectFit:"cover"}}/>
-      <canvas ref={rawRef} style={{display:"none"}}/>
-      <canvas ref={dispRef} data-primary={label==="REAR"?"true":undefined}
-        onClick={e=>{
-          const r=e.currentTarget.getBoundingClientRect();
-          const fx=(e.clientX-r.left)/r.width,fy=(e.clientY-r.top)/r.height;
-          setMagnify(m=>m?null:{fx,fy});
-        }}
-        style={{width:"100%",height:"100%",display:"block",
-        transform:`scale(${zoom})`,transformOrigin:"center",transition:"transform 0.15s ease",
-        imageRendering:zoom>=4?"pixelated":"auto",cursor:"crosshair"}}/>
-      {starsOn&&stars&&stars.length>0&&(
-        <svg style={{position:"absolute",inset:0,width:"100%",height:"100%",pointerEvents:"none",zIndex:21}}
-          viewBox={`0 0 ${cameraSize.w} ${cameraSize.h}`} preserveAspectRatio="none">
-          {stars.map((s,i)=>(
-            <g key={i}>
-              <circle cx={s.x} cy={s.y} r={cameraSize.w/180} fill="none" stroke="#a0d8ff" strokeWidth={cameraSize.w/700} opacity="0.8"/>
-              {i<12&&<text x={s.x+cameraSize.w/140} y={s.y-cameraSize.w/220} fill="#a0d8ff" fontSize={cameraSize.w/70} opacity="0.75" fontFamily="DM Mono,monospace">{Math.round(s.lum)}</text>}
-            </g>
-          ))}
-        </svg>
-      )}
-      {showHist&&expo&&(
-        <div style={{position:"absolute",bottom:6,left:6,zIndex:26,background:"rgba(0,0,0,0.7)",
-          border:`1px solid ${color}30`,borderRadius:5,padding:"5px 6px",display:"flex",flexDirection:"column",gap:3}}>
-          <div style={{display:"flex",alignItems:"flex-end",gap:1,height:28}}>
-            {Array.from(expo.hist).map((v,i)=>{
-              const mx=Math.max(...expo.hist)||1;
-              return <div key={i} style={{width:2,height:`${Math.max(1,(v/mx)*28)}px`,
-                background:i<3?"#4488ff":i>60?"#ff4444":color,opacity:.85}}/>;
-            })}
-          </div>
-          <span style={{fontFamily:"'DM Mono',monospace",fontSize:6,color:`${color}70`,letterSpacing:.5}}>
-            μ{Math.round(expo.mean)} ▼{(expo.clipLow*100).toFixed(0)}% ▲{(expo.clipHigh*100).toFixed(0)}%
-          </span>
-        </div>
-      )}
-      {expo&&(expo.clipLow>0.55||expo.clipHigh>0.30)&&(
-        <div style={{position:"absolute",top:6,left:"50%",transform:"translateX(-50%)",zIndex:27,
-          background:"rgba(0,0,0,0.75)",border:"1px solid rgba(255,170,0,0.5)",borderRadius:4,
-          padding:"3px 8px",fontFamily:"'DM Mono',monospace",fontSize:7,color:"#ffaa00",letterSpacing:1}}>
-          {expo.clipLow>0.55?"⚠ UNDEREXPOSED — RAISE GAIN":"⚠ OVEREXPOSED — LOWER GAIN"}
-        </div>
-      )}
-      {magnify&&<MagnifierPIP source={dispRef} fx={magnify.fx} fy={magnify.fy} color={color} onClose={()=>setMagnify(null)}/>}
-      <div style={{position:"absolute",inset:0,pointerEvents:"none",zIndex:10,overflow:"hidden"}}>
-        <div style={{position:"absolute",left:0,right:0,height:2,
-          background:`linear-gradient(180deg,transparent,${color}12,transparent)`,
-          animation:"nvg-scan 6s linear infinite"}}/>
-      </div>
-      {flash&&<div style={{position:"absolute",inset:0,zIndex:50,pointerEvents:"none",
-        background:"rgba(255,255,255,0.38)",animation:"flash-out 0.4s ease-out forwards"}}/>}
-      {ready&&(
-        <>
-          <Corners color={color}/>
-          {showReticle&&!blobs.length&&<Reticle color={color}/>}
-          <TargetBoxes blobs={blobs} cw={cameraSize.w} ch={cameraSize.h} color={color} autoCapPending={autoCapPending}/>
-          <ThermalOverlay tempData={tempData} mode={mode}/>
-          <div style={{position:"absolute",top:8,left:8,zIndex:20,display:"flex",flexDirection:"column",gap:2}}>
-            <div style={{fontSize:7,color,letterSpacing:2,padding:"1px 4px",border:`1px solid ${color}30`,background:`${color}08`,borderRadius:1}}>{label}</div>
-            <div style={{fontSize:6,color:`${color}45`,letterSpacing:1,paddingLeft:2}}>{fps}fps</div>
-            {blobs.length>0&&<div style={{fontSize:7,color:"#ff5500",letterSpacing:1,animation:"rec-blink 0.8s step-end infinite",paddingLeft:2}}>{blobs.length} TGT{blobs.length>1?"S":""}</div>}
-            {autoCapPending&&<div style={{fontSize:7,color:"#ffdd00",letterSpacing:1,paddingLeft:2,animation:"rec-blink 0.3s step-end infinite"}}>📷AUTO</div>}
-          </div>
-          {motionLevel>0.004&&(
-            <div style={{position:"absolute",bottom:8,left:8,zIndex:20,display:"flex",alignItems:"center",gap:3,
-              padding:"2px 5px",background:motionLevel>0.025?"rgba(255,30,30,0.18)":"rgba(255,165,0,0.12)",
-              border:`1px solid ${motionLevel>0.025?"#ff2222":"#ffaa00"}`,borderRadius:1}}>
-              <div style={{width:4,height:4,borderRadius:"50%",background:motionLevel>0.025?"#ff2222":"#ffaa00"}}/>
-              <span style={{fontSize:6,letterSpacing:1,fontFamily:"'DM Mono',monospace",color:motionLevel>0.025?"#ff2222":"#ffaa00"}}>
-                {motionLevel>0.025?"ALERT":"MOT"} {(motionLevel*100).toFixed(1)}%
-              </span>
-            </div>
-          )}
-          {tempData&&(mode==="THERMAL"||mode==="RAINBOW"||mode==="FUSION")&&(
-            <div style={{position:"absolute",bottom:8,right:8,zIndex:20}}>
-              <span style={{fontSize:7,color:"#ff8800",fontFamily:"'DM Mono',monospace",letterSpacing:1}}>▲{tempData.hot.toFixed(1)}°C</span>
-            </div>
-          )}
-        </>
-      )}
-      {!ready&&!error&&(
-        <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:8,zIndex:30}}>
-          <div style={{width:22,height:22,borderRadius:"50%",border:`2px solid ${color}20`,borderTop:`2px solid ${color}`,animation:"spin 1s linear infinite"}}/>
-          <span style={{fontSize:8,color:`${color}60`,letterSpacing:2}}>INIT {label}</span>
-        </div>
-      )}
-      {error&&(
-        <div onClick={onRetry} style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:10,zIndex:30,background:"rgba(0,0,0,0.92)",cursor:"pointer"}}>
-          <span style={{fontSize:28}}>📷</span>
-          <span style={{fontFamily:"'DM Mono',monospace",fontSize:11,color:error==="TAP TO START CAMERA"?color:"#ff4444",letterSpacing:2,fontWeight:700}}>
-            {error==="TAP TO START CAMERA"?"▶ TAP TO START CAMERA":`${label} OFFLINE`}
-          </span>
-          {error!=="TAP TO START CAMERA"&&(
-            <span style={{fontSize:8,color:"rgba(255,100,100,0.6)",textAlign:"center",maxWidth:220,letterSpacing:.5,fontFamily:"'DM Mono',monospace"}}>
-              {error.toLowerCase().includes("denied")?"ALLOW CAMERA IN BROWSER SETTINGS, THEN TAP":error.slice(0,60).toUpperCase()}
-            </span>
-          )}
-          <span style={{fontSize:8,color:`${color}70`,letterSpacing:2,border:`1px solid ${color}40`,padding:"6px 16px",borderRadius:6,fontFamily:"'DM Mono',monospace"}}>
-            ↻ RETRY
-          </span>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CONSTANTS
-// ═══════════════════════════════════════════════════════════════════════════════
-const MODE_META={
-  RAW:    {label:"RAW",    color:"#ffffff"},
-  NVG:    {label:"NVG",    color:"#00ff50"},
-  THERMAL:{label:"THERMAL",color:"#ff5500"},
-  RAINBOW:{label:"RAINBOW",color:"#00ccff"},
-  FUSION: {label:"FUSION", color:"#cc44ff"},
-  BLUE:   {label:"ARCTIC", color:"#0088ff"},
-  WHITE:  {label:"WHT-HOT",color:"#dddddd"},
-  TACT:   {label:"TACT",   color:"#f0e060"},
-  HAZE:   {label:"DEHAZE", color:"#60d0ff"},
-  POLAR:  {label:"POLARIZ",color:"#ff60d0"},
-  ASTRO:  {label:"ASTRO",  color:"#a0b8ff"},
-};
-const MODE_KEYS=Object.keys(MODE_META);
-const ZOOM_STEPS=[1,1.5,2,3,4,6,8,12];
-const PEER_ID=Math.random().toString(36).slice(2,10);
+import{useTFDetector}from"./part1.jsx";
+import{
+  useClock,useDeviceOrientation,useGPS,useMicrophone,useRPPG,useTorch,useShake,
+  useWindSpeed,useBarometer,useHardwareZoom,useCameraStream,useWakeLock,useBattery,
+  useVoiceControl,useThreatBeep,dbAll,dbClear,dbPut,dbDel,dbUsage,useGeofence,useSessionStats,
+  usePanorama,
+}from"./part2.jsx";
+import{useMultiSync,useTimeline,genCastCode,useCastBroadcast}from"./part3.jsx";
+import{GPSMap,TimelineModal,TripwireEditor,InstructionsModal,BiometricHUD,CastModal}from"./part4.jsx";
+import{CameraPanel,SignalBars}from"./part5.jsx";
+import{MODE_META,MODE_KEYS,ZOOM_STEPS,PEER_ID,Bezel,SectionLabel,BootSequence}from"./part6.jsx";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // MAIN APP
 // ═══════════════════════════════════════════════════════════════════════════════
 export default function NightVisionCamera(){
+  const[booted,setBooted]=useState(false);
+  const[openGroups,setOpenGroups]=useState({vision:false,detect:false,alert:false,system:false});
+  const cycleMode=useCallback(d=>setMode(m=>{
+    const i=MODE_KEYS.indexOf(m);
+    return MODE_KEYS[(i+d+MODE_KEYS.length)%MODE_KEYS.length];
+  }),[]);
+  const applyPreset=useCallback(name=>{
+    const P={
+      SURVEIL:{mode:"NVG",brightness:1.125,sensitivity:0.7,motionEnabled:true,autoCapture:true,
+        sentryOn:true,alertsOn:true,heatmapOn:true,stabOn:true,noiseReduction:true,
+        edgeOverlay:false,srOn:false,starsOn:false,showRPPG:false,zoom:1},
+      RECON:{mode:"TACT",brightness:0,sensitivity:0.5,motionEnabled:true,autoCapture:false,
+        sentryOn:false,alertsOn:false,heatmapOn:false,stabOn:true,noiseReduction:false,
+        edgeOverlay:true,srOn:false,starsOn:false,showRPPG:false,zoom:2},
+      ASTRO:{mode:"ASTRO",brightness:1.5,sensitivity:0.3,motionEnabled:false,autoCapture:false,
+        sentryOn:false,alertsOn:false,heatmapOn:false,stabOn:true,noiseReduction:true,
+        edgeOverlay:false,srOn:true,starsOn:true,showRPPG:false,zoom:1},
+      SEARCH:{mode:"WHITE",brightness:0.75,sensitivity:0.8,motionEnabled:true,autoCapture:true,
+        sentryOn:false,alertsOn:true,heatmapOn:false,stabOn:true,noiseReduction:true,
+        edgeOverlay:true,srOn:false,starsOn:false,showRPPG:false,zoom:1},
+    }[name];
+    if(!P)return;
+    setMode(P.mode);setBrightness(P.brightness);setSensitivity(P.sensitivity);
+    setMotionEnabled(P.motionEnabled);setAutoCapture(P.autoCapture);setSentryOn(P.sentryOn);
+    setAlertsOn(P.alertsOn);setHeatmapOn(P.heatmapOn);setStabOn(P.stabOn);
+    setNoiseReduction(P.noiseReduction);setEdgeOverlay(P.edgeOverlay);setSrOn(P.srOn);
+    setStarsOn(P.starsOn);setShowRPPG(P.showRPPG);setZoom(P.zoom);
+    setActivePreset(name);
+    addEvent("preset",{label:`PRESET LOADED — ${name}`,icon:"⚡"});
+  },[addEvent]);
+  const[activePreset,setActivePreset]=useState(null);
+  const[stealth,setStealth]=useState(false);
+  const[redUI,setRedUI]=useState(false);
+
+  const bumpGain=useCallback(d=>setBrightness(b=>Math.max(-1.5,Math.min(1.5,b+d*0.375))),[]);
   const[mode,setMode]=useState("NVG");
   const[zoom,setZoom]=useState(1);
   const[brightness,setBrightness]=useState(0);
@@ -2513,6 +81,8 @@ export default function NightVisionCamera(){
   const[showRPPG,setShowRPPG]=useState(false);
   const[audioEnabled,setAudioEnabled]=useState(false);
   const[multiSync,setMultiSync]=useState(false);
+  const[castOn,setCastOn]=useState(false);
+  const[castCode,setCastCode]=useState(null);
   const[modal,setModal]=useState(null);
   const[rppgSample,setRppgSample]=useState(0);
   const[faceDetect,setFaceDetect]=useState(false);
@@ -2530,6 +100,9 @@ export default function NightVisionCamera(){
   const{level:audioLevel,spike:audioSpike,peakFreq}=useMicrophone(audioEnabled,micAnalyserRef);
   const{hr,quality:hrQ,spo2}=useRPPG(showRPPG?rppgSample:null);
   const{peers,alerts:syncAlerts,broadcast}=useMultiSync(multiSync,PEER_ID);
+  const{viewers:castViewers,status:castStatus}=useCastBroadcast(castOn,castCode);
+  const startCast=useCallback(()=>{setCastCode(genCastCode());setCastOn(true);},[]);
+  const stopCast=useCallback(()=>setCastOn(false),[]);
   const{events,add:addEvent}=useTimeline();
   useEffect(()=>{ // hydrate events from vault once
     (async()=>{const ev=await dbAll("events");
@@ -2570,7 +143,7 @@ export default function NightVisionCamera(){
     if(alertsOnRef.current)beepRef.current?.("alert");
   },[addEvent]);
   const alertsOnRef=useRef(true),beepRef=useRef(null);
-  useEffect(()=>{panoRef.current=pano;geoRef.current=geo;});
+  useEffect(()=>{panoRef.current=pano;geoRef.current=geo;presetRef.current=applyPreset;});
   const sentryRecUntil=useRef(0);
   const[alertsOn,setAlertsOn]=useState(true);
   const{listening,lastCmd}=useVoiceControl(voiceOn,{
@@ -2608,18 +181,24 @@ export default function NightVisionCamera(){
     "stars":()=>setStarsOn(s=>!s),
     "histogram":()=>setShowHist(h=>!h),
     "clips":()=>setModal("clips"),
+    "surveillance mode":()=>presetRef.current?.("SURVEIL"),
+    "recon mode":()=>presetRef.current?.("RECON"),
+    "astro mode":()=>presetRef.current?.("ASTRO"),
+    "search mode":()=>presetRef.current?.("SEARCH"),
+    "stealth":()=>setStealth(true),
+    "night safe":()=>setRedUI(r=>!r),
     "stabilize":()=>setStabOn(s=>!s),
     "super resolution":()=>setSrOn(s=>!s),
     "drop anchor":()=>geoRef.current?.drop(),
     "clear anchor":()=>geoRef.current?.clear(),
     "panorama":()=>{const cv=document.querySelector("canvas[data-primary='true']");if(cv)panoRef.current?.add(cv.toDataURL("image/jpeg",0.85));},
   });
-  const panoRef=useRef(null),geoRef=useRef(null);
+  const panoRef=useRef(null),geoRef=useRef(null),presetRef=useRef(null);
   const manualSnapRef=useRef(null),burstSnapRef=useRef(null),toggleRecordRef=useRef(null);
   const recordingRef=useRef(false);
   const exportPDFRef=useRef(null),scanQRRef=useRef(null);
 
-  const color=MODE_META[mode].color;
+  const color=redUI?"#ff2200":MODE_META[mode].color;
   const timeStr=clock.toLocaleTimeString("en-US",{hour12:false});
   const dateStr=clock.toLocaleDateString("en-US",{day:"2-digit",month:"short",year:"numeric"}).toUpperCase();
   const dirs=["N","NE","E","SE","S","SW","W","NW"];
@@ -2821,19 +400,36 @@ export default function NightVisionCamera(){
         @keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
         @keyframes flash-out{0%{opacity:.38}100%{opacity:0}}
         @keyframes lock-flash{0%,49%{border-color:#ff220088}50%,100%{border-color:#ff2200}}
-        *{box-sizing:border-box}button{font-family:"DM Mono",monospace;cursor:pointer}
+        @keyframes header-sweep{0%{background-position:-200% 0}100%{background-position:200% 0}}
+        *{box-sizing:border-box}
+        button{font-family:"DM Mono",monospace;cursor:pointer;transition:transform .1s ease,filter .12s ease,box-shadow .15s ease}
+        button:hover{filter:brightness(1.22)}
+        button:active{transform:scale(.94)}
+        button:focus-visible{outline:1.5px solid ${color}90;outline-offset:1px}
+        input[type=range]:focus-visible{outline:1.5px solid ${color}90;outline-offset:3px}
         ::-webkit-scrollbar{display:none}
       `}</style>
+
+      {!booted&&<BootSequence color={color} onDone={()=>setBooted(true)}/>}
 
       {modal==="map"&&<GPSMap pos={gps} track={gpsTrack} events={events} color={color} onClose={()=>setModal(null)}/>}
       {modal==="timeline"&&<TimelineModal events={events} captures={captures} color={color} onClose={()=>setModal(null)}/>}
       {modal==="tripwire"&&<TripwireEditor tripwires={tripwires} onUpdate={setTripwires} color={color} onClose={()=>setModal(null)}/>}
       {modal==="manual"&&<InstructionsModal color={color} onClose={()=>setModal(null)}/>}
+      {modal==="cast"&&<CastModal color={color} code={castCode} on={castOn} viewers={castViewers} status={castStatus} onStart={startCast} onStop={stopCast} onClose={()=>setModal(null)}/>}
 
-      <div style={{width:"100%",height:"100%",display:"flex",flexDirection:"column",background:"#000",border:`1px solid ${color}18`,animation:"fade-in 0.4s ease",overflow:"hidden"}}>
+      <div style={{width:"100%",height:"100%",display:"flex",flexDirection:"column",background:"#000",
+        border:`1px solid ${color}18`,boxShadow:`inset 0 0 60px rgba(0,0,0,0.6),inset 0 0 1px ${color}25`,
+        animation:booted?"fade-in 0.5s ease":"none",overflow:"hidden",position:"relative"}}>
+        <Bezel color={color} op={.4}/>
 
         {/* HEADER */}
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 14px",borderBottom:`1px solid ${color}15`}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 14px",
+          borderBottom:`1px solid ${color}15`,position:"relative",
+          background:`linear-gradient(180deg,${color}06,transparent)`,backdropFilter:"blur(2px)"}}>
+          <div style={{position:"absolute",left:0,right:0,bottom:-1,height:1,
+            background:`linear-gradient(90deg,transparent,${color}50,transparent)`,
+            backgroundSize:"200% 100%",animation:"header-sweep 5s linear infinite"}}/>
           <div style={{display:"flex",alignItems:"center",gap:7}}>
             <div style={{width:6,height:6,borderRadius:"50%",background:color,boxShadow:`0 0 10px ${color}`,animation:"rec-blink 2s step-end infinite"}}/>
             <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4,textShadow:`0 0 10px ${color}40`}}>NVS-7</span>
@@ -2879,7 +475,7 @@ export default function NightVisionCamera(){
               motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
               showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
               onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={true}
-              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry} heatmapOn={heatmapOn} onTrackCount={setBlobsCount} starsOn={starsOn} showHist={showHist} stabOn={stabOn} srOn={srOn} onLoiter={handleLoiter}/>
+              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry} heatmapOn={heatmapOn} onTrackCount={setBlobsCount} starsOn={starsOn} showHist={showHist} stabOn={stabOn} srOn={srOn} onLoiter={handleLoiter} onZoom={setZoom} onSwipeMode={cycleMode} onSwipeGain={bumpGain}/>
             <CameraPanel stream={front.stream} ready={front.ready} error={front.error} label="FRONT"
               mode={mode} brightness={brightness} sensitivity={sensitivity} edgeOverlay={edgeOverlay}
               noiseReduction={noiseReduction} color={color} zoom={zoom} showReticle={showReticle}
@@ -2896,7 +492,7 @@ export default function NightVisionCamera(){
               motionEnabled={motionEnabled} autoCapture={autoCapture} tripwires={tripwires}
               showRPPG={showRPPG} onCapture={handleCapture} onMotionEvent={handleMotionEvent}
               onTripwireHit={handleTripwireHit} onRPPG={setRppgSample} compact={false}
-              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry} heatmapOn={heatmapOn} onTrackCount={setBlobsCount} starsOn={starsOn} showHist={showHist} stabOn={stabOn} srOn={srOn} onLoiter={handleLoiter}/>
+              tfDetect={tfDetect} modelReady={modelReady} onRetry={rear.retry} heatmapOn={heatmapOn} onTrackCount={setBlobsCount} starsOn={starsOn} showHist={showHist} stabOn={stabOn} srOn={srOn} onLoiter={handleLoiter} onZoom={setZoom} onSwipeMode={cycleMode} onSwipeGain={bumpGain}/>
             {(showRPPG||audioEnabled)&&(
               <BiometricHUD hr={hr} audioLevel={audioLevel} audioSpike={audioSpike} color={color}/>
             )}
@@ -2914,28 +510,81 @@ export default function NightVisionCamera(){
         }}>
 
           {/* ── MODE SELECTOR ── */}
-          <div style={{display:"flex",gap:5}}>
-            {MODE_KEYS.map(m=>{
-              const mc=MODE_META[m].color;
-              return(
-                <button key={m} onClick={()=>setMode(m)} style={{
-                  flex:1,padding:"9px 2px",
-                  background:mode===m?`${mc}20`:"rgba(0,0,0,0.4)",
-                  border:`1.5px solid ${mode===m?mc:`${mc}28`}`,
-                  borderRadius:6,fontSize:8,fontWeight:700,
-                  color:mode===m?mc:`${mc}55`,
-                  letterSpacing:.5,transition:"all 0.15s",
-                  boxShadow:mode===m?`0 0 8px ${mc}30`:"none",
-                }}>
-                  {MODE_META[m].label}
-                </button>
-              );
-            })}
+          {/* ── PRESETS ── */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:6}}>
+            {[
+              {n:"SURVEIL",i:"🛡",d:"NVG + sentry + heat"},
+              {n:"RECON",i:"🔭",d:"Tactical day + edges"},
+              {n:"ASTRO",i:"✨",d:"Long exposure + stars"},
+              {n:"SEARCH",i:"🔍",d:"White-hot + auto-cap"},
+            ].map(({n,i})=>(
+              <button key={n} onClick={()=>applyPreset(n)} style={{
+                display:"flex",flexDirection:"column",alignItems:"center",gap:3,padding:"10px 3px",
+                background:activePreset===n?`${color}16`:"rgba(255,255,255,0.02)",
+                border:`1px solid ${activePreset===n?color:`${color}20`}`,borderRadius:9,
+                boxShadow:activePreset===n?`0 0 8px ${color}25`:"none",transition:"all 0.12s",
+              }}>
+                <span style={{fontSize:13,lineHeight:1}}>{i}</span>
+                <span style={{fontFamily:"'DM Mono',monospace",fontSize:7,letterSpacing:1,
+                  color:activePreset===n?color:`${color}60`,fontWeight:activePreset===n?700:400}}>{n}</span>
+              </button>
+            ))}
+          </div>
+
+          {/* ── QUICK BAR — the four things you actually reach for ── */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:6}}>
+            {[
+              {l:"📷",sub:"SHOT",f:manualSnap,c:color},
+              {l:recording?"■":"●",sub:recording?"STOP":"REC",f:toggleRecord,c:recording?"#ff2222":"#ff5555"},
+              {l:"🔦",sub:"TORCH",f:toggleTorch,c:"#ffdd88",on:torchOn},
+              {l:"🛡",sub:"SENTRY",f:()=>setSentryOn(s=>!s),c:"#ff3355",on:sentryOn},
+            ].map(({l,sub,f,c,on})=>(
+              <button key={sub} onClick={f} style={{
+                display:"flex",flexDirection:"column",alignItems:"center",gap:3,
+                padding:"12px 4px",
+                background:on?`${c}1a`:"rgba(255,255,255,0.03)",
+                border:`1.5px solid ${on?c:`${c}30`}`,borderRadius:10,
+                boxShadow:on?`0 0 10px ${c}30`:"none",transition:"all 0.12s",
+              }}>
+                <span style={{fontSize:16,lineHeight:1,color:c}}>{l}</span>
+                <span style={{fontFamily:"'DM Mono',monospace",fontSize:7,letterSpacing:1.5,
+                  color:on?c:`${c}70`,fontWeight:on?700:400}}>{sub}</span>
+              </button>
+            ))}
+          </div>
+
+          {/* ── GESTURE HINT ── */}
+          <div style={{display:"flex",gap:10,justifyContent:"center",padding:"2px 0 0",flexWrap:"wrap"}}>
+            {["◀▶ swipe: mode","▲▼ swipe: gain","pinch: zoom","2-tap: magnify"].map(h=>(
+              <span key={h} style={{fontFamily:"'DM Mono',monospace",fontSize:7,color:`${color}30`,letterSpacing:.5}}>{h}</span>
+            ))}
+          </div>
+
+          <div style={{padding:"9px 10px",border:`1px solid ${color}12`,borderRadius:9,background:`${color}03`}}>
+            <SectionLabel color={color}>MODE</SectionLabel>
+            <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
+              {MODE_KEYS.map(m=>{
+                const mc=MODE_META[m].color;
+                return(
+                  <button key={m} onClick={()=>setMode(m)} style={{
+                    flex:"1 1 auto",minWidth:44,padding:"9px 2px",
+                    background:mode===m?`${mc}20`:"rgba(0,0,0,0.4)",
+                    border:`1.5px solid ${mode===m?mc:`${mc}28`}`,
+                    borderRadius:6,fontSize:8,fontWeight:700,
+                    color:mode===m?mc:`${mc}55`,
+                    letterSpacing:.5,transition:"all 0.15s",
+                    boxShadow:mode===m?`0 0 8px ${mc}30`:"none",
+                  }}>
+                    {MODE_META[m].label}
+                  </button>
+                );
+              })}
+            </div>
           </div>
 
           {/* ── ZOOM ── */}
-          <div>
-            <div style={{fontSize:9,color:`${color}60`,letterSpacing:2,marginBottom:5}}>ZOOM</div>
+          <div style={{padding:"9px 10px",border:`1px solid ${color}12`,borderRadius:9,background:`${color}03`}}>
+            <SectionLabel color={color}>ZOOM</SectionLabel>
             <div style={{display:"flex",gap:5}}>
               {ZOOM_STEPS.map(z=>(
                 <button key={z} onClick={()=>setZoom(z)} style={{
@@ -2963,7 +612,9 @@ export default function NightVisionCamera(){
           </div>
 
           {/* ── SLIDERS ── */}
-          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          <div style={{display:"flex",flexDirection:"column",gap:8,padding:"9px 10px",
+            border:`1px solid ${color}12`,borderRadius:9,background:`${color}03`}}>
+            <SectionLabel color={color}>SIGNAL</SectionLabel>
             <div style={{display:"flex",alignItems:"center",gap:10}}>
               <span style={{fontSize:9,color:`${color}60`,letterSpacing:1,minWidth:36}}>SENS</span>
               <input type="range" min="0" max="1" step="0.05" value={sensitivity}
@@ -2989,52 +640,87 @@ export default function NightVisionCamera(){
             </div>
           </div>
 
-          {/* ── FEATURE TOGGLES ── */}
-          <div>
-            <div style={{fontSize:9,color:`${color}50`,letterSpacing:2,marginBottom:6}}>FEATURES</div>
-            <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:5}}>
-              {[
-                {l:"EDGE",v:edgeOverlay,f:()=>setEdgeOverlay(e=>!e)},
-                {l:"NR",v:noiseReduction,f:()=>setNoiseReduction(n=>!n)},
-                {l:"MOTION",v:motionEnabled,f:()=>setMotionEnabled(m=>!m)},
-                {l:"DUAL",v:dualMode,f:()=>setDualMode(d=>!d)},
-                {l:"RETICLE",v:showReticle,f:()=>setShowReticle(r=>!r)},
-                {l:"FACE",v:faceDetect,f:()=>setFaceDetect(fd=>!fd)},
-                {l:"rPPG HR",v:showRPPG,f:()=>setShowRPPG(r=>!r)},
-                {l:"MIC",v:audioEnabled,f:()=>setAudioEnabled(a=>!a)},
-                {l:"🔦 TORCH",v:torchOn,f:toggleTorch,c:"#ffdd88"},
-                {l:"SHAKE",v:shakeEnabled,f:()=>setShakeEnabled(s=>!s),c:"#ff8844"},
-                {l:"HW ZOOM",v:hardZoom,f:()=>setHardZoom(h=>!h),c:"#44ffcc"},
-                {l:"SYNC",v:multiSync,f:()=>setMultiSync(s=>!s),c:"#cc44ff"},
-                {l:"🎤 VOICE",v:voiceOn,f:()=>setVoiceOn(v=>!v),c:"#ff88ff"},
-                {l:"🔔 ALERTS",v:alertsOn,f:()=>setAlertsOn(a=>!a),c:"#ffaa00"},
-                {l:"🛡 SENTRY",v:sentryOn,f:()=>setSentryOn(s=>!s),c:"#ff3355"},
-                {l:"🌡 HEAT",v:heatmapOn,f:()=>setHeatmapOn(h=>!h),c:"#ff7700"},
-                {l:"✨ STARS",v:starsOn,f:()=>setStarsOn(s=>!s),c:"#a0d8ff"},
-                {l:"📊 HIST",v:showHist,f:()=>setShowHist(h=>!h),c:"#88ff88"},
-                {l:"💾 VAULT",v:vaultOn,f:()=>setVaultOn(v=>!v),c:"#00ddaa"},
-                {l:"🎯 STAB",v:stabOn,f:()=>setStabOn(s=>!s),c:"#66ddff"},
-                {l:"🔬 SUPER-R",v:srOn,f:()=>setSrOn(s=>!s),c:"#ffaaff"},
-              ].map(({l,v,f,c})=>(
-                <button key={l} onClick={f} style={{
-                  padding:"10px 4px",
-                  background:v?`${c||color}18`:"rgba(0,0,0,0.35)",
-                  border:`1.5px solid ${v?(c||color):`${c||color}22`}`,
-                  borderRadius:7,fontSize:8,fontWeight:v?700:400,
-                  color:v?(c||color):`${c||color}45`,
-                  letterSpacing:.3,transition:"all 0.12s",
-                  boxShadow:v?`0 0 6px ${c||color}25`:"none",
-                  lineHeight:1.2,
-                }}>
-                  {l}
+          {/* ── FEATURE TOGGLES — grouped & collapsible ── */}
+          {[
+            {id:"vision",label:"VISION",items:[
+              {l:"EDGE",v:edgeOverlay,f:()=>setEdgeOverlay(e=>!e)},
+              {l:"NOISE RED",v:noiseReduction,f:()=>setNoiseReduction(n=>!n)},
+              {l:"RETICLE",v:showReticle,f:()=>setShowReticle(r=>!r)},
+              {l:"🎯 STAB",v:stabOn,f:()=>setStabOn(s=>!s),c:"#66ddff"},
+              {l:"🔬 SUPER-R",v:srOn,f:()=>setSrOn(s=>!s),c:"#ffaaff"},
+              {l:"📊 HISTOGRAM",v:showHist,f:()=>setShowHist(h=>!h),c:"#88ff88"},
+              {l:"✨ STARS",v:starsOn,f:()=>setStarsOn(s=>!s),c:"#a0d8ff"},
+              {l:"🔦 TORCH",v:torchOn,f:toggleTorch,c:"#ffdd88"},
+              {l:"HW ZOOM",v:hardZoom,f:()=>setHardZoom(h=>!h),c:"#44ffcc"},
+              {l:"DUAL CAM",v:dualMode,f:()=>setDualMode(d=>!d)},
+            ]},
+            {id:"detect",label:"DETECTION",items:[
+              {l:"MOTION",v:motionEnabled,f:()=>setMotionEnabled(m=>!m)},
+              {l:"FACE",v:faceDetect,f:()=>setFaceDetect(fd=>!fd)},
+              {l:"🌡 HEATMAP",v:heatmapOn,f:()=>setHeatmapOn(h=>!h),c:"#ff7700"},
+              {l:"🎤 MIC",v:audioEnabled,f:()=>setAudioEnabled(a=>!a)},
+              {l:"❤️ rPPG",v:showRPPG,f:()=>setShowRPPG(r=>!r),c:"#ff6688"},
+              {l:"💥 SHAKE",v:shakeEnabled,f:()=>setShakeEnabled(s=>!s),c:"#ff8844"},
+            ]},
+            {id:"alert",label:"ALERTS & AUTOMATION",items:[
+              {l:"🛡 SENTRY",v:sentryOn,f:()=>setSentryOn(s=>!s),c:"#ff3355"},
+              {l:"🔔 ALERTS",v:alertsOn,f:()=>setAlertsOn(a=>!a),c:"#ffaa00"},
+              {l:"🎯 AUTO-CAP",v:autoCapture,f:()=>setAutoCapture(a=>!a),c:"#ffdd00"},
+            ]},
+            {id:"system",label:"SYSTEM",items:[
+              {l:"💾 VAULT",v:vaultOn,f:()=>setVaultOn(v=>!v),c:"#00ddaa"},
+              {l:"🎤 VOICE",v:voiceOn,f:()=>setVoiceOn(v=>!v),c:"#ff88ff"},
+              {l:"🔗 SYNC",v:multiSync,f:()=>setMultiSync(s=>!s),c:"#cc44ff"},
+              {l:"🔴 NIGHT-SAFE UI",v:redUI,f:()=>setRedUI(r=>!r),c:"#ff2200"},
+              {l:"🌑 STEALTH",v:stealth,f:()=>setStealth(true),c:"#666666"},
+            ]},
+          ].map(group=>{
+            const open=openGroups[group.id];
+            const activeCount=group.items.filter(i=>i.v).length;
+            return(
+              <div key={group.id} style={{border:`1px solid ${color}12`,borderRadius:9,background:`${color}03`,overflow:"hidden"}}>
+                <button onClick={()=>setOpenGroups(g=>({...g,[group.id]:!g[group.id]}))}
+                  style={{width:"100%",display:"flex",alignItems:"center",justifyContent:"space-between",
+                    padding:"11px 12px",background:"transparent",border:"none",cursor:"pointer"}}>
+                  <span style={{display:"flex",alignItems:"center",gap:8}}>
+                    <span style={{fontFamily:"'DM Mono',monospace",fontSize:9,color:`${color}75`,letterSpacing:2.5,fontWeight:600}}>{group.label}</span>
+                    {activeCount>0&&(
+                      <span style={{fontSize:7,color:"#000",background:color,borderRadius:8,
+                        padding:"1px 6px",fontWeight:700,fontFamily:"'DM Mono',monospace"}}>{activeCount}</span>
+                    )}
+                  </span>
+                  <span style={{fontSize:9,color:`${color}50`,transform:open?"rotate(90deg)":"none",transition:"transform 0.15s"}}>▶</span>
                 </button>
-              ))}
-            </div>
-          </div>
+                {open&&(
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:6,padding:"0 10px 11px"}}>
+                    {group.items.map(({l,v,f,c})=>(
+                      <button key={l} onClick={f} style={{
+                        display:"flex",alignItems:"center",justifyContent:"space-between",gap:6,
+                        padding:"12px 11px",
+                        background:v?`${c||color}14`:"rgba(255,255,255,0.02)",
+                        border:`1px solid ${v?(c||color):`${c||color}20`}`,
+                        borderRadius:8,fontSize:9,fontWeight:v?700:400,
+                        color:v?(c||color):`${c||color}55`,
+                        letterSpacing:.3,transition:"all 0.12s",
+                        boxShadow:v?`0 0 8px ${c||color}22`:"none",
+                      }}>
+                        <span style={{textAlign:"left",lineHeight:1.2}}>{l}</span>
+                        <span style={{width:22,height:12,borderRadius:7,flexShrink:0,
+                          background:v?(c||color):`${c||color}25`,position:"relative",transition:"background 0.15s"}}>
+                          <span style={{position:"absolute",top:2,left:v?12:2,width:8,height:8,borderRadius:"50%",
+                            background:v?"#000":`${c||color}70`,transition:"left 0.15s"}}/>
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
 
           {/* ── CAPTURE ACTIONS ── */}
-          <div>
-            <div style={{fontSize:9,color:`${color}50`,letterSpacing:2,marginBottom:6}}>CAPTURE</div>
+          <div style={{padding:"9px 10px",border:`1px solid ${color}12`,borderRadius:9,background:`${color}03`}}>
+            <SectionLabel color={color}>CAPTURE</SectionLabel>
             <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr",gap:5}}>
               <button onClick={()=>setAutoCapture(a=>!a)} style={{
                 padding:"12px 6px",
@@ -3073,8 +759,8 @@ export default function NightVisionCamera(){
           </div>
 
           {/* ── TOOLS ── */}
-          <div>
-            <div style={{fontSize:9,color:`${color}50`,letterSpacing:2,marginBottom:6}}>TOOLS</div>
+          <div style={{padding:"9px 10px",border:`1px solid ${color}12`,borderRadius:9,background:`${color}03`}}>
+            <SectionLabel color={color}>TOOLS</SectionLabel>
             <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:5}}>
               {[
                 {l:"📁 Gallery",m:"gallery",c:newCapCount>0?color:undefined,badge:newCapCount>0?newCapCount:null},
@@ -3086,6 +772,7 @@ export default function NightVisionCamera(){
                 {l:`🎞 Clips${clips.length?` (${clips.length})`:""}`,m:"clips",c:"#ff5588"},
                 {l:`🌐 Pano${pano.frames.length?` (${pano.frames.length})`:""}`,m:"panoadd",c:"#ffcc44"},
                 {l:"📊 Sensors",m:"sensors",c:"#44ffcc"},
+                {l:"📡 Cast",m:"cast",c:castOn?"#00ff88":"#00ff8880"},
                 {l:"? Manual",m:"manual",c:`${color}80`},
               ].map(({l,m,c,badge})=>(
                 <button key={m} onClick={()=>{
@@ -3205,9 +892,24 @@ export default function NightVisionCamera(){
         </div>
       </div>
 
+      {/* STEALTH — screen dark, systems keep running */}
+      {stealth&&(
+        <div onClick={()=>setStealth(false)} style={{position:"fixed",inset:0,zIndex:500,
+          background:"#000",display:"flex",alignItems:"center",justifyContent:"center",
+          flexDirection:"column",gap:14,cursor:"pointer"}}>
+          <span style={{fontFamily:"'DM Mono',monospace",fontSize:8,color:"rgba(0,255,80,0.16)",letterSpacing:3}}>
+            STEALTH — TAP TO WAKE
+          </span>
+          <div style={{display:"flex",gap:14}}>
+            {recording&&<span style={{fontSize:8,color:"rgba(255,34,34,0.35)",letterSpacing:2,animation:"rec-blink 1.5s step-end infinite"}}>● REC</span>}
+            {sentryOn&&<span style={{fontSize:8,color:"rgba(255,51,85,0.3)",letterSpacing:2}}>🛡 ARMED</span>}
+          </div>
+        </div>
+      )}
+
       {/* Clips vault modal */}
       {modal==="clips"&&(
-        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.97)",zIndex:200,display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease"}}>
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.93)",backdropFilter:"blur(10px)",WebkitBackdropFilter:"blur(10px)",zIndex:200,display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease"}}>
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0}}>
             <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>CLIP VAULT ({clips.length})</span>
             <div style={{display:"flex",gap:6}}>
@@ -3244,7 +946,7 @@ export default function NightVisionCamera(){
 
       {/* Sensors modal */}
       {modal==="sensors"&&(
-        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.97)",zIndex:200,
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.93)",backdropFilter:"blur(10px)",WebkitBackdropFilter:"blur(10px)",zIndex:200,
           display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease"}}>
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
             padding:"10px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0}}>
@@ -3298,7 +1000,7 @@ export default function NightVisionCamera(){
 
       {/* Gallery modal inline */}
       {modal==="gallery"&&(
-        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.97)",zIndex:200,
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.93)",backdropFilter:"blur(10px)",WebkitBackdropFilter:"blur(10px)",zIndex:200,
           display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease",overflowY:"auto"}}>
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
             padding:"10px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0}}>
