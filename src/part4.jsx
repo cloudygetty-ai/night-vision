@@ -26,6 +26,11 @@ export function InstructionsModal({color,onClose}){
       {icon:"📷",title:"ALLOW CAMERA",body:"Open in Chrome/Safari and tap Allow on the camera prompt. Also Allow location (GPS map, altitude) and microphone (audio spike, wind) when asked. iOS: Settings → Safari → Camera → Allow."},
       {icon:"▶",title:"IF CAMERA WON'T START",body:"After 6s a TAP TO START CAMERA button appears — tap it. Any error screen also has a ↻ RETRY button. Tapping counts as a user gesture, which iOS always honors."},
       {icon:"📱",title:"INSTALL AS APP",body:"Share button → Add to Home Screen for full-screen with no browser chrome. Screen stays awake automatically while the app is open (wake lock)."},
+      {icon:"🏷",title:"GEO-STAMP (EVIDENCE)",body:"On by default. Every capture gets a burned-in footer: UTC timestamp, GPS coordinates with accuracy, heading, altitude, mode, and camera — plus tamper-evident corner ticks. A SHA-256 hash of the finished image is stored with it for chain of custody."},
+      {icon:"⏲",title:"TIMELAPSE",body:"Set an interval from 2 seconds to 5 minutes and press START. Shoots automatically and counts frames in the header. Every frame is geo-stamped and vaulted. Use with SENTRY for unattended monitoring."},
+      {icon:"⤴",title:"SHARE",body:"The ⤴ button on any gallery item opens the native share sheet with the stamped image and its coordinates — straight to Messages, Mail, or any app."},
+      {icon:"📴",title:"WORKS OFFLINE",body:"Add to Home Screen and the whole app is cached — it launches and runs with zero signal. An ⚠OFFLINE badge appears in the header when there is no connection. Camera, all modes, AI detection, and the vault keep working; only the map tiles need data."},
+      {icon:"◫",title:"DUAL CAMERA LAYOUTS",body:"DUAL CAM offers ◫ SPLIT (equal side-by-side) or ⬓ PIP (one full-screen with the other as an inset) and ⇄ to swap which is primary. Many phones — most iOS Safari builds — can only run one camera at a time; if the second fails you get a clear notice and a one-tap fallback."},
       {icon:"👆",title:"GESTURES",body:"Swipe ◀▶ across the camera to cycle modes. Swipe ▲▼ to change gain. Pinch to zoom. Double-tap for the 3x magnifier. Single tap drops a focus ring. No buttons needed for the common moves."},
       {icon:"⚡",title:"MISSION PRESETS",body:"Four one-tap profiles configure every setting at once. SURVEIL: NVG + sentry + heatmap + auto-capture. RECON: tactical day + edges + 2x. ASTRO: long exposure + super-res + star tracker. SEARCH: white-hot + high sensitivity + auto-capture."},
       {icon:"🌑",title:"STEALTH MODE",body:"Blacks the screen almost completely while recording, sentry, and all detection keep running underneath. Dim indicators show what is still armed. Tap anywhere to wake. Say \"stealth\" to trigger hands-free."},
@@ -93,7 +98,7 @@ export function InstructionsModal({color,onClose}){
   return(
     <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.93)",backdropFilter:"blur(10px)",WebkitBackdropFilter:"blur(10px)",zIndex:200,display:"flex",flexDirection:"column",animation:"fade-in 0.2s ease"}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 14px",borderBottom:`1px solid ${color}15`,flexShrink:0}}>
-        <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>NVS-12.0 OPERATOR MANUAL</span>
+        <span style={{fontFamily:"'Cinzel',serif",fontSize:10,fontWeight:900,color,letterSpacing:4}}>NVS-13.0 OPERATOR MANUAL</span>
         <button onClick={onClose} style={{padding:"6px 12px",background:"transparent",border:`1px solid ${color}30`,borderRadius:4,color:`${color}70`,fontFamily:"'DM Mono',monospace",fontSize:9,letterSpacing:2,cursor:"pointer"}}>CLOSE</button>
       </div>
       <div style={{display:"flex",gap:4,padding:"8px 12px",borderBottom:`1px solid ${color}10`,flexShrink:0,overflowX:"auto"}}>
