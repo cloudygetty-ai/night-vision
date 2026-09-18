@@ -229,18 +229,30 @@ export function useCastBroadcast(enabled,code){
   const[status,setStatus]=useState("idle"); // idle | connecting | ready | unsupported | error
   useEffect(()=>{
     if(!enabled||!code){setViewers(0);setStatus("idle");return;}
-    const cv=document.querySelector("canvas[data-primary='true']");
-    if(!cv||!cv.captureStream){setStatus("unsupported");return;}
     let cancelled=false,room=null;
     setStatus("connecting");
     (async()=>{
       try{
+        // wait for the display canvas to exist and have pixels (up to 6s)
+        let cv=null;
+        for(let i=0;i<60&&!cancelled;i++){
+          cv=document.querySelector("canvas[data-primary='true']");
+          if(cv&&cv.width>0&&typeof cv.captureStream==="function")break;
+          await new Promise(r=>setTimeout(r,100));
+        }
+        if(cancelled)return;
+        if(!cv||typeof cv.captureStream!=="function"){setStatus("unsupported");return;}
         const{joinRoom}=await import("trystero/nostr");
         if(cancelled)return;
         const stream=cv.captureStream(24);
         room=joinRoom({appId:CAST_APP_ID},`nvs7-${code}`);
-        room.onPeerJoin=peerId=>{room.addStream(stream,{target:peerId});setViewers(v=>v+1);};
-        room.onPeerLeave=()=>setViewers(v=>Math.max(0,v-1));
+        // trystero handlers are FUNCTIONS, not assignable properties
+        room.addStream(stream);                    // serve peers already in the room
+        room.onPeerJoin(peerId=>{
+          try{room.addStream(stream,peerId);}catch{}   // serve each new peer
+          setViewers(v=>v+1);
+        });
+        room.onPeerLeave(()=>setViewers(v=>Math.max(0,v-1)));
         setStatus("ready");
       }catch{if(!cancelled)setStatus("error");}
     })();
@@ -264,8 +276,9 @@ export function useCastWatch(code){
         const{joinRoom}=await import("trystero/nostr");
         if(cancelled)return;
         room=joinRoom({appId:CAST_APP_ID},`nvs7-${code}`);
-        room.onPeerStream=s=>{setStream(s);setStatus("live");};
-        room.onPeerLeave=()=>{setStream(null);setStatus("ended");};
+        room.onPeerStream(s=>{setStream(s);setStatus("live");});
+        room.onPeerJoin(()=>setStatus(st=>st==="connecting"?"handshake":st));
+        room.onPeerLeave(()=>{setStream(null);setStatus("ended");});
       }catch{if(!cancelled)setStatus("error");}
     })();
     return()=>{cancelled=true;room?.leave();};
