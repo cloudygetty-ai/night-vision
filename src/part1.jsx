@@ -1,5 +1,3 @@
-import*as tf from"@tensorflow/tfjs";
-import*as cocoSsd from"@tensorflow-models/coco-ssd";
 import{useState,useEffect,useRef,useCallback}from"react";
 import{estimateRange,estimateGlobalShift,superResolve,computeHistogram,detectPoints}from"./part2.jsx";
 import{applyTactical,applyDehaze,applyUnsharpMask,applyPolarize}from"./part3.jsx";
@@ -220,14 +218,24 @@ export function useTFDetector(){
   const[modelReady,setModelReady]=useState(false);
   useEffect(()=>{
     let cancelled=false;
-    (async()=>{
+    const kick=()=>(async()=>{
       try{
+        const [tf,cocoSsd]=await Promise.all([
+          import("@tensorflow/tfjs"),
+          import("@tensorflow-models/coco-ssd"),
+        ]);
         await tf.ready();
         const m=await cocoSsd.load({base:"lite_mobilenet_v2"});
         if(!cancelled){modelRef.current=m;setModelReady(true);}
       }catch(e){console.warn("COCO-SSD load failed:",e);}
     })();
-    return()=>{cancelled=true;};
+    // let the camera and UI paint before pulling ~2MB of model code
+    const id=window.requestIdleCallback
+      ? window.requestIdleCallback(kick,{timeout:2500})
+      : setTimeout(kick,1200);
+    return()=>{cancelled=true;
+      if(window.cancelIdleCallback&&window.requestIdleCallback)window.cancelIdleCallback(id);
+      else clearTimeout(id);};
   },[]);
   const busyRef=useRef(false);
   const smallRef=useRef(null);
