@@ -126,7 +126,7 @@ export default function NightVisionCamera(){
   const rear=useCameraStream({facingMode:"environment"},true);
   const front=useCameraStream({facingMode:"user"},dualMode);
   const{hzoom,maxZoom,supported:hzoomSupported,applyZoom}=useHardwareZoom(hardZoom?rear.stream:null);
-  const{detect:tfDetect,modelReady}=useTFDetector();
+  const{detect:tfDetect,modelReady}=useTFDetector(motionEnabled);
   useWakeLock();
   const battery=useBattery();
   const beep=useThreatBeep();

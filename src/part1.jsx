@@ -213,7 +213,7 @@ export const COCO_ICONS={
 };
 
 // useTFDetector — loads COCO-SSD once, exposes a detect() fn
-export function useTFDetector(){
+export function useTFDetector(enabled=true){
   const modelRef=useRef(null);
   const[modelReady,setModelReady]=useState(false);
   useEffect(()=>{
@@ -230,13 +230,15 @@ export function useTFDetector(){
       }catch(e){console.warn("COCO-SSD load failed:",e);}
     })();
     // let the camera and UI paint before pulling ~2MB of model code
+    if(!enabled)return;
+    // wait until the app is interactive, then idle, before fetching ~2MB of model
     const id=window.requestIdleCallback
-      ? window.requestIdleCallback(kick,{timeout:2500})
-      : setTimeout(kick,1200);
+      ? window.requestIdleCallback(kick,{timeout:8000})
+      : setTimeout(kick,4000);
     return()=>{cancelled=true;
       if(window.cancelIdleCallback&&window.requestIdleCallback)window.cancelIdleCallback(id);
       else clearTimeout(id);};
-  },[]);
+  },[enabled]);
   const busyRef=useRef(false);
   const smallRef=useRef(null);
   const detect=useCallback(async(canvas)=>{
