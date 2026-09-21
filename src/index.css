@@ -1,12 +1,8 @@
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-html,body,#root{width:100%;height:100%;overflow:hidden;background:#000}
-input[type=range]{-webkit-appearance:none;appearance:none;height:4px;background:transparent;outline:none}
-input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;cursor:pointer}
-::-webkit-scrollbar{display:none}
-button{font-family:"DM Mono",monospace;cursor:pointer;-webkit-tap-highlight-color:transparent}
-
-@keyframes focus-pulse{
-  0%{transform:translate(-50%,-50%) scale(1.5);opacity:0}
-  35%{transform:translate(-50%,-50%) scale(1);opacity:1}
-  100%{transform:translate(-50%,-50%) scale(0.85);opacity:0}
-}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body, #root { width: 100%; height: 100%; overflow: hidden; background: #000; overscroll-behavior: none; }
+body { -webkit-font-smoothing: antialiased; -webkit-user-select: none; user-select: none; }
+button { cursor: pointer; font-family: inherit; -webkit-tap-highlight-color: transparent; }
+button:active { transform: scale(.96); }
+input[type=range] { height: 28px; }
+::-webkit-scrollbar { display: none; }
+@keyframes blink { 50% { opacity: .35; } }

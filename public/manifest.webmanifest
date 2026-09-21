@@ -1,13 +1,9 @@
 {
-  "name":"NVS-13 Night Vision",
-  "short_name":"NVS-13",
-  "start_url":"/",
-  "display":"fullscreen",
-  "orientation":"any",
-  "background_color":"#000000",
-  "theme_color":"#000000",
-  "description":"Tactical night vision, thermal imaging, AI object detection and surveillance suite.",
-  "icons":[
-    {"src":"/favicon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}
-  ]
+  "name": "NVS Night Vision",
+  "short_name": "NVS",
+  "start_url": "/",
+  "display": "fullscreen",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
 }
