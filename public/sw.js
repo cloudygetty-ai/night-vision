@@ -1,5 +1,5 @@
 // NVS-15 service worker: network-first HTML, cache-first hashed assets
-const V = 'nvs-15';
+const V = 'nvs-15.1';
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('message', e => { if (e.data === 'SKIP_WAITING') self.skipWaiting(); });
 self.addEventListener('activate', e => e.waitUntil((async () => {

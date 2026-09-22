@@ -137,3 +137,36 @@ export function download(url, name) {
   const a = document.createElement('a'); a.href = url; a.download = name; a.click()
 }
 export const dataUrlToBlob = async u => (await fetch(u)).blob()
+
+// ── FRAME REGISTRATION for super-resolution ───────────────────────────────
+// Locks onto a reference frame and measures how far each new frame has
+// drifted (handshake). The GPU then samples each frame back into alignment
+// before averaging, so detail adds up instead of smearing.
+export function createAligner() {
+  const W = 128, H = 72, R = 6, M = 8
+  const c = document.createElement('canvas'); c.width = W; c.height = H
+  const ctx = c.getContext('2d', { willReadFrequently: true })
+  const cur = new Float32Array(W * H)
+  let ref = null
+  return {
+    reset() { ref = null },
+    estimate(video) {
+      ctx.drawImage(video, 0, 0, W, H)
+      const d = ctx.getImageData(0, 0, W, H).data
+      for (let i = 0, j = 0; j < cur.length; i += 4, j++) cur[j] = d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114
+      if (!ref) { ref = new Float32Array(cur); return { dx: 0, dy: 0, fresh: true, lost: false } }
+      let best = Infinity, bx = 0, by = 0
+      for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
+        let sum = 0
+        for (let y = M; y < H - M; y += 2) {
+          const row = y * W, rrow = (y + dy) * W
+          for (let x = M; x < W - M; x += 2) sum += Math.abs(cur[row + x] - ref[rrow + x + dx])
+          if (sum >= best) break
+        }
+        if (sum < best) { best = sum; bx = dx; by = dy }
+      }
+      const lost = Math.abs(bx) === R || Math.abs(by) === R   // drifted past search window
+      return { dx: bx / W, dy: by / H, fresh: false, lost }
+    },
+  }
+}

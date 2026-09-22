@@ -27,9 +27,9 @@ precision highp float;
 in vec2 vUv; out vec4 o;
 uniform sampler2D uCur, uPrev;
 uniform float uAlpha, uMirror;
-uniform vec2 uScale;
+uniform vec2 uScale, uShift;
 void main(){
-  vec2 uv = (vUv - .5) * uScale + .5;
+  vec2 uv = (vUv - .5) * uScale + .5 + uShift;
   if (uMirror > .5) uv.x = 1. - uv.x;
   vec3 c = texture(uCur, uv).rgb;
   vec3 p = texture(uPrev, vUv).rgb;
@@ -41,7 +41,7 @@ precision highp float;
 in vec2 vUv; out vec4 o;
 uniform sampler2D uTex, uLut;
 uniform int uMode;
-uniform float uGain, uTime, uZoom, uEdge;
+uniform float uGain, uTime, uZoom, uEdge, uSharp;
 uniform vec2 uRes;
 float L(vec3 c){ return dot(c, vec3(.299,.587,.114)); }
 float H(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }
@@ -51,6 +51,11 @@ void main(){
   vec2 uv = (vUv - .5) / uZoom + .5;
   vec2 px = 1. / uRes;
   vec3 c = S(uv);
+  if (uSharp > 0.) {                                   // detail recovery on the clean stacked image
+    vec3 b = (S(uv+vec2(px.x,0.)) + S(uv-vec2(px.x,0.)) + S(uv+vec2(0.,px.y)) + S(uv-vec2(0.,px.y))) * .25;
+    vec3 b2 = (S(uv+px) + S(uv-px) + S(uv+vec2(px.x,-px.y)) + S(uv+vec2(-px.x,px.y))) * .25;
+    c = clamp(c + (c - mix(b, b2, .35)) * uSharp, 0., 1.);
+  }
   float l = L(c);
   float g = uGain;
   vec3 col;
@@ -103,6 +108,19 @@ void main(){
   o = vec4(clamp(col, 0., 1.), 1.);
 }`
 
+
+const PIP_FS = `#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 o;
+uniform sampler2D uCur;
+uniform float uMirror;
+uniform vec2 uScale;
+void main(){
+  vec2 uv = (vUv - .5) * uScale + .5;
+  if (uMirror > .5) uv.x = 1. - uv.x;
+  o = vec4(texture(uCur, uv).rgb, 1.);
+}`
+
 function buildLut() {
   const stops = [
     [[0,0,0],[.2,0,.35],[.45,.05,.55],[.8,.15,.25],[1,.55,0],[1,.9,.2],[1,1,1]], // iron
@@ -150,6 +168,7 @@ export function createRenderer(canvas) {
   const halfFloat = !!gl.getExtension('EXT_color_buffer_float')
   const acc = program(gl, ACC_FS)
   const disp = program(gl, DISP_FS)
+  const pip = program(gl, PIP_FS)
 
   const vbo = gl.createBuffer()
   gl.bindBuffer(gl.ARRAY_BUFFER, vbo)
@@ -168,6 +187,7 @@ export function createRenderer(canvas) {
   }
 
   const video = mkTex()
+  const video2 = mkTex()
   const lut = mkTex()
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 3, 0, gl.RGBA, gl.UNSIGNED_BYTE, buildLut())
 
@@ -214,6 +234,7 @@ export function createRenderer(canvas) {
     gl.uniform1f(acc.u.uAlpha, fresh ? 1 : Math.max(0.04, 1 - o.denoise))
     gl.uniform1f(acc.u.uMirror, o.mirror ? 1 : 0)
     gl.uniform2f(acc.u.uScale, sx, sy)
+    gl.uniform2f(acc.u.uShift, o.shift ? o.shift[0] : 0, o.shift ? o.shift[1] : 0)
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
     cur = 1 - cur; fresh = false
 
@@ -229,13 +250,41 @@ export function createRenderer(canvas) {
     gl.uniform1f(disp.u.uTime, o.time % 1000)
     gl.uniform1f(disp.u.uZoom, o.zoom)
     gl.uniform1f(disp.u.uEdge, o.edge ? 0.85 : 0)
+    gl.uniform1f(disp.u.uSharp, o.sharp || 0)
     gl.uniform2f(disp.u.uRes, W, H)
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
 
     return { sx, sy }
   }
 
-  return { gl, resize, render, reset, halfFloat }
+
+  // Picture-in-picture: second camera composited into the same GPU frame,
+  // so photos, recordings and casts all contain both views.
+  function renderPip(el, r, mirror, border) {
+    const vw = el.videoWidth, vh = el.videoHeight
+    if (!vw || !vh || !W) return
+    const x = Math.round(r.x * W), w = Math.round(r.w * W), h = Math.round(r.h * H)
+    const y = Math.round(H - (r.y * H) - h)                  // GL origin is bottom-left
+    const b = Math.max(2, Math.round(W * 0.004))
+    gl.enable(gl.SCISSOR_TEST)
+    gl.scissor(x - b, y - b, w + 2 * b, h + 2 * b)
+    gl.clearColor(border[0], border[1], border[2], 1); gl.clear(gl.COLOR_BUFFER_BIT)
+    gl.scissor(x, y, w, h)
+    gl.viewport(x, y, w, h)
+    gl.bindTexture(gl.TEXTURE_2D, video2)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, el)
+    const ca = w / h, va = vw / vh
+    gl.useProgram(pip.p)
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, video2)
+    gl.uniform1i(pip.u.uCur, 0)
+    gl.uniform1f(pip.u.uMirror, mirror ? 1 : 0)
+    gl.uniform2f(pip.u.uScale, va > ca ? ca / va : 1, va > ca ? 1 : va / ca)
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+    gl.disable(gl.SCISSOR_TEST)
+    gl.viewport(0, 0, W, H)
+  }
+
+  return { gl, resize, render, renderPip, reset, halfFloat }
 }
 
 // Map a point in normalized raw-video space (0..1) to normalized screen space.

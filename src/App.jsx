@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { MODES, createRenderer, videoToScreen } from './gl.js'
-import { createMotion, vault, stamp, sha256, beep, recorderType, shareBlob, download, dataUrlToBlob } from './engine.js'
+import { createMotion, createAligner, vault, stamp, sha256, beep, recorderType, shareBlob, download, dataUrlToBlob } from './engine.js'
 import { Sheet, Btn, Section, Toggle, Slider, Tool, FONT, DISPLAY, PANEL } from './ui.jsx'
 
 const PRESETS = [
@@ -97,6 +97,11 @@ export default function App() {
   const [cast, setCast] = useState({ on: false, code: '', viewers: 0, status: 'idle' })
   const [storage, setStorage] = useState(null)
   const [toast, setToast] = useState(null)
+  const [dual, setDual] = useState(false)
+  const [dualOk, setDualOk] = useState(false)
+  const [sr, setSr] = useState(false)
+  const [srFrames, setSrFrames] = useState(0)
+  const [stealth, setStealth] = useState(false)
 
   const M = MODES[mode]
   const color = M.color
@@ -104,14 +109,16 @@ export default function App() {
   const { stream, error } = useCamera(facing, attempt)
   const { model, state: aiState } = useDetector(ai)
 
-  const videoRef = useRef(null), canvasRef = useRef(null), stageRef = useRef(null)
+  const videoRef = useRef(null), video2Ref = useRef(null), canvasRef = useRef(null), stageRef = useRef(null)
+  const alignRef = useRef(null), srRef = useRef({ n: 0, shift: [0, 0] })
   const rendererRef = useRef(null), geomRef = useRef({ sx: 1, sy: 1 })
   const motionFn = useRef(null), recRef = useRef(null), stopAtRef = useRef(0)
   const lastTrigger = useRef(0), gpsRef = useRef(null), castRef = useRef(null)
   const cfg = useRef({})
   cfg.current = {
     mode: M.idx, ev, zoom, edge, mirror, sens, sentry, alerts, vaultOn,
-    denoise: denoise ?? M.denoise, needMotion: sentry || !ai,
+    denoise: sr ? 0.93 : (denoise ?? M.denoise), needMotion: sentry || !ai,
+    dual: dualOk, mirror2: facing !== 'user', pipColor: color, sr,
   }
 
   const say = useCallback(msg => { setToast(msg); clearTimeout(say.t); say.t = setTimeout(() => setToast(null), 2200) }, [])
@@ -163,6 +170,35 @@ export default function App() {
     return () => { track?.removeEventListener('ended', ended); if (gid != null) navigator.geolocation.clearWatch(gid) }
   }, [stream])
 
+  // ── second camera — verify the browser really runs both at once ──
+  useEffect(() => {
+    if (!dual || !stream) return
+    let dead = false, s2 = null
+    const other = facing === 'user' ? 'environment' : 'user'
+    ;(async () => {
+      try {
+        s2 = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { exact: other }, width: { ideal: 1280 }, height: { ideal: 720 } } })
+        if (dead) { s2.getTracks().forEach(t => t.stop()); return }
+        const v2 = video2Ref.current
+        v2.srcObject = s2
+        await v2.play().catch(() => {})
+        const v = videoRef.current, t0 = v?.currentTime
+        await new Promise(r => setTimeout(r, 1300))
+        if (dead) return
+        const main = stream.getVideoTracks()[0]
+        if (!(main?.readyState === 'live' && !main.muted && v && v.currentTime !== t0 && v2.videoWidth > 0)) {
+          s2.getTracks().forEach(t => t.stop()); v2.srcObject = null
+          setDual(false); setDualOk(false)
+          say('This browser can only run one camera at a time')
+          setAttempt(a => a + 1)
+          return
+        }
+        setDualOk(true)
+      } catch { if (!dead) { setDual(false); setDualOk(false); say('Second camera not available here') } }
+    })()
+    return () => { dead = true; s2?.getTracks().forEach(t => t.stop()); if (video2Ref.current) video2Ref.current.srcObject = null; setDualOk(false) }
+  }, [dual, facing, stream, say])
+
   // ── renderer + resize ──
   useEffect(() => {
     const cv = canvasRef.current, stage = stageRef.current
@@ -172,20 +208,24 @@ export default function App() {
     if (!r) { setGlFail(true); return }
     rendererRef.current = r
     motionFn.current = createMotion()
+    alignRef.current = createAligner()
     const fit = () => {
       const b = stage.getBoundingClientRect()
-      const dpr = Math.min(window.devicePixelRatio || 1, 2) * QUALITY[quality]
+      const dpr = Math.min(window.devicePixelRatio || 1, 2) * (sr ? 1 : QUALITY[quality])
       let w = Math.round(b.width * dpr), h = Math.round(b.height * dpr)
-      const cap = 1600, long = Math.max(w, h)
+      const cap = sr ? 2048 : 1600, long = Math.max(w, h)
       if (long > cap) { w = Math.round(w * cap / long); h = Math.round(h * cap / long) }
       r.resize(Math.max(2, w), Math.max(2, h))
     }
     fit()
     const ro = new ResizeObserver(fit); ro.observe(stage)
     return () => ro.disconnect()
-  }, [quality])
+  }, [quality, sr])
 
-  useEffect(() => { rendererRef.current?.reset() }, [mode, facing])
+  useEffect(() => {
+    rendererRef.current?.reset(); alignRef.current?.reset()
+    srRef.current = { n: 0, shift: [0, 0] }; setSrFrames(0)
+  }, [mode, facing, sr])
 
   // ── recording ──
   const startRec = useCallback((auto = false) => {
@@ -229,8 +269,22 @@ export default function App() {
     const loop = t => {
       const v = videoRef.current, r = rendererRef.current, S = cfg.current
       if (v && r && v.readyState >= 2) {
-        const g = r.render(v, { mode: S.mode, gain: Math.pow(2, S.ev), denoise: S.denoise, zoom: S.zoom, edge: S.edge, mirror: S.mirror, time: t / 1000 })
+        let shift = null, sharp = 0
+        if (S.sr && alignRef.current) {
+          const a = alignRef.current.estimate(v), st = srRef.current
+          if (a.lost) { alignRef.current.reset(); r.reset(); st.n = 0; st.shift = [0, 0] }
+          else { st.shift = [-a.dx, -a.dy]; st.n++ }
+          shift = st.shift
+          sharp = Math.min(1.6, 0.25 + st.n * 0.05)
+          if ((st.n & 7) === 0 || a.lost) setSrFrames(Math.min(st.n, 40))
+        }
+        const g = r.render(v, { mode: S.mode, gain: Math.pow(2, S.ev), denoise: S.denoise, zoom: S.zoom, edge: S.edge, mirror: S.mirror, time: t / 1000, shift, sharp })
         if (g) geomRef.current = g
+        const v2 = video2Ref.current
+        if (S.dual && v2 && v2.readyState >= 2) {
+          const cv = canvasRef.current, w = 0.30
+          r.renderPip(v2, { x: 0.67, y: 0.12, w, h: w * (cv.width / cv.height) * (4 / 3) }, S.mirror2, hexRgb(S.pipColor))
+        }
         frames++
         if (S.needMotion && (++tick & 1) === 0 && motionFn.current) {
           const m = motionFn.current(v, S.sens)
@@ -381,6 +435,7 @@ export default function App() {
   return (
     <div style={{ position: 'fixed', inset: 0, background: '#000', overflow: 'hidden', fontFamily: FONT, color: '#e9f1ec' }}>
       <video ref={videoRef} muted playsInline autoPlay style={{ position: 'absolute', width: 1, height: 1, opacity: 0, pointerEvents: 'none' }} />
+      <video ref={video2Ref} muted playsInline autoPlay style={{ position: 'absolute', width: 1, height: 1, opacity: 0, pointerEvents: 'none' }} />
 
       {/* ══ STAGE ══ */}
       <div ref={stageRef} onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}
@@ -416,6 +471,13 @@ export default function App() {
           )
         })}
 
+        {dualOk && (
+          <button onClick={() => setFacing(f => f === 'user' ? 'environment' : 'user')} aria-label="Swap cameras"
+            style={{ position: 'absolute', left: '67%', top: '12%', width: '30%', aspectRatio: '3/4', background: 'transparent', border: 'none', padding: 0, zIndex: 5 }}>
+            <span style={{ position: 'absolute', bottom: 6, left: '50%', transform: 'translateX(-50%)', fontFamily: FONT, fontSize: 11, fontWeight: 800,
+              color: '#fff', background: 'rgba(0,0,0,.65)', borderRadius: 7, padding: '3px 8px', whiteSpace: 'nowrap' }}>⇄ TAP TO SWAP</span>
+          </button>
+        )}
         {flash && <div style={{ position: 'absolute', inset: 0, background: '#fff', opacity: .7, pointerEvents: 'none' }} />}
         {alertFlash && <div style={{ position: 'absolute', inset: 0, boxShadow: 'inset 0 0 0 6px #ff3b5c', pointerEvents: 'none' }} />}
       </div>
@@ -446,23 +508,27 @@ export default function App() {
         padding: 'calc(env(safe-area-inset-top,0px) + 10px) 14px 14px',
         background: 'linear-gradient(to bottom, rgba(0,0,0,.92), rgba(0,0,0,.5) 65%, transparent)',
         display: 'flex', alignItems: 'center', gap: 12 }}>
+        <img src="/icon.svg" alt="" style={{ width: 30, height: 30, borderRadius: 8, filter: `drop-shadow(0 0 8px ${color}66)` }} />
         <span style={{ fontFamily: DISPLAY, fontSize: 19, fontWeight: 900, color, letterSpacing: 3, textShadow: `0 0 16px ${color}77` }}>NVS</span>
         <span style={{ fontSize: 14, fontWeight: 700, color }}>{M.label}</span>
         <span style={{ flex: 1 }} />
         {recording && <Pill c="#ff4d4d" blink>● REC</Pill>}
         {sentry && <Pill c="#ff3b5c">🛡 ARMED</Pill>}
+        {sr && <Pill c="#ffaaff">🔬 SR</Pill>}
+        {dualOk && <Pill c="#c89bff">⧉ DUAL</Pill>}
         {cast.on && <Pill c="#5cd6ff">📡 {cast.viewers}</Pill>}
         {ai && <Pill c={aiState === 'ready' ? '#7dff9a' : '#ffd23f'} blink={aiState === 'loading'}>{aiState === 'ready' ? 'AI ✓' : aiState === 'failed' ? 'AI ✗' : 'AI …'}</Pill>}
         <span style={{ fontSize: 13, color: 'rgba(233,241,236,.8)' }}>{clock}</span>
       </div>
 
       {/* ══ READOUT CHIP ══ */}
-      <div style={{ position: 'absolute', left: 14, zIndex: 20, bottom: 'calc(env(safe-area-inset-bottom,0px) + 250px)',
+      <div style={{ position: 'absolute', left: 14, zIndex: 20, bottom: 'calc(env(safe-area-inset-bottom,0px) + 318px)',
         display: 'flex', gap: 8, flexWrap: 'wrap' }}>
         <Chip>EV {ev > 0 ? '+' : ''}{ev.toFixed(1)}</Chip>
         {zoom > 1.01 && <Chip>{zoom.toFixed(1)}×</Chip>}
         <Chip>{fps} FPS</Chip>
         {gps && <Chip>📍 ±{Math.round(gps.acc)}m</Chip>}
+        {sr && <Chip>🔬 {srFrames < 32 ? `SUPER-RES ${Math.round(srFrames / 32 * 100)}% · HOLD STILL` : 'SUPER-RES READY'}</Chip>}
       </div>
 
       {toast && (
@@ -508,15 +574,24 @@ export default function App() {
           <Round onClick={toggleTorch} label="TORCH" active={torch} c="#ffd27a" dim={!torchOk}>🔦</Round>
         </div>
 
-        {/* tool strip */}
-        <div style={{ display: 'flex', gap: 8, padding: '0 12px' }}>
-          <Tool icon="⚙" label="SETTINGS" c={color} on onClick={() => setSheet('settings')} />
-          <Tool icon="◎" label="AI" c="#7dff9a" on={ai} onClick={() => setAi(a => !a)} />
-          <Tool icon="🛡" label="SENTRY" c="#ff3b5c" on={sentry} onClick={() => { setSentry(s => !s); say(sentry ? 'Sentry disarmed' : 'Sentry armed — records on motion') }} />
-          <Tool icon="📡" label="CAST" c="#5cd6ff" on={cast.on} onClick={() => setSheet('cast')} />
-          <Tool icon="?" label="HELP" c={color} onClick={() => setSheet('help')} />
+        {/* tool strip — two rows */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: '0 12px' }}>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <Tool icon="⚙" label="SETTINGS" c={color} on onClick={() => setSheet('settings')} />
+            <Tool icon="◎" label="AI" c="#7dff9a" on={ai} onClick={() => setAi(a => !a)} />
+            <Tool icon="🛡" label="SENTRY" c="#ff3b5c" on={sentry} onClick={() => { setSentry(x => !x); say(sentry ? 'Sentry disarmed' : 'Sentry armed — records on motion') }} />
+            <Tool icon="⧉" label="DUAL" c="#c89bff" on={dual} onClick={() => { setDual(d => !d); if (!dual) say('Starting second camera…') }} />
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <Tool icon="🔬" label="SUPER-RES" c="#ffaaff" on={sr} onClick={() => { setSr(x => !x); if (!sr) say('Super-res — hold the phone still') }} />
+            <Tool icon="🌑" label="STEALTH" c="#9aa4b2" onClick={() => setStealth(true)} />
+            <Tool icon="📡" label="CAST" c="#5cd6ff" on={cast.on} onClick={() => setSheet('cast')} />
+            <Tool icon="?" label="HELP" c={color} onClick={() => setSheet('help')} />
+          </div>
         </div>
       </div>
+
+      {stealth && <Stealth recording={recording} sentry={sentry} cast={cast.on} onWake={() => setStealth(false)} />}
 
       {/* ══ SETTINGS ══ */}
       {sheet === 'settings' && (
@@ -536,6 +611,8 @@ export default function App() {
             onChange={setDenoise} fmt={v => denoise === null ? `AUTO ${Math.round(v * 100)}%` : `${Math.round(v * 100)}%`} />
           {denoise !== null && <Btn color={color} onClick={() => setDenoise(null)}>RESET NOISE TO AUTO</Btn>}
           <Slider color={color} label="ZOOM" value={zoom} min={1} max={8} step={0.1} onChange={setZoom} fmt={v => `${v.toFixed(1)}×`} />
+          <Toggle color={color} label="SUPER-RESOLUTION" hint="Aligns and stacks frames on the GPU to recover real detail. Hold still." on={sr} onClick={() => setSr(x => !x)} c="#ffaaff" />
+          <Toggle color={color} label="DUAL CAMERA" hint="Front + rear together, where the browser allows it" on={dual} onClick={() => setDual(d => !d)} c="#c89bff" />
 
           <Section color={color}>OVERLAYS</Section>
           <Toggle color={color} label="AI OBJECT DETECTION" hint="Names 80 object types. Downloads ~2MB once." on={ai} onClick={() => setAi(a => !a)} c="#7dff9a" />
@@ -628,6 +705,9 @@ export default function App() {
             ['Seeing in the dark', 'Use NIGHT and raise exposure. Noise reduction blends recent frames on the GPU — hold steady for the cleanest image. For stars and extreme darkness use ASTRO and brace the phone.'],
             ['Thermal modes', 'THERMAL, WHT-HOT, BLK-HOT, RAINBOW and ARCTIC map brightness to false color. Phone cameras see light, not heat — these are visualizations, not real thermal imaging.'],
             ['AI detection', 'Turn on AI to name objects (person, car, dog…) with confidence scores. The model downloads once, then works offline.'],
+            ['Super-resolution', 'Turn on SUPER-RES and hold still. Each frame is aligned to the first on the GPU, then averaged and sharpened, so detail builds up and noise cancels out. The chip shows progress; moving too far restarts the stack.'],
+            ['Stealth', 'STEALTH blacks out the screen so it emits no light, while the camera, sentry, recording and cast keep running. Double-tap anywhere to wake.'],
+            ['Dual camera', 'DUAL shows front and rear together, with the second camera as an inset that is included in photos, videos and casts. Tap the inset to swap. Works where the browser allows two cameras at once (Chrome on many Android phones). Safari on iPhone stops the first camera when a second opens, so there DUAL will tell you and fall back to FLIP. Native apps like Snapchat use iOS multi-camera APIs that websites cannot reach.'],
             ['Sentry', 'Arm SENTRY and set the phone down. Motion or a person triggers an alert and a 15-second clip that extends while activity continues.'],
             ['Evidence', 'GEO-STAMP burns UTC time and GPS into every photo and stores a SHA-256 hash, so you can later prove the image was not altered.'],
             ['Your data', 'Photos and videos stay on this device in the vault. Nothing is uploaded. Cast is direct device-to-device.'],
@@ -640,6 +720,23 @@ export default function App() {
           ))}
         </Sheet>
       )}
+    </div>
+  )
+}
+
+function hexRgb(h) { const n = parseInt(h.slice(1), 16); return [(n >> 16 & 255) / 255, (n >> 8 & 255) / 255, (n & 255) / 255] }
+
+function Stealth({ recording, sentry, cast, onWake }) {
+  const last = useRef(0)
+  const tap = () => { const n = Date.now(); if (n - last.current < 350) onWake(); last.current = n }
+  return (
+    <div onClick={tap} style={{ position: 'fixed', inset: 0, zIndex: 300, background: '#000', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 14 }}>
+      <div style={{ fontFamily: FONT, fontSize: 12, letterSpacing: 3, color: 'rgba(120,255,160,.14)' }}>STEALTH · DOUBLE-TAP TO WAKE</div>
+      <div style={{ display: 'flex', gap: 16, fontFamily: FONT, fontSize: 11, letterSpacing: 2 }}>
+        {recording && <span style={{ color: 'rgba(255,80,80,.3)', animation: 'blink 1.6s steps(1) infinite' }}>● REC</span>}
+        {sentry && <span style={{ color: 'rgba(255,60,90,.26)' }}>ARMED</span>}
+        {cast && <span style={{ color: 'rgba(92,214,255,.26)' }}>CASTING</span>}
+      </div>
     </div>
   )
 }
