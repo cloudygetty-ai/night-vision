@@ -22,6 +22,11 @@ const VS = `#version 300 es
 in vec2 aPos; out vec2 vUv;
 void main(){ vUv = vec2(aPos.x*.5+.5, .5-aPos.y*.5); gl_Position = vec4(aPos,0.,1.); }`
 
+// Display pass reads an FBO (already bottom-up in GL space) so it must NOT flip.
+const VS_FLAT = `#version 300 es
+in vec2 aPos; out vec2 vUv;
+void main(){ vUv = aPos * .5 + .5; gl_Position = vec4(aPos,0.,1.); }`
+
 const ACC_FS = `#version 300 es
 precision highp float;
 in vec2 vUv; out vec4 o;
@@ -146,9 +151,9 @@ function compile(gl, type, src) {
   if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s))
   return s
 }
-function program(gl, fs) {
+function program(gl, fs, vs = VS) {
   const p = gl.createProgram()
-  gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, VS))
+  gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, vs))
   gl.attachShader(p, compile(gl, gl.FRAGMENT_SHADER, fs))
   gl.bindAttribLocation(p, 0, 'aPos'); gl.linkProgram(p)
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p))
@@ -167,7 +172,7 @@ export function createRenderer(canvas) {
 
   const halfFloat = !!gl.getExtension('EXT_color_buffer_float')
   const acc = program(gl, ACC_FS)
-  const disp = program(gl, DISP_FS)
+  const disp = program(gl, DISP_FS, VS_FLAT)
   const pip = program(gl, PIP_FS)
 
   const vbo = gl.createBuffer()
