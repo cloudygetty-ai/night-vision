@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { MODES, createRenderer, videoToScreen } from './gl.js'
-import { createMotion, createAligner, vault, stamp, sha256, beep, recorderType, shareBlob, download, dataUrlToBlob } from './engine.js'
+import { createMotion, createAligner, vault, stamp, sha256, beep, recorderType, shareBlob, download, dataUrlToBlob,
+         fitCanvas, pickBitrate, resLabel } from './engine.js'
 import { Sheet, Btn, Section, Toggle, Slider, Tool, FONT, DISPLAY, PANEL } from './ui.jsx'
 
 const PRESETS = [
@@ -9,7 +10,7 @@ const PRESETS = [
   { id: 'ASTRO',   icon: '✨', mode: 9, ev: 2,   zoom: 1, edge: false, ai: false, sentry: false, sens: 0.3 },
   { id: 'SEARCH',  icon: '🔍', mode: 3, ev: 0.5, zoom: 1, edge: true,  ai: true,  sentry: false, sens: 0.85 },
 ]
-const QUALITY = { HIGH: 1, BALANCED: 0.75, SAVER: 0.5 }
+const QUALITY_ORDER = ['ULTRA', 'HIGH', 'BALANCED', 'SAVER']
 
 // ── camera ─────────────────────────────────────────────────────────────────
 function useCamera(facing, attempt) {
@@ -22,7 +23,7 @@ function useCamera(facing, attempt) {
       try {
         s = await navigator.mediaDevices.getUserMedia({
           audio: false,
-          video: { facingMode: { ideal: facing }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
+          video: { facingMode: { ideal: facing }, width: { ideal: 3840 }, height: { ideal: 2160 }, frameRate: { ideal: 30 } },
         })
         if (!live) { s.getTracks().forEach(t => t.stop()); return }
         setStream(s)
@@ -72,7 +73,7 @@ export default function App() {
   const [alerts, setAlerts] = useState(true)
   const [stampOn, setStampOn] = useState(true)
   const [vaultOn, setVaultOn] = useState(true)
-  const [quality, setQuality] = useState('BALANCED')
+  const [quality, setQuality] = useState('ULTRA')
   const [preset, setPreset] = useState(null)
 
   // ── runtime ──
@@ -92,6 +93,8 @@ export default function App() {
   const [viewer, setViewer] = useState(null)
   const [gps, setGps] = useState(null)
   const [glFail, setGlFail] = useState(false)
+  const [renderRes, setRenderRes] = useState({ w: 0, h: 0 })
+  const [camRes, setCamRes] = useState({ w: 0, h: 0 })
   const [clock, setClock] = useState('')
   const [alertFlash, setAlertFlash] = useState(false)
   const [cast, setCast] = useState({ on: false, code: '', viewers: 0, status: 'idle' })
@@ -118,7 +121,7 @@ export default function App() {
   cfg.current = {
     mode: M.idx, ev, zoom, edge, mirror, sens, sentry, alerts, vaultOn,
     denoise: sr ? 0.93 : (denoise ?? M.denoise), needMotion: sentry || !ai,
-    dual: dualOk, mirror2: facing !== 'user', pipColor: color, sr,
+    dual: dualOk, mirror2: facing !== 'user', pipColor: color, sr, quality,
   }
 
   const say = useCallback(msg => { setToast(msg); clearTimeout(say.t); say.t = setTimeout(() => setToast(null), 2200) }, [])
@@ -155,10 +158,20 @@ export default function App() {
     if (!v || !stream) return
     v.srcObject = stream
     v.play().then(() => setNeedsTap(false)).catch(() => setNeedsTap(true))
+    const meta = () => setCamRes({ w: v.videoWidth, h: v.videoHeight })
+    v.addEventListener('loadedmetadata', meta); if (v.videoWidth) meta()
     const track = stream.getVideoTracks()[0]
     setTorchOk(!!track?.getCapabilities?.()?.torch); setTorch(false)
     const ended = () => setAttempt(a => a + 1)
     track?.addEventListener('ended', ended)
+    // ask the track directly for the highest mode it supports
+    ;(async () => {
+      try {
+        const caps = track?.getCapabilities?.()
+        if (caps?.width?.max && caps.width.max > (track.getSettings()?.width || 0))
+          await track.applyConstraints({ width: { ideal: caps.width.max }, height: { ideal: caps.height?.max } })
+      } catch {}
+    })()
     rendererRef.current?.reset()
     // GPS starts only once the camera is live
     let gid = null
@@ -211,16 +224,16 @@ export default function App() {
     alignRef.current = createAligner()
     const fit = () => {
       const b = stage.getBoundingClientRect()
-      const dpr = Math.min(window.devicePixelRatio || 1, 2) * (sr ? 1 : QUALITY[quality])
-      let w = Math.round(b.width * dpr), h = Math.round(b.height * dpr)
-      const cap = sr ? 2048 : 1600, long = Math.max(w, h)
-      if (long > cap) { w = Math.round(w * cap / long); h = Math.round(h * cap / long) }
-      r.resize(Math.max(2, w), Math.max(2, h))
+      const v = videoRef.current
+      const { w, h } = fitCanvas(b.width, b.height, window.devicePixelRatio || 1,
+        cfg.current.quality, v?.videoWidth || 0, v?.videoHeight || 0, cfg.current.sr)
+      r.resize(w, h)
+      setRenderRes({ w, h })
     }
     fit()
     const ro = new ResizeObserver(fit); ro.observe(stage)
     return () => ro.disconnect()
-  }, [quality, sr])
+  }, [quality, sr, camRes.w, camRes.h])
 
   useEffect(() => {
     rendererRef.current?.reset(); alignRef.current?.reset()
@@ -232,7 +245,7 @@ export default function App() {
     const c = canvasRef.current
     if (!c || recRef.current || !window.MediaRecorder) return
     const type = recorderType()
-    const rec = new MediaRecorder(c.captureStream(30), type ? { mimeType: type, videoBitsPerSecond: 6_000_000 } : undefined)
+    const rec = new MediaRecorder(c.captureStream(30), type ? { mimeType: type, videoBitsPerSecond: pickBitrate(c.width, c.height, 30) } : undefined)
     const chunks = [], t0 = Date.now()
     rec.ondataavailable = e => { if (e.data?.size) chunks.push(e.data) }
     rec.onstop = async () => {
@@ -634,13 +647,14 @@ export default function App() {
           )}
 
           <Section color={color}>PERFORMANCE</Section>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
-            {Object.keys(QUALITY).map(q => (
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 8 }}>
+            {QUALITY_ORDER.map(q => (
               <Btn key={q} color={color} active={quality === q} onClick={() => setQuality(q)} style={{ fontSize: 12, padding: '12px 4px' }}>{q}</Btn>
             ))}
           </div>
           <div style={{ fontSize: 12.5, color: 'rgba(233,241,236,.62)', lineHeight: 1.5, padding: '0 4px' }}>
-            Running at {fps} FPS · {rendererRef.current?.halfFloat ? 'high-precision' : 'standard'} GPU buffers. Choose SAVER on older phones or to save battery.
+            Sensor {camRes.w ? `${camRes.w}×${camRes.h} (${resLabel(camRes.w, camRes.h)})` : '—'} · rendering {renderRes.w ? `${renderRes.w}×${renderRes.h}` : '—'} at {fps} FPS · {rendererRef.current?.halfFloat ? 'high-precision' : 'standard'} GPU buffers.
+            ULTRA renders at full sensor resolution; choose SAVER on older phones or to save battery.
           </div>
         </Sheet>
       )}

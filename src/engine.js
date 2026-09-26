@@ -2,52 +2,163 @@
 // NVS-15 ENGINE — cheap CPU-side services (everything heavy lives in gl.js)
 // ═════════════════════════════════════════════════════════════════════════
 
-// ── MOTION: 96×54 luminance diff → 12×6 cell grid → merged boxes ──────────
-export function createMotion() {
-  const W = 96, H = 54, CW = 8, CH = 9, GX = W / CW, GY = H / CH
-  const c = document.createElement('canvas'); c.width = W; c.height = H
-  const ctx = c.getContext('2d', { willReadFrequently: true })
-  let prev = null
-  const lum = new Uint8Array(W * H)
 
-  return function detect(video, sensitivity) {
-    ctx.drawImage(video, 0, 0, W, H)
-    const d = ctx.getImageData(0, 0, W, H).data
-    for (let i = 0, j = 0; j < lum.length; i += 4, j++) lum[j] = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8
-    if (!prev) { prev = new Uint8Array(lum); return { frac: 0, boxes: [] } }
+// ── RESOLUTION: pure helpers (unit-tested in tests/resolution.test.mjs) ────
+// Quality ladder: long-edge pixel cap for the render target.
+export const QUALITY_CAP = { ULTRA: 4096, HIGH: 2560, BALANCED: 1600, SAVER: 1100 }
+export const QUALITY_DPR = { ULTRA: 3, HIGH: 2.5, BALANCED: 2, SAVER: 1.5 }
 
-    const thr = 14 + (1 - sensitivity) * 36
-    const cells = new Uint16Array(GX * GY)
-    let changed = 0
-    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
-      const k = y * W + x
-      if (Math.abs(lum[k] - prev[k]) > thr) { changed++; cells[((y / CH) | 0) * GX + ((x / CW) | 0)]++ }
-    }
-    prev.set(lum)
+// Size the WebGL drawing buffer. Never render above the source resolution
+// (pure upscale costs GPU and adds nothing) unless super-res is stacking
+// frames, which genuinely creates detail beyond one frame.
+export function fitCanvas(cssW, cssH, dpr, quality = 'HIGH', srcW = 0, srcH = 0, sr = false) {
+  const cap = QUALITY_CAP[quality] || QUALITY_CAP.HIGH
+  const d = Math.min(Math.max(dpr || 1, 1), QUALITY_DPR[quality] || 2)
+  let w = Math.round(cssW * d), h = Math.round(cssH * d)
+  const srcLong = Math.max(srcW, srcH)
+  // cover-crop means the source must fill the shorter axis too
+  const ceiling = srcLong ? Math.round(srcLong * (sr ? 1.5 : 1)) : cap
+  const limit = Math.min(cap, ceiling)
+  const long = Math.max(w, h)
+  if (long > limit) { const k = limit / long; w = Math.round(w * k); h = Math.round(h * k) }
+  return { w: Math.max(2, w), h: Math.max(2, h), dpr: d }
+}
 
-    const active = new Uint8Array(GX * GY)
-    const need = CW * CH * 0.18
-    for (let i = 0; i < cells.length; i++) active[i] = cells[i] > need ? 1 : 0
+// Bitrate scaled to pixel count — 6 Mbps is fine at 1080p and mush at 4K.
+export function pickBitrate(w, h, fps = 30) {
+  const bpp = 0.10                                   // bits per pixel per frame
+  return Math.round(Math.min(120e6, Math.max(4e6, w * h * fps * bpp)))
+}
 
-    const seen = new Uint8Array(GX * GY), boxes = []
-    for (let s = 0; s < active.length; s++) {
-      if (!active[s] || seen[s]) continue
-      let x0 = GX, y0 = GY, x1 = 0, y1 = 0, n = 0
-      const q = [s]; seen[s] = 1
-      while (q.length) {
-        const k = q.pop(), x = k % GX, y = (k / GX) | 0
-        n++; x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y)
-        for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
-          const nx = x + dx, ny = y + dy
-          if (nx < 0 || ny < 0 || nx >= GX || ny >= GY) continue
-          const nk = ny * GX + nx
-          if (active[nk] && !seen[nk]) { seen[nk] = 1; q.push(nk) }
-        }
+export function resLabel(w, h) {
+  const long = Math.max(w, h)
+  if (long >= 3400) return '4K'
+  if (long >= 2500) return 'QHD'
+  if (long >= 1800) return 'FHD'
+  if (long >= 1200) return 'HD'
+  return `${long}p`
+}
+
+// ── MOTION DETECTION ──────────────────────────────────────────────────────
+// analyzeMotion is pure (arrays in, boxes out) so it can be unit-tested.
+//  1. adaptive threshold from the frame's own noise floor
+//  2. 20×10 cell occupancy grid
+//  3. morphological close (dilate → erode) to merge a target split across cells
+//  4. 8-connected labelling, tight pixel-accurate bounds
+//  5. camera-pan suppression when the whole grid lights up
+export const MOTION_W = 160, MOTION_H = 90, CELL_W = 8, CELL_H = 9
+export const GRID_X = MOTION_W / CELL_W, GRID_Y = MOTION_H / CELL_H   // 20 × 10
+
+export function analyzeMotion(cur, prev, sensitivity = 0.6, opts = {}) {
+  const W = opts.W || MOTION_W, H = opts.H || MOTION_H
+  const CW = opts.CW || CELL_W, CH = opts.CH || CELL_H
+  const GX = W / CW, GY = H / CH
+  const n = W * H
+
+  // Noise floor from a LOW PERCENTILE of the frame difference, not the mean:
+  // a large moving object (or a pan) inflates the mean and would otherwise
+  // raise the threshold high enough to hide the very thing we want to see.
+  const samp = []
+  for (let i = 0; i < n; i += 7) samp.push(Math.abs(cur[i] - prev[i]))
+  samp.sort((a, b) => a - b)
+  const p = q => samp[Math.min(samp.length - 1, Math.floor(samp.length * q))]
+  const floor20 = p(0.20), mid = p(0.5)
+  const thr = Math.max(6, floor20 * 2.0 + 5 + (1 - sensitivity) * 30)
+
+  const diff = new Uint8Array(n)
+  const cells = new Uint16Array(GX * GY)
+  let changed = 0
+  for (let y = 0; y < H; y++) {
+    const row = y * W, cy = (y / CH) | 0
+    for (let x = 0; x < W; x++) {
+      if (Math.abs(cur[row + x] - prev[row + x]) > thr) {
+        diff[row + x] = 1; changed++; cells[cy * GX + ((x / CW) | 0)]++
       }
-      if (n >= 1) boxes.push({ x: x0 / GX, y: y0 / GY, w: (x1 - x0 + 1) / GX, h: (y1 - y0 + 1) / GY, cells: n })
     }
-    boxes.sort((a, b) => b.cells - a.cells)
-    return { frac: changed / (W * H), boxes: boxes.slice(0, 6) }
+  }
+
+  const need = CW * CH * (0.10 + (1 - sensitivity) * 0.18)
+  let on = new Uint8Array(GX * GY)
+  for (let i = 0; i < cells.length; i++) on[i] = cells[i] >= need ? 1 : 0
+  const activeCells = on.reduce((a, b) => a + b, 0)
+
+  // a pan or shake lights up nearly everything — not a target
+  // Pan/shake vs. a large subject: both change a lot of pixels, but a pan
+  // changes them EVERYWHERE while a subject changes one region. Judge by
+  // spatial spread across rows and columns, not by raw area.
+  const frac = changed / n
+  const colUsed = new Uint8Array(GX), rowUsed = new Uint8Array(GY)
+  for (let i = 0; i < on.length; i++) if (on[i]) { colUsed[i % GX] = 1; rowUsed[(i / GX) | 0] = 1 }
+  const cols = colUsed.reduce((a, b) => a + b, 0), rows = rowUsed.reduce((a, b) => a + b, 0)
+  const spread = cols >= GX * 0.8 && rows >= GY * 0.8
+  if (activeCells > GX * GY * 0.6 || (spread && activeCells > GX * GY * 0.35) || (mid > thr && spread))
+    return { frac, boxes: [], panning: true }
+
+  const morph = (src, grow) => {
+    const out = new Uint8Array(src.length)
+    for (let y = 0; y < GY; y++) for (let x = 0; x < GX; x++) {
+      let hit = grow ? 0 : 1
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx, ny = y + dy
+        const v = (nx < 0 || ny < 0 || nx >= GX || ny >= GY) ? 0 : src[ny * GX + nx]
+        if (grow) hit |= v; else hit &= v
+      }
+      out[y * GX + x] = hit
+    }
+    return out
+  }
+  on = morph(morph(on, true), false)   // close: bridges a target split across cells
+
+  const seen = new Uint8Array(GX * GY), boxes = []
+  for (let s0 = 0; s0 < on.length; s0++) {
+    if (!on[s0] || seen[s0]) continue
+    const stack = [s0]; seen[s0] = 1
+    const members = []
+    while (stack.length) {
+      const k = stack.pop(); members.push(k)
+      const x = k % GX, y = (k / GX) | 0
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx, ny = y + dy
+        if (nx < 0 || ny < 0 || nx >= GX || ny >= GY) continue
+        const nk = ny * GX + nx
+        if (on[nk] && !seen[nk]) { seen[nk] = 1; stack.push(nk) }
+      }
+    }
+    if (members.length < 2) continue                       // single cell = noise
+
+    // tighten to the actual changed pixels inside the cell cluster
+    let x0 = W, y0 = H, x1 = -1, y1 = -1, hits = 0
+    for (const k of members) {
+      const cx = (k % GX) * CW, cy = ((k / GX) | 0) * CH
+      for (let y = cy; y < cy + CH; y++) for (let x = cx; x < cx + CW; x++) {
+        if (!diff[y * W + x]) continue
+        hits++
+        if (x < x0) x0 = x; if (x > x1) x1 = x
+        if (y < y0) y0 = y; if (y > y1) y1 = y
+      }
+    }
+    if (x1 < 0 || hits < 24) continue
+    const w = (x1 - x0 + 1) / W, h = (y1 - y0 + 1) / H
+    if (w < 0.03 || h < 0.03) continue                     // too small to be real
+    boxes.push({ x: x0 / W, y: y0 / H, w, h, score: hits })
+  }
+  boxes.sort((a, b) => b.score - a.score)
+  return { frac: changed / n, boxes: boxes.slice(0, 5), panning: false }
+}
+
+export function createMotion() {
+  const c = document.createElement('canvas'); c.width = MOTION_W; c.height = MOTION_H
+  const ctx = c.getContext('2d', { willReadFrequently: true })
+  const cur = new Uint8Array(MOTION_W * MOTION_H)
+  let prev = null
+  return function detect(video, sensitivity) {
+    ctx.drawImage(video, 0, 0, MOTION_W, MOTION_H)
+    const d = ctx.getImageData(0, 0, MOTION_W, MOTION_H).data
+    for (let i = 0, j = 0; j < cur.length; i += 4, j++) cur[j] = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8
+    if (!prev) { prev = new Uint8Array(cur); return { frac: 0, boxes: [], panning: false } }
+    const out = analyzeMotion(cur, prev, sensitivity)
+    prev.set(cur)
+    return out
   }
 }
 
