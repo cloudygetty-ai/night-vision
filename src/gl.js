@@ -18,9 +18,17 @@ export const MODES = [
   { id: 'ASTRO',   label: 'ASTRO',   color: '#a8c0ff', idx: 9, denoise: 0.93 },
 ]
 
+// Accumulation pass needs TWO coordinate sets:
+//   vUv  — Y-flipped, for the video texture (arrives top-row-first)
+//   vFbo — un-flipped, for the ping-pong FBO (already bottom-up in GL space)
+// Sampling the FBO with vUv blends in a vertically mirrored copy of history.
 const VS = `#version 300 es
-in vec2 aPos; out vec2 vUv;
-void main(){ vUv = vec2(aPos.x*.5+.5, .5-aPos.y*.5); gl_Position = vec4(aPos,0.,1.); }`
+in vec2 aPos; out vec2 vUv; out vec2 vFbo;
+void main(){
+  vUv  = vec2(aPos.x*.5+.5, .5-aPos.y*.5);
+  vFbo = aPos * .5 + .5;
+  gl_Position = vec4(aPos,0.,1.);
+}`
 
 // Display pass reads an FBO (already bottom-up in GL space) so it must NOT flip.
 const VS_FLAT = `#version 300 es
@@ -29,7 +37,7 @@ void main(){ vUv = aPos * .5 + .5; gl_Position = vec4(aPos,0.,1.); }`
 
 const ACC_FS = `#version 300 es
 precision highp float;
-in vec2 vUv; out vec4 o;
+in vec2 vUv; in vec2 vFbo; out vec4 o;
 uniform sampler2D uCur, uPrev;
 uniform float uAlpha, uMirror;
 uniform vec2 uScale, uShift;
@@ -37,7 +45,7 @@ void main(){
   vec2 uv = (vUv - .5) * uScale + .5 + uShift;
   if (uMirror > .5) uv.x = 1. - uv.x;
   vec3 c = texture(uCur, uv).rgb;
-  vec3 p = texture(uPrev, vUv).rgb;
+  vec3 p = texture(uPrev, vFbo).rgb;        // FBO space — must NOT be flipped
   o = vec4(mix(p, c, uAlpha), 1.);
 }`
 
