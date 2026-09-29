@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { MODES, createRenderer, videoToScreen } from './gl.js'
 import { createMotion, createAligner, vault, stamp, sha256, beep, recorderType, shareBlob, download, dataUrlToBlob,
-         fitCanvas, pickBitrate, resLabel } from './engine.js'
+         fitCanvas, pickBitrate, resLabel, autoExposure } from './engine.js'
 import { Sheet, Btn, Section, Toggle, Slider, Tool, FONT, DISPLAY, PANEL } from './ui.jsx'
 
 const PRESETS = [
@@ -74,6 +74,7 @@ export default function App() {
   const [stampOn, setStampOn] = useState(true)
   const [vaultOn, setVaultOn] = useState(true)
   const [quality, setQuality] = useState('ULTRA')
+  const [agc, setAgc] = useState(true)
   const [preset, setPreset] = useState(null)
 
   // ── runtime ──
@@ -96,6 +97,8 @@ export default function App() {
   const [renderRes, setRenderRes] = useState({ w: 0, h: 0 })
   const [glReady, setGlReady] = useState(0)
   const sizeRef = useRef({ w: 0, h: 0 })
+  const expRef = useRef(1)
+  const [expShow, setExpShow] = useState(1)
   const [camRes, setCamRes] = useState({ w: 0, h: 0 })
   const [clock, setClock] = useState('')
   const [alertFlash, setAlertFlash] = useState(false)
@@ -123,7 +126,7 @@ export default function App() {
   cfg.current = {
     mode: M.idx, ev, zoom, edge, mirror, sens, sentry, alerts, vaultOn,
     denoise: sr ? 0.93 : (denoise ?? M.denoise), needMotion: sentry || !ai,
-    dual: dualOk, mirror2: facing !== 'user', pipColor: color, sr, quality,
+    dual: dualOk, mirror2: facing !== 'user', pipColor: color, sr, quality, agc,
   }
 
   const say = useCallback(msg => { setToast(msg); clearTimeout(say.t); say.t = setTimeout(() => setToast(null), 2200) }, [])
@@ -292,7 +295,7 @@ export default function App() {
 
   // ── the render loop ──
   useEffect(() => {
-    let raf, frames = 0, last = performance.now(), tick = 0, lastUi = 0
+    let raf, frames = 0, last = performance.now(), tick = 0, lastUi = 0, lastExp = 0
     const loop = t => {
       const v = videoRef.current, r = rendererRef.current, S = cfg.current
       if (v && r && v.readyState >= 2) {
@@ -305,7 +308,7 @@ export default function App() {
           sharp = Math.min(1.6, 0.25 + st.n * 0.05)
           if ((st.n & 7) === 0 || a.lost) setSrFrames(Math.min(st.n, 40))
         }
-        const g = r.render(v, { mode: S.mode, gain: Math.pow(2, S.ev), denoise: S.denoise, zoom: S.zoom, edge: S.edge, mirror: S.mirror, time: t / 1000, shift, sharp })
+        const g = r.render(v, { mode: S.mode, gain: Math.pow(2, S.ev), denoise: S.denoise, zoom: S.zoom, edge: S.edge, mirror: S.mirror, time: t / 1000, shift, sharp, exposure: S.agc ? expRef.current : 1 })
         if (g) geomRef.current = g
         const v2 = video2Ref.current
         if (S.dual && v2 && v2.readyState >= 2) {
@@ -313,10 +316,17 @@ export default function App() {
           r.renderPip(v2, { x: 0.67, y: 0.12, w, h: w * (cv.width / cv.height) * (4 / 3) }, S.mirror2, hexRgb(S.pipColor))
         }
         frames++
-        if (S.needMotion && (++tick & 1) === 0 && motionFn.current) {
+        // one downsample serves both AGC and motion detection
+        if ((S.needMotion || S.agc) && (++tick & 1) === 0 && motionFn.current) {
           const m = motionFn.current(v, S.sens)
-          if (S.sentry && m.frac > 0.006 + (1 - S.sens) * 0.02 && m.boxes.length) trigger('motion')
-          if (t - lastUi > 200) { lastUi = t; setMotion(m) }
+          if (S.agc && m.luma) {
+            expRef.current = autoExposure(m.luma, expRef.current)
+            if (t - lastExp > 400) { lastExp = t; setExpShow(expRef.current) }
+          }
+          if (S.needMotion) {
+            if (S.sentry && m.frac > 0.006 + (1 - S.sens) * 0.02 && m.boxes.length) trigger('motion')
+            if (t - lastUi > 200) { lastUi = t; setMotion(m) }
+          }
         }
         const rr = recRef.current
         if (rr?.auto && Date.now() > stopAtRef.current) stopRec()
@@ -552,6 +562,7 @@ export default function App() {
       <div style={{ position: 'absolute', left: 14, zIndex: 20, bottom: 'calc(env(safe-area-inset-bottom,0px) + 318px)',
         display: 'flex', gap: 8, flexWrap: 'wrap' }}>
         <Chip>EV {ev > 0 ? '+' : ''}{ev.toFixed(1)}</Chip>
+        {agc && <Chip>AGC {expShow.toFixed(1)}×</Chip>}
         {zoom > 1.01 && <Chip>{zoom.toFixed(1)}×</Chip>}
         <Chip>{fps} FPS</Chip>
         {gps && <Chip>📍 ±{Math.round(gps.acc)}m</Chip>}
@@ -643,6 +654,7 @@ export default function App() {
 
           <Section color={color}>OVERLAYS</Section>
           <Toggle color={color} label="AI OBJECT DETECTION" hint="Names 80 object types. Downloads ~2MB once." on={ai} onClick={() => setAi(a => !a)} c="#7dff9a" />
+          <Toggle color={color} label="AUTO EXPOSURE" hint="Measures the scene and normalises brightness so modes never blow out. Turn off for manual EV only." on={agc} onClick={() => setAgc(a => !a)} c="#ffe08a" />
           <Toggle color={color} label="EDGE HIGHLIGHT" hint="Outlines shapes in gold" on={edge} onClick={() => setEdge(e => !e)} c="#ffd23f" />
           <Toggle color={color} label="GRID & RETICLE" on={grid} onClick={() => setGrid(g => !g)} />
 

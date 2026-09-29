@@ -54,9 +54,13 @@ precision highp float;
 in vec2 vUv; out vec4 o;
 uniform sampler2D uTex, uLut;
 uniform int uMode;
-uniform float uGain, uTime, uZoom, uEdge, uSharp;
+uniform float uGain, uTime, uZoom, uEdge, uSharp, uExp;
 uniform vec2 uRes;
 float L(vec3 c){ return dot(c, vec3(.299,.587,.114)); }
+// Saturating response curve: approaches 1 but never clips, so highlights
+// roll off into detail instead of flattening into a solid block.
+float TM(float x){ return 1. - exp(-max(x, 0.) * 1.85); }
+vec3 TM3(vec3 c){ return vec3(TM(c.r), TM(c.g), TM(c.b)); }
 float H(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }
 vec3 S(vec2 uv){ return texture(uTex, uv).rgb; }
 vec3 LUT(float v, float row){ return texture(uLut, vec2(clamp(v,0.,1.), (row+.5)/3.)).rgb; }
@@ -70,33 +74,35 @@ void main(){
     c = clamp(c + (c - mix(b, b2, .35)) * uSharp, 0., 1.);
   }
   float l = L(c);
-  float g = uGain;
+  float g = uGain * uExp;                             // user EV × auto exposure
   vec3 col;
 
   if (uMode == 0) {                                   // RAW
-    col = c * g;
+    col = TM3(c * g);
   } else if (uMode == 1) {                            // NIGHT VISION
-    float v = pow(clamp(l*g*2.4, 0., 1.), .6);
+    float v = pow(TM(l * g), .78);
     float bl = 0.;
     for (int i = 0; i < 8; i++) {
       float a = float(i) * .7854;
       bl += L(S(uv + vec2(cos(a), sin(a)) * px * 5.));
     }
     bl /= 8.;
-    v += max(bl*g*2.4 - .55, 0.) * .7;                // phosphor bloom
+    // bloom only from genuine highlights, and it cannot saturate the frame
+    float bloom = max(TM(bl * g) - .72, 0.) * .55;
+    v = min(v + bloom, 1.);                            // phosphor bloom
     col = vec3(.12, 1., .34) * v;
     col += (H(vUv*uRes + uTime) - .5) * (.11*(1.-v) + .02);  // signal-adaptive grain
     col *= 1. - .09 * mod(floor(gl_FragCoord.y), 2.); // scanlines
-  } else if (uMode == 2) { col = LUT(l*g*1.3, 0.);    // THERMAL (iron)
-  } else if (uMode == 3) { float v = clamp((l*g-.5)*1.7+.5, 0., 1.); col = vec3(v);
-  } else if (uMode == 4) { float v = clamp((l*g-.5)*1.7+.5, 0., 1.); col = vec3(1.-v);
-  } else if (uMode == 5) { col = LUT(l*g*1.2, 1.);    // RAINBOW
-  } else if (uMode == 6) { col = LUT(l*g*1.3, 2.);    // ARCTIC
+  } else if (uMode == 2) { col = LUT(TM(l*g), 0.);    // THERMAL (iron)
+  } else if (uMode == 3) { float v = clamp((TM(l*g)-.5)*1.55+.5, 0., 1.); col = vec3(v);
+  } else if (uMode == 4) { float v = clamp((TM(l*g)-.5)*1.55+.5, 0., 1.); col = vec3(1.-v);
+  } else if (uMode == 5) { col = LUT(TM(l*g), 1.);    // RAINBOW
+  } else if (uMode == 6) { col = LUT(TM(l*g), 2.);    // ARCTIC
   } else if (uMode == 7) {                            // TACTICAL: unsharp + contrast
     vec3 b = (S(uv+vec2(px.x,0.)) + S(uv-vec2(px.x,0.)) + S(uv+vec2(0.,px.y)) + S(uv-vec2(0.,px.y))) * .25;
     col = c + (c - b) * 1.8;
     col = (col - .5) * 1.28 + .5;
-    col *= g * vec3(.95, 1.04, .9);
+    col = TM3(col * g) * vec3(.95, 1.04, .9);
   } else if (uMode == 8) {                            // DEHAZE: dark-channel prior
     float d = 1.;
     for (int i = -1; i <= 1; i++) for (int j = -1; j <= 1; j++) {
@@ -104,9 +110,9 @@ void main(){
       d = min(d, min(s.r, min(s.g, s.b)));
     }
     float t = max(1. - .9*d, .22);
-    col = ((c - .86) / t + .86) * g;
+    col = TM3(((c - .86) / t + .86) * g);
   } else {                                            // ASTRO
-    float v = pow(clamp(l*g*3.2, 0., 1.), .5);
+    float v = pow(TM(l * g * 1.3), .62);
     col = v * vec3(.84, .92, 1.08);
   }
 
@@ -264,6 +270,7 @@ export function createRenderer(canvas) {
     gl.uniform1f(disp.u.uZoom, o.zoom)
     gl.uniform1f(disp.u.uEdge, o.edge ? 0.85 : 0)
     gl.uniform1f(disp.u.uSharp, o.sharp || 0)
+    gl.uniform1f(disp.u.uExp, o.exposure == null ? 1 : o.exposure)
     gl.uniform2f(disp.u.uRes, W, H)
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
 

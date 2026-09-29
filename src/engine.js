@@ -3,6 +3,35 @@
 // ═════════════════════════════════════════════════════════════════════════
 
 
+// ── AUTO EXPOSURE (AGC) ───────────────────────────────────────────────────
+// The mode shaders used to hard-code a fixed boost (NIGHT was l * 2.4), which
+// clips to flat colour the moment the scene is not near-black. Instead we
+// measure the frame and hand the shader a normalising multiplier.
+//
+// Uses a MEDIAN, not a mean: a streetlight or torch reflection drags a mean
+// upward and makes the shader crush the whole scene to black.
+export const AGC_TARGET = 0.34, AGC_MIN = 0.35, AGC_MAX = 12
+
+export function autoExposure(luma, prev = 1, rate = 0.12, target = AGC_TARGET) {
+  if (!luma || !luma.length) return prev
+  const step = Math.max(1, (luma.length / 4096) | 0)
+  const s = []
+  for (let i = 0; i < luma.length; i += step) s.push(luma[i])
+  s.sort((a, b) => a - b)
+  const med = s[(s.length * 0.5) | 0] / 255
+  // Guard on the 90th percentile, not the 98th: a lamp or torch reflection
+  // occupies a few percent of pixels, and guarding on the extreme tail let a
+  // single bright spot crush exposure for the whole dark frame.
+  const hi = s[(s.length * 0.90) | 0] / 255
+  let want = target / Math.max(med, 0.004)
+  // only pull back once a broad area (not just the tail) would blow out
+  if (hi * want > 2.0) want = Math.min(want, 2.0 / Math.max(hi, 0.02))
+  want = Math.min(AGC_MAX, Math.max(AGC_MIN, want))
+  const r = Math.min(1, Math.max(0.01, rate))
+  const next = prev + (want - prev) * r                // temporal smoothing
+  return Math.min(AGC_MAX, Math.max(AGC_MIN, next))
+}
+
 // ── RESOLUTION: pure helpers (unit-tested in tests/resolution.test.mjs) ────
 // Quality ladder: long-edge pixel cap for the render target.
 export const QUALITY_CAP = { ULTRA: 4096, HIGH: 2560, BALANCED: 1600, SAVER: 1100 }
@@ -155,9 +184,10 @@ export function createMotion() {
     ctx.drawImage(video, 0, 0, MOTION_W, MOTION_H)
     const d = ctx.getImageData(0, 0, MOTION_W, MOTION_H).data
     for (let i = 0, j = 0; j < cur.length; i += 4, j++) cur[j] = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8
-    if (!prev) { prev = new Uint8Array(cur); return { frac: 0, boxes: [], panning: false } }
+    if (!prev) { prev = new Uint8Array(cur); return { frac: 0, boxes: [], panning: false, luma: cur } }
     const out = analyzeMotion(cur, prev, sensitivity)
     prev.set(cur)
+    out.luma = cur
     return out
   }
 }
