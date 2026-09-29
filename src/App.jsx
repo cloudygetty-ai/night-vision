@@ -94,6 +94,8 @@ export default function App() {
   const [gps, setGps] = useState(null)
   const [glFail, setGlFail] = useState(false)
   const [renderRes, setRenderRes] = useState({ w: 0, h: 0 })
+  const [glReady, setGlReady] = useState(0)
+  const sizeRef = useRef({ w: 0, h: 0 })
   const [camRes, setCamRes] = useState({ w: 0, h: 0 })
   const [clock, setClock] = useState('')
   const [alertFlash, setAlertFlash] = useState(false)
@@ -212,28 +214,40 @@ export default function App() {
     return () => { dead = true; s2?.getTracks().forEach(t => t.stop()); if (video2Ref.current) video2Ref.current.srcObject = null; setDualOk(false) }
   }, [dual, facing, stream, say])
 
-  // ── renderer + resize ──
+  // ── renderer: created exactly once for the life of the canvas ──
+  // Never add deps here. A second createRenderer() on the same canvas draws a
+  // ghosted double image, and the GL context cannot be cleanly disposed.
   useEffect(() => {
-    const cv = canvasRef.current, stage = stageRef.current
-    if (!cv || !stage) return
+    const cv = canvasRef.current
+    if (!cv) return
     let r
     try { r = createRenderer(cv) } catch { r = null }
     if (!r) { setGlFail(true); return }
     rendererRef.current = r
     motionFn.current = createMotion()
     alignRef.current = createAligner()
+    setGlReady(n => n + 1)
+  }, [])
+
+  // ── sizing: re-runs freely, touches only the drawing buffer ──
+  useEffect(() => {
+    const stage = stageRef.current, r = rendererRef.current
+    if (!stage || !r) return
     const fit = () => {
       const b = stage.getBoundingClientRect()
       const v = videoRef.current
       const { w, h } = fitCanvas(b.width, b.height, window.devicePixelRatio || 1,
         cfg.current.quality, v?.videoWidth || 0, v?.videoHeight || 0, cfg.current.sr)
+      if (w === sizeRef.current.w && h === sizeRef.current.h) return
+      sizeRef.current = { w, h }
       r.resize(w, h)
+      r.reset(); alignRef.current?.reset()        // stale accumulation is a ghost
       setRenderRes({ w, h })
     }
     fit()
     const ro = new ResizeObserver(fit); ro.observe(stage)
     return () => ro.disconnect()
-  }, [quality, sr, camRes.w, camRes.h])
+  }, [quality, sr, camRes.w, camRes.h, glReady])
 
   useEffect(() => {
     rendererRef.current?.reset(); alignRef.current?.reset()
