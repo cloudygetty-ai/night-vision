@@ -179,7 +179,8 @@ function program(gl, fs, vs = VS) {
 
 export function createRenderer(canvas) {
   const gl = canvas.getContext('webgl2', {
-    preserveDrawingBuffer: true, antialias: false, alpha: false, depth: false,
+    preserveDrawingBuffer: false, antialias: false, alpha: false, depth: false,
+    desynchronized: true,
     powerPreference: 'high-performance',
   })
   if (!gl) return null
@@ -207,6 +208,20 @@ export function createRenderer(canvas) {
 
   const video = mkTex()
   const video2 = mkTex()
+  const texDim = new Map()                 // texture → "wxh" currently allocated
+
+  // Reallocating texture storage every frame is the single biggest per-frame
+  // cost on mobile. Allocate once per source size, then stream into it.
+  function upload(tex, el, vw, vh) {
+    const key = vw + 'x' + vh
+    gl.bindTexture(gl.TEXTURE_2D, tex)
+    if (texDim.get(tex) !== key) {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, el)
+      texDim.set(tex, key)
+    } else {
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, el)
+    }
+  }
   const lut = mkTex()
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 3, 0, gl.RGBA, gl.UNSIGNED_BYTE, buildLut())
 
@@ -230,12 +245,31 @@ export function createRenderer(canvas) {
 
   function reset() { fresh = true }
 
+  let lastTex = null, lastOpts = null
+
+  function drawDisplay(tex, o) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.viewport(0, 0, W, H)
+    gl.useProgram(disp.p)
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex)
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, lut)
+    gl.uniform1i(disp.u.uTex, 0); gl.uniform1i(disp.u.uLut, 1)
+    gl.uniform1i(disp.u.uMode, o.mode)
+    gl.uniform1f(disp.u.uGain, o.gain)
+    gl.uniform1f(disp.u.uTime, o.time % 1000)
+    gl.uniform1f(disp.u.uZoom, o.zoom)
+    gl.uniform1f(disp.u.uEdge, o.edge ? 0.85 : 0)
+    gl.uniform1f(disp.u.uSharp, o.sharp || 0)
+    gl.uniform1f(disp.u.uExp, o.exposure == null ? 1 : o.exposure)
+    gl.uniform2f(disp.u.uRes, W, H)
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+  }
+
   function render(el, o) {
     const vw = el.videoWidth, vh = el.videoHeight
     if (!vw || !vh || !W) return false
 
-    gl.bindTexture(gl.TEXTURE_2D, video)
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, el)
+    upload(video, el, vw, vh)
 
     // cover-fit crop
     const ca = W / H, va = vw / vh
@@ -258,24 +292,14 @@ export function createRenderer(canvas) {
     cur = 1 - cur; fresh = false
 
     // pass 2 — mode shader to screen
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
-    gl.viewport(0, 0, W, H)
-    gl.useProgram(disp.p)
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, dst.tex)
-    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, lut)
-    gl.uniform1i(disp.u.uTex, 0); gl.uniform1i(disp.u.uLut, 1)
-    gl.uniform1i(disp.u.uMode, o.mode)
-    gl.uniform1f(disp.u.uGain, o.gain)
-    gl.uniform1f(disp.u.uTime, o.time % 1000)
-    gl.uniform1f(disp.u.uZoom, o.zoom)
-    gl.uniform1f(disp.u.uEdge, o.edge ? 0.85 : 0)
-    gl.uniform1f(disp.u.uSharp, o.sharp || 0)
-    gl.uniform1f(disp.u.uExp, o.exposure == null ? 1 : o.exposure)
-    gl.uniform2f(disp.u.uRes, W, H)
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
-
+    drawDisplay(dst.tex, o)
+    lastTex = dst.tex; lastOpts = o
     return { sx, sy }
   }
+
+  // The drawing buffer is no longer preserved (that flag costs real frame
+  // time), so repaint the last frame immediately before reading pixels.
+  function redraw() { if (lastTex && lastOpts) drawDisplay(lastTex, lastOpts) }
 
 
   // Picture-in-picture: second camera composited into the same GPU frame,
@@ -291,8 +315,7 @@ export function createRenderer(canvas) {
     gl.clearColor(border[0], border[1], border[2], 1); gl.clear(gl.COLOR_BUFFER_BIT)
     gl.scissor(x, y, w, h)
     gl.viewport(x, y, w, h)
-    gl.bindTexture(gl.TEXTURE_2D, video2)
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, el)
+    upload(video2, el, vw, vh)
     const ca = w / h, va = vw / vh
     gl.useProgram(pip.p)
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, video2)
@@ -304,7 +327,7 @@ export function createRenderer(canvas) {
     gl.viewport(0, 0, W, H)
   }
 
-  return { gl, resize, render, renderPip, reset, halfFloat }
+  return { gl, resize, render, renderPip, reset, redraw, halfFloat }
 }
 
 // Map a point in normalized raw-video space (0..1) to normalized screen space.

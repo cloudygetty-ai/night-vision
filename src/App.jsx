@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { MODES, createRenderer, videoToScreen } from './gl.js'
 import { createMotion, createAligner, vault, stamp, sha256, beep, recorderType, shareBlob, download, dataUrlToBlob,
-         fitCanvas, pickBitrate, resLabel, autoExposure } from './engine.js'
+         fitCanvas, pickBitrate, resLabel, autoExposure, qualityGovernor } from './engine.js'
 import { Sheet, Btn, Section, Toggle, Slider, Tool, FONT, DISPLAY, PANEL } from './ui.jsx'
 
 const PRESETS = [
@@ -75,6 +75,8 @@ export default function App() {
   const [vaultOn, setVaultOn] = useState(true)
   const [quality, setQuality] = useState('ULTRA')
   const [agc, setAgc] = useState(true)
+  const [adaptive, setAdaptive] = useState(true)
+  const [govScale, setGovScale] = useState(1)
   const [preset, setPreset] = useState(null)
 
   // ── runtime ──
@@ -98,6 +100,7 @@ export default function App() {
   const [glReady, setGlReady] = useState(0)
   const sizeRef = useRef({ w: 0, h: 0 })
   const expRef = useRef(1)
+  const scaleRef = useRef(1)
   const [expShow, setExpShow] = useState(1)
   const [camRes, setCamRes] = useState({ w: 0, h: 0 })
   const [clock, setClock] = useState('')
@@ -126,7 +129,7 @@ export default function App() {
   cfg.current = {
     mode: M.idx, ev, zoom, edge, mirror, sens, sentry, alerts, vaultOn,
     denoise: sr ? 0.93 : (denoise ?? M.denoise), needMotion: sentry || !ai,
-    dual: dualOk, mirror2: facing !== 'user', pipColor: color, sr, quality, agc,
+    dual: dualOk, mirror2: facing !== 'user', pipColor: color, sr, quality, agc, adaptive,
   }
 
   const say = useCallback(msg => { setToast(msg); clearTimeout(say.t); say.t = setTimeout(() => setToast(null), 2200) }, [])
@@ -240,7 +243,7 @@ export default function App() {
       const b = stage.getBoundingClientRect()
       const v = videoRef.current
       const { w, h } = fitCanvas(b.width, b.height, window.devicePixelRatio || 1,
-        cfg.current.quality, v?.videoWidth || 0, v?.videoHeight || 0, cfg.current.sr)
+        cfg.current.quality, v?.videoWidth || 0, v?.videoHeight || 0, cfg.current.sr, scaleRef.current)
       if (w === sizeRef.current.w && h === sizeRef.current.h) return
       sizeRef.current = { w, h }
       r.resize(w, h)
@@ -250,7 +253,7 @@ export default function App() {
     fit()
     const ro = new ResizeObserver(fit); ro.observe(stage)
     return () => ro.disconnect()
-  }, [quality, sr, camRes.w, camRes.h, glReady])
+  }, [quality, sr, camRes.w, camRes.h, glReady, govScale])
 
   useEffect(() => {
     rendererRef.current?.reset(); alignRef.current?.reset()
@@ -295,7 +298,7 @@ export default function App() {
 
   // ── the render loop ──
   useEffect(() => {
-    let raf, frames = 0, last = performance.now(), tick = 0, lastUi = 0, lastExp = 0
+    let raf, frames = 0, last = performance.now(), lastUi = 0, lastExp = 0, lastSample = 0
     const loop = t => {
       const v = videoRef.current, r = rendererRef.current, S = cfg.current
       if (v && r && v.readyState >= 2) {
@@ -316,8 +319,10 @@ export default function App() {
           r.renderPip(v2, { x: 0.67, y: 0.12, w, h: w * (cv.width / cv.height) * (4 / 3) }, S.mirror2, hexRgb(S.pipColor))
         }
         frames++
-        // one downsample serves both AGC and motion detection
-        if ((S.needMotion || S.agc) && (++tick & 1) === 0 && motionFn.current) {
+        // One downsample serves both AGC and motion detection. This is a
+        // GPU→CPU readback, so run it on a clock (~10Hz), not per frame.
+        if ((S.needMotion || S.agc) && t - lastSample > 95 && motionFn.current) {
+          lastSample = t
           const m = motionFn.current(v, S.sens)
           if (S.agc && m.luma) {
             expRef.current = autoExposure(m.luma, expRef.current)
@@ -331,7 +336,14 @@ export default function App() {
         const rr = recRef.current
         if (rr?.auto && Date.now() > stopAtRef.current) stopRec()
       }
-      if (t - last >= 1000) { setFps(frames); frames = 0; last = t }
+      if (t - last >= 1000) {
+        setFps(frames)
+        if (cfg.current.adaptive) {
+          const next = qualityGovernor(frames, scaleRef.current)
+          if (Math.abs(next - scaleRef.current) > 0.005) { scaleRef.current = next; setGovScale(next) }
+        }
+        frames = 0; last = t
+      }
       raf = requestAnimationFrame(loop)
     }
     raf = requestAnimationFrame(loop)
@@ -369,6 +381,7 @@ export default function App() {
     const c = canvasRef.current
     if (!c) return
     setFlash(true); setTimeout(() => setFlash(false), 140)
+    rendererRef.current?.redraw()      // drawing buffer is not preserved
     let url = c.toDataURL('image/jpeg', 0.92)
     const now = new Date()
     const meta = { utc: now.toISOString().replace('T', ' ').slice(0, 19) + 'Z', mode: M.label, zoom, gps: gpsRef.current }
@@ -654,6 +667,7 @@ export default function App() {
 
           <Section color={color}>OVERLAYS</Section>
           <Toggle color={color} label="AI OBJECT DETECTION" hint="Names 80 object types. Downloads ~2MB once." on={ai} onClick={() => setAi(a => !a)} c="#7dff9a" />
+          <Toggle color={color} label="ADAPTIVE RESOLUTION" hint="Holds the frame rate by trading resolution when the GPU is loaded, and climbs back when it frees up." on={adaptive} onClick={() => setAdaptive(a => !a)} c="#8ad6ff" />
           <Toggle color={color} label="AUTO EXPOSURE" hint="Measures the scene and normalises brightness so modes never blow out. Turn off for manual EV only." on={agc} onClick={() => setAgc(a => !a)} c="#ffe08a" />
           <Toggle color={color} label="EDGE HIGHLIGHT" hint="Outlines shapes in gold" on={edge} onClick={() => setEdge(e => !e)} c="#ffd23f" />
           <Toggle color={color} label="GRID & RETICLE" on={grid} onClick={() => setGrid(g => !g)} />
@@ -679,7 +693,7 @@ export default function App() {
             ))}
           </div>
           <div style={{ fontSize: 12.5, color: 'rgba(233,241,236,.62)', lineHeight: 1.5, padding: '0 4px' }}>
-            Sensor {camRes.w ? `${camRes.w}×${camRes.h} (${resLabel(camRes.w, camRes.h)})` : '—'} · rendering {renderRes.w ? `${renderRes.w}×${renderRes.h}` : '—'} at {fps} FPS · {rendererRef.current?.halfFloat ? 'high-precision' : 'standard'} GPU buffers.
+            Sensor {camRes.w ? `${camRes.w}×${camRes.h} (${resLabel(camRes.w, camRes.h)})` : '—'} · rendering {renderRes.w ? `${renderRes.w}×${renderRes.h}` : '—'}{adaptive && govScale < 0.995 ? ` (${Math.round(govScale * 100)}%)` : ''} at {fps} FPS · {rendererRef.current?.halfFloat ? 'high-precision' : 'standard'} GPU buffers.
             ULTRA renders at full sensor resolution; choose SAVER on older phones or to save battery.
           </div>
         </Sheet>

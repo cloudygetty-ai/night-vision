@@ -32,6 +32,25 @@ export function autoExposure(luma, prev = 1, rate = 0.12, target = AGC_TARGET) {
   return Math.min(AGC_MAX, Math.max(AGC_MIN, next))
 }
 
+// ── ADAPTIVE QUALITY GOVERNOR ─────────────────────────────────────────────
+// Full-sensor rendering is worth it only while the GPU keeps up. Rather than
+// forcing the user to pick a tier, scale the render buffer toward a target
+// frame rate: back off fast when frames are being dropped, recover slowly so
+// the resolution does not visibly pump.
+export const GOV_MIN = 0.45, GOV_MAX = 1, GOV_TARGET = 30
+
+export function qualityGovernor(fps, scale = 1, target = GOV_TARGET, opts = {}) {
+  const down = opts.down ?? 0.90, up = opts.up ?? 1.03
+  const lo = opts.lo ?? target * 0.94         // below this, shrink
+  const hi = opts.hi ?? target * 1.02         // above this, grow
+  if (!Number.isFinite(fps) || fps <= 0) return clampScale(scale)
+  let next = scale
+  if (fps < lo) next = scale * (fps < target * 0.55 ? down * down : down)
+  else if (fps > hi && scale < GOV_MAX) next = scale * up
+  return clampScale(next)
+}
+const clampScale = v => Math.min(GOV_MAX, Math.max(GOV_MIN, Math.round(v * 1000) / 1000))
+
 // ── RESOLUTION: pure helpers (unit-tested in tests/resolution.test.mjs) ────
 // Quality ladder: long-edge pixel cap for the render target.
 export const QUALITY_CAP = { ULTRA: 4096, HIGH: 2560, BALANCED: 1600, SAVER: 1100 }
@@ -40,10 +59,11 @@ export const QUALITY_DPR = { ULTRA: 3, HIGH: 2.5, BALANCED: 2, SAVER: 1.5 }
 // Size the WebGL drawing buffer. Never render above the source resolution
 // (pure upscale costs GPU and adds nothing) unless super-res is stacking
 // frames, which genuinely creates detail beyond one frame.
-export function fitCanvas(cssW, cssH, dpr, quality = 'HIGH', srcW = 0, srcH = 0, sr = false) {
+export function fitCanvas(cssW, cssH, dpr, quality = 'HIGH', srcW = 0, srcH = 0, sr = false, scale = 1) {
   const cap = QUALITY_CAP[quality] || QUALITY_CAP.HIGH
   const d = Math.min(Math.max(dpr || 1, 1), QUALITY_DPR[quality] || 2)
-  let w = Math.round(cssW * d), h = Math.round(cssH * d)
+  const k = Math.min(1, Math.max(0.3, scale || 1))     // governor
+  let w = Math.round(cssW * d * k), h = Math.round(cssH * d * k)
   const srcLong = Math.max(srcW, srcH)
   // cover-crop means the source must fill the shorter axis too
   const ceiling = srcLong ? Math.round(srcLong * (sr ? 1.5 : 1)) : cap
