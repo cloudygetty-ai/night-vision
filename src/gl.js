@@ -246,6 +246,11 @@ export function createRenderer(canvas) {
   function reset() { fresh = true }
 
   let lastTex = null, lastOpts = null
+  let lost = false
+  const onLost = e => { e.preventDefault(); lost = true; texDim.clear() }
+  const onRestored = () => { lost = false }
+  canvas.addEventListener('webglcontextlost', onLost, false)
+  canvas.addEventListener('webglcontextrestored', onRestored, false)
 
   function drawDisplay(tex, o) {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
@@ -268,6 +273,7 @@ export function createRenderer(canvas) {
   function render(el, o) {
     const vw = el.videoWidth, vh = el.videoHeight
     if (!vw || !vh || !W) return false
+    if (lost || gl.isContextLost()) return false
 
     upload(video, el, vw, vh)
 
@@ -327,7 +333,16 @@ export function createRenderer(canvas) {
     gl.viewport(0, 0, W, H)
   }
 
-  return { gl, resize, render, renderPip, reset, redraw, halfFloat }
+  function isLost() { return lost || gl.isContextLost() }
+  function dispose() {
+    canvas.removeEventListener('webglcontextlost', onLost)
+    canvas.removeEventListener('webglcontextrestored', onRestored)
+    ping.forEach(b => { gl.deleteTexture(b.tex); gl.deleteFramebuffer(b.fbo) })
+    ping = []
+    try { gl.getExtension('WEBGL_lose_context')?.loseContext() } catch {}
+  }
+
+  return { gl, resize, render, renderPip, reset, redraw, isLost, dispose, halfFloat }
 }
 
 // Map a point in normalized raw-video space (0..1) to normalized screen space.

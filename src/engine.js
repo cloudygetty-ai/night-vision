@@ -3,6 +3,42 @@
 // ═════════════════════════════════════════════════════════════════════════
 
 
+// ── AI DETECTOR BOOTSTRAP ─────────────────────────────────────────────────
+// Runs on the WASM backend, never WebGL. TF.js's WebGL backend would create a
+// SECOND GL context on the page; with the renderer already holding large
+// half-float ping-pong buffers, iOS evicts one of them under memory pressure
+// and whichever context loses is dead — which looked like the camera freezing
+// the moment AI was switched on. WASM keeps the GPU entirely for rendering.
+export const TF_WASM_CDN = 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/'
+
+export async function initDetector(importers, opts = {}) {
+  const { tfjs, wasm, coco, converter } = importers
+  const tf = await tfjs()
+  if (converter) await converter()          // coco-ssd needs the graph executor
+  const w = await wasm()
+  if (w.setWasmPaths) w.setWasmPaths(opts.wasmPath || TF_WASM_CDN)
+  // Select the backend BEFORE tf.ready(): ready() initialises whatever is
+  // current, and the default is webgl — which is what we must never touch.
+  try {
+    await tf.setBackend('wasm')
+    await tf.ready()
+  } catch {
+    await tf.setBackend('cpu')          // slow but will not fight the renderer
+    await tf.ready()
+  }
+  const model = await (await coco()).load({ base: 'lite_mobilenet_v2' })
+  return { model, backend: tf.getBackend() }
+}
+
+// First inference compiles kernels and allocates buffers — hundreds of ms of
+// blocking work. Do it once here, on a dummy frame, so it never lands on a
+// live frame and stalls the render loop.
+export async function warmup(model, makeCanvas) {
+  const c = makeCanvas(320, 240)
+  try { await model.detect(c, 1, 0.9) } catch { /* warmup is best-effort */ }
+  return true
+}
+
 // ── AUTO EXPOSURE (AGC) ───────────────────────────────────────────────────
 // The mode shaders used to hard-code a fixed boost (NIGHT was l * 2.4), which
 // clips to flat colour the moment the scene is not near-black. Instead we
@@ -50,6 +86,21 @@ export function qualityGovernor(fps, scale = 1, target = GOV_TARGET, opts = {}) 
   return clampScale(next)
 }
 const clampScale = v => Math.min(GOV_MAX, Math.max(GOV_MIN, Math.round(v * 1000) / 1000))
+
+// GPU memory headroom. Two RGBA16F ping-pong buffers cost w*h*8*2 bytes; at
+// full sensor resolution that is tens of MB, and a second consumer (an ML
+// backend, a PIP stream) can tip the browser into evicting a GL context —
+// which presents to the user as the camera freezing. Cap the buffer when
+// other consumers are active.
+export const GPU_BUDGET_MP = 3.2
+
+export function memoryScale(baseScale, { ai = false, dual = false, recording = false } = {}) {
+  let k = baseScale
+  if (ai) k *= 0.8
+  if (dual) k *= 0.9
+  if (recording) k *= 0.95
+  return Math.min(1, Math.max(0.35, Math.round(k * 1000) / 1000))
+}
 
 // ── RESOLUTION: pure helpers (unit-tested in tests/resolution.test.mjs) ────
 // Quality ladder: long-edge pixel cap for the render target.

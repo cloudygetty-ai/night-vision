@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { MODES, createRenderer, videoToScreen } from './gl.js'
 import { createMotion, createAligner, vault, stamp, sha256, beep, recorderType, shareBlob, download, dataUrlToBlob,
-         fitCanvas, pickBitrate, resLabel, autoExposure, qualityGovernor } from './engine.js'
+         fitCanvas, pickBitrate, resLabel, autoExposure, qualityGovernor, memoryScale, initDetector, warmup } from './engine.js'
 import { Sheet, Btn, Section, Toggle, Slider, Tool, FONT, DISPLAY, PANEL } from './ui.jsx'
 
 const PRESETS = [
@@ -41,16 +41,29 @@ function useCamera(facing, attempt) {
 // ── lazy AI detector ───────────────────────────────────────────────────────
 function useDetector(enabled) {
   const model = useRef(null)
-  const [state, setState] = useState('off') // off | loading | ready | failed
+  const [state, setState] = useState('off') // off | loading | warming | ready | failed
   useEffect(() => {
-    if (!enabled || model.current) { if (model.current) setState('ready'); return }
+    if (!enabled) return
+    if (model.current) { setState('ready'); return }
     let dead = false
     setState('loading')
     ;(async () => {
       try {
-        const [tf, coco] = await Promise.all([import('@tensorflow/tfjs'), import('@tensorflow-models/coco-ssd')])
-        await tf.ready()
-        const m = await coco.load({ base: 'lite_mobilenet_v2' })
+        const { model: m } = await initDetector({
+          // core + converter only: the full tfjs bundle ships the WebGL
+          // backend, whose context is what crowded out the renderer.
+          tfjs: () => import('@tensorflow/tfjs-core'),
+          converter: () => import('@tensorflow/tfjs-converter'),
+          wasm: () => import('@tensorflow/tfjs-backend-wasm'),
+          coco: () => import('@tensorflow-models/coco-ssd'),
+        })
+        if (dead) return
+        setState('warming')
+        await warmup(m, (w, h) => {
+          const c = document.createElement('canvas'); c.width = w; c.height = h
+          const x = c.getContext('2d'); x.fillStyle = '#222'; x.fillRect(0, 0, w, h)
+          return c
+        })
         if (!dead) { model.current = m; setState('ready') }
       } catch { if (!dead) setState('failed') }
     })()
@@ -98,6 +111,7 @@ export default function App() {
   const [glFail, setGlFail] = useState(false)
   const [renderRes, setRenderRes] = useState({ w: 0, h: 0 })
   const [glReady, setGlReady] = useState(0)
+  const [glEpoch, setGlEpoch] = useState(0)
   const sizeRef = useRef({ w: 0, h: 0 })
   const expRef = useRef(1)
   const scaleRef = useRef(1)
@@ -129,7 +143,7 @@ export default function App() {
   cfg.current = {
     mode: M.idx, ev, zoom, edge, mirror, sens, sentry, alerts, vaultOn,
     denoise: sr ? 0.93 : (denoise ?? M.denoise), needMotion: sentry || !ai,
-    dual: dualOk, mirror2: facing !== 'user', pipColor: color, sr, quality, agc, adaptive,
+    dual: dualOk, ai, mirror2: facing !== 'user', pipColor: color, sr, quality, agc, adaptive,
   }
 
   const say = useCallback(msg => { setToast(msg); clearTimeout(say.t); say.t = setTimeout(() => setToast(null), 2200) }, [])
@@ -220,9 +234,10 @@ export default function App() {
     return () => { dead = true; s2?.getTracks().forEach(t => t.stop()); if (video2Ref.current) video2Ref.current.srcObject = null; setDualOk(false) }
   }, [dual, facing, stream, say])
 
-  // ── renderer: created exactly once for the life of the canvas ──
-  // Never add deps here. A second createRenderer() on the same canvas draws a
-  // ghosted double image, and the GL context cannot be cleanly disposed.
+  // ── renderer: exactly one live context at a time ──
+  // glEpoch is the ONLY permitted dep: a second createRenderer() on the same
+  // canvas without disposing the first draws a ghosted double image. The
+  // cleanup below disposes before any rebuild, so recovery stays safe.
   useEffect(() => {
     const cv = canvasRef.current
     if (!cv) return
@@ -232,8 +247,20 @@ export default function App() {
     rendererRef.current = r
     motionFn.current = createMotion()
     alignRef.current = createAligner()
+    sizeRef.current = { w: 0, h: 0 }       // force a resize on the new context
     setGlReady(n => n + 1)
-  }, [])
+    return () => { r.dispose(); if (rendererRef.current === r) rendererRef.current = null }
+  }, [glEpoch])
+
+  // ── context-loss recovery ──
+  // A dropped GL context used to freeze the camera permanently. Rebuild it.
+  useEffect(() => {
+    const cv = canvasRef.current
+    if (!cv) return
+    const onLost = () => { say('Display context reset — recovering'); setGlEpoch(n => n + 1) }
+    cv.addEventListener('webglcontextlost', onLost)
+    return () => cv.removeEventListener('webglcontextlost', onLost)
+  }, [say])
 
   // ── sizing: re-runs freely, touches only the drawing buffer ──
   useEffect(() => {
@@ -243,7 +270,8 @@ export default function App() {
       const b = stage.getBoundingClientRect()
       const v = videoRef.current
       const { w, h } = fitCanvas(b.width, b.height, window.devicePixelRatio || 1,
-        cfg.current.quality, v?.videoWidth || 0, v?.videoHeight || 0, cfg.current.sr, scaleRef.current)
+        cfg.current.quality, v?.videoWidth || 0, v?.videoHeight || 0, cfg.current.sr,
+        memoryScale(scaleRef.current, { ai: cfg.current.ai, dual: cfg.current.dual, recording: !!recRef.current }))
       if (w === sizeRef.current.w && h === sizeRef.current.h) return
       sizeRef.current = { w, h }
       r.resize(w, h)
@@ -253,7 +281,7 @@ export default function App() {
     fit()
     const ro = new ResizeObserver(fit); ro.observe(stage)
     return () => ro.disconnect()
-  }, [quality, sr, camRes.w, camRes.h, glReady, govScale])
+  }, [quality, sr, camRes.w, camRes.h, glReady, govScale, ai, dualOk])
 
   useEffect(() => {
     rendererRef.current?.reset(); alignRef.current?.reset()
@@ -298,7 +326,7 @@ export default function App() {
 
   // ── the render loop ──
   useEffect(() => {
-    let raf, frames = 0, last = performance.now(), lastUi = 0, lastExp = 0, lastSample = 0
+    let raf, frames = 0, last = performance.now(), lastUi = 0, lastExp = 0, lastSample = 0, deadFrames = 0
     const loop = t => {
       const v = videoRef.current, r = rendererRef.current, S = cfg.current
       if (v && r && v.readyState >= 2) {
@@ -313,6 +341,10 @@ export default function App() {
         }
         const g = r.render(v, { mode: S.mode, gain: Math.pow(2, S.ev), denoise: S.denoise, zoom: S.zoom, edge: S.edge, mirror: S.mirror, time: t / 1000, shift, sharp, exposure: S.agc ? expRef.current : 1 })
         if (g) geomRef.current = g
+        else if (v.readyState >= 2 && r.isLost?.()) {
+          // silent context death — the event does not always fire
+          if (++deadFrames > 20) { deadFrames = 0; setGlEpoch(n => n + 1) }
+        } else deadFrames = 0
         const v2 = video2Ref.current
         if (S.dual && v2 && v2.readyState >= 2) {
           const cv = canvasRef.current, w = 0.30
@@ -567,7 +599,7 @@ export default function App() {
         {sr && <Pill c="#ffaaff">🔬 SR</Pill>}
         {dualOk && <Pill c="#c89bff">⧉ DUAL</Pill>}
         {cast.on && <Pill c="#5cd6ff">📡 {cast.viewers}</Pill>}
-        {ai && <Pill c={aiState === 'ready' ? '#7dff9a' : '#ffd23f'} blink={aiState === 'loading'}>{aiState === 'ready' ? 'AI ✓' : aiState === 'failed' ? 'AI ✗' : 'AI …'}</Pill>}
+        {ai && <Pill c={aiState === 'ready' ? '#7dff9a' : '#ffd23f'} blink={aiState === 'loading' || aiState === 'warming'}>{aiState === 'ready' ? 'AI ✓' : aiState === 'failed' ? 'AI ✗' : aiState === 'warming' ? 'AI WARM' : 'AI …'}</Pill>}
         <span style={{ fontSize: 13, color: 'rgba(233,241,236,.8)' }}>{clock}</span>
       </div>
 

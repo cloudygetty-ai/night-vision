@@ -100,7 +100,7 @@ group('Governor is wired into the app')
 {
   ok('governor imported', /qualityGovernor/.test(app))
   ok('scale feeds the canvas sizing', /scaleRef\.current\)/.test(app))
-  ok('resize re-runs when the scale changes', /glReady, govScale\]/.test(app))
+  ok('resize re-runs when the scale changes', /govScale[,\]]/.test(app.match(/\}, \[quality, sr[^\]]*\]/)?.[0] || ''))
   ok('can be turned off', /ADAPTIVE RESOLUTION/.test(app) && /cfg\.current\.adaptive/.test(app))
 }
 
