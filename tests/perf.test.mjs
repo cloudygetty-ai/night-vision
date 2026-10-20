@@ -15,8 +15,10 @@ group('Per-frame GPU upload')
   ok('streams frames with texSubImage2D', /texSubImage2D\(gl\.TEXTURE_2D, 0, 0, 0, gl\.RGBA/.test(gl))
   ok('reallocates storage only when the source size changes', /texDim\.get\(tex\) !== key/.test(gl))
   // the only full texImage2D calls left should be the allocation path + the LUT
+  // + the one-time half-float framebuffer-completeness probe (runs once at
+  // renderer creation, never per-frame)
   const allocs = (gl.match(/gl\.texImage2D\(/g) || []).length
-  ok('no stray per-frame texImage2D calls', allocs <= 4, `${allocs} texImage2D call sites`)
+  ok('no stray per-frame texImage2D calls', allocs <= 5, `${allocs} texImage2D call sites`)
   ok('upload() is not recursive', !/function upload[\s\S]{0,400}?upload\(video/.test(gl))
 }
 

@@ -76,6 +76,7 @@ export default function App() {
   // ── settings ──
   const [mode, setMode] = useState(1)
   const [ev, setEv] = useState(0.5)
+  const [dce, setDce] = useState(0)              // Zero-DCE-style low-light curve strength, 0 = off
   const [denoise, setDenoise] = useState(null)   // null = auto per mode
   const [zoom, setZoom] = useState(1)
   const [edge, setEdge] = useState(false)
@@ -143,7 +144,7 @@ export default function App() {
   cfg.current = {
     mode: M.idx, ev, zoom, edge, mirror, sens, sentry, alerts, vaultOn,
     denoise: sr ? 0.93 : (denoise ?? M.denoise), needMotion: sentry || !ai,
-    dual: dualOk, ai, mirror2: facing !== 'user', pipColor: color, sr, quality, agc, adaptive,
+    dual: dualOk, ai, mirror2: facing !== 'user', pipColor: color, sr, quality, agc, adaptive, dce,
   }
 
   const say = useCallback(msg => { setToast(msg); clearTimeout(say.t); say.t = setTimeout(() => setToast(null), 2200) }, [])
@@ -339,7 +340,7 @@ export default function App() {
           sharp = Math.min(1.6, 0.25 + st.n * 0.05)
           if ((st.n & 7) === 0 || a.lost) setSrFrames(Math.min(st.n, 40))
         }
-        const g = r.render(v, { mode: S.mode, gain: Math.pow(2, S.ev), denoise: S.denoise, zoom: S.zoom, edge: S.edge, mirror: S.mirror, time: t / 1000, shift, sharp, exposure: S.agc ? expRef.current : 1 })
+        const g = r.render(v, { mode: S.mode, gain: Math.pow(2, S.ev), denoise: S.denoise, zoom: S.zoom, edge: S.edge, mirror: S.mirror, time: t / 1000, shift, sharp, exposure: S.agc ? expRef.current : 1, dce: S.dce })
         if (g) geomRef.current = g
         else if (v.readyState >= 2 && r.isLost?.()) {
           // silent context death — the event does not always fire
@@ -694,6 +695,8 @@ export default function App() {
             onChange={setDenoise} fmt={v => denoise === null ? `AUTO ${Math.round(v * 100)}%` : `${Math.round(v * 100)}%`} />
           {denoise !== null && <Btn color={color} onClick={() => setDenoise(null)}>RESET NOISE TO AUTO</Btn>}
           <Slider color={color} label="ZOOM" value={zoom} min={1} max={8} step={0.1} onChange={setZoom} fmt={v => `${v.toFixed(1)}×`} />
+          <Slider color={color} label="LOW-LIGHT ENHANCE" hint="Zero-DCE-style curve: lifts shadow detail without blowing out highlights"
+            value={dce} min={0} max={0.5} step={0.01} onChange={setDce} fmt={v => v === 0 ? 'OFF' : `${Math.round(v * 200)}%`} />
           <Toggle color={color} label="SUPER-RESOLUTION" hint="Aligns and stacks frames on the GPU to recover real detail. Hold still." on={sr} onClick={() => setSr(x => !x)} c="#ffaaff" />
           <Toggle color={color} label="DUAL CAMERA" hint="Front + rear together, where the browser allows it" on={dual} onClick={() => setDual(d => !d)} c="#c89bff" />
 

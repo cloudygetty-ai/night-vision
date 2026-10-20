@@ -54,9 +54,17 @@ precision highp float;
 in vec2 vUv; out vec4 o;
 uniform sampler2D uTex, uLut;
 uniform int uMode;
-uniform float uGain, uTime, uZoom, uEdge, uSharp, uExp;
+uniform float uGain, uTime, uZoom, uEdge, uSharp, uExp, uDce;
 uniform vec2 uRes;
 float L(vec3 c){ return dot(c, vec3(.299,.587,.114)); }
+// Zero-DCE-style zero-reference light-enhancement curve (Guo et al., CVPR 2020):
+// LE(x) = x + a·x·(1-x), iterated — lifts shadow detail without blowing out highlights.
+// Fixed global alpha here (from the uDce slider); a trained per-pixel model would
+// predict alpha per pixel from a small CNN instead of taking one scalar for the frame.
+vec3 zeroDCE(vec3 x, float a){
+  for (int i = 0; i < 8; i++) x = x + a * x * (1. - x);
+  return x;
+}
 // Saturating response curve: approaches 1 but never clips, so highlights
 // roll off into detail instead of flattening into a solid block.
 float TM(float x){ return 1. - exp(-max(x, 0.) * 1.85); }
@@ -73,6 +81,7 @@ void main(){
     vec3 b2 = (S(uv+px) + S(uv-px) + S(uv+vec2(px.x,-px.y)) + S(uv+vec2(-px.x,px.y))) * .25;
     c = clamp(c + (c - mix(b, b2, .35)) * uSharp, 0., 1.);
   }
+  if (uDce > 0.) c = zeroDCE(c, uDce);                  // low-light curve enhance, pre-mode
   float l = L(c);
   float g = uGain * uExp;                             // user EV × auto exposure
   vec3 col;
@@ -185,7 +194,26 @@ export function createRenderer(canvas) {
   })
   if (!gl) return null
 
-  const halfFloat = !!gl.getExtension('EXT_color_buffer_float')
+  // Some iOS/WebKit builds report EXT_color_buffer_float present but produce an
+  // incomplete framebuffer for an RGBA16F attachment — the accumulation pass
+  // then reads back garbled or blank pixels with no error. Probe actual
+  // framebuffer completeness, not just the extension string, before trusting it.
+  function probeHalfFloatFbo(gl) {
+    if (!gl.getExtension('EXT_color_buffer_float')) return false
+    const tex = gl.createTexture()
+    gl.bindTexture(gl.TEXTURE_2D, tex)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, 4, 4, 0, gl.RGBA, gl.HALF_FLOAT, null)
+    const fbo = gl.createFramebuffer()
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0)
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.deleteFramebuffer(fbo)
+    gl.deleteTexture(tex)
+    return ok
+  }
+
+  const halfFloat = probeHalfFloatFbo(gl)
   const acc = program(gl, ACC_FS)
   const disp = program(gl, DISP_FS, VS_FLAT)
   const pip = program(gl, PIP_FS)
@@ -266,6 +294,7 @@ export function createRenderer(canvas) {
     gl.uniform1f(disp.u.uEdge, o.edge ? 0.85 : 0)
     gl.uniform1f(disp.u.uSharp, o.sharp || 0)
     gl.uniform1f(disp.u.uExp, o.exposure == null ? 1 : o.exposure)
+    gl.uniform1f(disp.u.uDce, o.dce || 0)
     gl.uniform2f(disp.u.uRes, W, H)
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
   }

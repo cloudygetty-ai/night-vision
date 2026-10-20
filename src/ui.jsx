@@ -83,13 +83,14 @@ export function Toggle({ color, label, hint, on, onClick, c }) {
   )
 }
 
-export function Slider({ color, label, value, min, max, step, onChange, fmt }) {
+export function Slider({ color, label, hint, value, min, max, step, onChange, fmt }) {
   return (
     <div style={{ padding: '14px 16px', borderRadius: 14, background: 'rgba(255,255,255,.05)', border: '1.5px solid rgba(255,255,255,.12)' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 10 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: hint ? 4 : 10 }}>
         <span style={{ fontFamily: FONT, fontSize: 14, fontWeight: 700, color: '#e9f1ec', letterSpacing: 1 }}>{label}</span>
         <span style={{ fontFamily: FONT, fontSize: 15, fontWeight: 700, color }}>{fmt ? fmt(value) : value}</span>
       </div>
+      {hint && <div style={{ fontFamily: FONT, fontSize: 12, color: 'rgba(233,241,236,.62)', marginBottom: 10 }}>{hint}</div>}
       <input type="range" min={min} max={max} step={step} value={value}
         onChange={e => onChange(parseFloat(e.target.value))}
         style={{ width: '100%', accentColor: color }} />
