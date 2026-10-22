@@ -3,6 +3,7 @@ import { MODES, createRenderer, videoToScreen } from './gl.js'
 import { createMotion, createAligner, vault, stamp, sha256, beep, recorderType, shareBlob, download, dataUrlToBlob,
          fitCanvas, pickBitrate, resLabel, autoExposure, qualityGovernor, memoryScale, initDetector, warmup } from './engine.js'
 import { Sheet, Btn, Section, Toggle, Slider, Tool, FONT, DISPLAY, PANEL } from './ui.jsx'
+import { initWatchBridge } from './watchBridge.js'
 
 const PRESETS = [
   { id: 'SURVEIL', icon: '🛡', mode: 1, ev: 1,   zoom: 1, edge: false, ai: true,  sentry: true,  sens: 0.7 },
@@ -144,7 +145,7 @@ export default function App() {
   cfg.current = {
     mode: M.idx, ev, zoom, edge, mirror, sens, sentry, alerts, vaultOn,
     denoise: sr ? 0.93 : (denoise ?? M.denoise), needMotion: sentry || !ai,
-    dual: dualOk, ai, mirror2: facing !== 'user', pipColor: color, sr, quality, agc, adaptive, dce,
+    dual: dualOk, ai, mirror2: facing !== 'user', pipColor: color, sr, quality, agc, adaptive, dce, recording,
   }
 
   const say = useCallback(msg => { setToast(msg); clearTimeout(say.t); say.t = setTimeout(() => setToast(null), 2200) }, [])
@@ -313,6 +314,25 @@ export default function App() {
     try { r.rec.stop() } catch { /* already stopped */ }
     recRef.current = null; setRecording(false)
   }, [])
+
+  // ── watch bridge: no-op outside the native iOS host app (see watchBridge.js) ──
+  // Registered once; reads live values from cfg.current / recRef rather than
+  // closing over state, so it never needs to be torn down and rebuilt.
+  useEffect(() => initWatchBridge({
+    canvasRef, rendererRef,
+    getStatus: () => ({
+      mode: cfg.current.mode, modeLabel: MODES[cfg.current.mode].label, color: cfg.current.pipColor,
+      recording: cfg.current.recording, sentry: cfg.current.sentry, dce: cfg.current.dce, zoom: cfg.current.zoom,
+    }),
+    remote: {
+      setMode: idx => { if (idx >= 0 && idx < MODES.length) { setMode(idx); setPreset(null) } },
+      cycleMode: dir => { setMode(m => (m + (dir < 0 ? -1 : 1) + MODES.length) % MODES.length); setPreset(null) },
+      toggleRecording: () => (recRef.current ? stopRec() : startRec(false)),
+      toggleSentry: () => setSentry(s => !s),
+      setDce: v => setDce(Math.max(0, Math.min(0.5, v))),
+      setZoom: v => setZoom(Math.max(1, Math.min(8, v))),
+    },
+  }), [startRec, stopRec])
 
   // ── sentry trigger ──
   const trigger = useCallback(reason => {
