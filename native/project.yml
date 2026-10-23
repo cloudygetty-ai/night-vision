@@ -1,0 +1,51 @@
+# XcodeGen spec — `cd native && xcodegen` produces NVSHost.xcodeproj.
+# Replaces SETUP.md steps 2–6. Run `npm run build` first: dist/ is bundled.
+name: NVSHost
+options:
+  bundleIdPrefix: ai.cloudygetty
+  deploymentTarget:
+    iOS: "16.0"
+    watchOS: "9.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  NVSHost:
+    type: application
+    platform: iOS
+    scheme: {}
+    sources:
+      - path: ios/NVSHost
+      - path: ../dist
+        type: folder          # folder reference: keeps dist/ intact for LocalSchemeHandler
+        buildPhase: resources
+    info:
+      path: build/NVSHost-Info.plist
+      properties:
+        CFBundleDisplayName: NVS
+        NSCameraUsageDescription: NVS needs the camera for night-vision capture.
+        NSLocationWhenInUseUsageDescription: NVS stamps photos and clips with your location.
+        UILaunchScreen: {}
+        UIRequiresFullScreen: true
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: ai.cloudygetty.nvs
+      TARGETED_DEVICE_FAMILY: "1"
+    dependencies:
+      - target: NVSWatch
+  NVSWatch:
+    type: application
+    platform: watchOS
+    scheme: {}
+    sources:
+      - path: "watchOS/NVSWatch Watch App"
+    info:
+      path: build/NVSWatch-Info.plist
+      properties:
+        CFBundleDisplayName: NVS
+        WKApplication: true
+        WKCompanionAppBundleIdentifier: ai.cloudygetty.nvs
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: ai.cloudygetty.nvs.watchkitapp
