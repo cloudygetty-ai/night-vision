@@ -56,7 +56,23 @@ struct WebViewContainer: UIViewRepresentable {
             initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType,
             decisionHandler: @escaping (WKPermissionDecision) -> Void
         ) {
-            decisionHandler(.grant)
+            // Only the bundled app (nvs://app) gets the camera — never a remote page.
+            decisionHandler(origin.protocol == LocalSchemeHandler.scheme ? .grant : .deny)
+        }
+
+        // Keep the web view on the bundled app: web links open in Safari instead
+        // of replacing NVS (and inheriting its camera access) inside this view.
+        func webView(
+            _ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+        ) {
+            if let url = navigationAction.request.url, ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+               navigationAction.targetFrame?.isMainFrame ?? true {
+                UIApplication.shared.open(url)
+                decisionHandler(.cancel)
+                return
+            }
+            decisionHandler(.allow)
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {

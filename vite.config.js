@@ -3,9 +3,9 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   // Relative asset paths: the normal PWA deploy (served from a domain root)
-  // doesn't care, but the iOS host app's WKWebView loads dist/index.html via
-  // a plain file:// URL (see native/SETUP.md) — root-absolute paths like
-  // "/assets/x.js" resolve against the filesystem root there and 404.
+  // doesn't care, but the iOS host app serves dist/ from its app bundle via
+  // the nvs://app/ scheme handler (native/ios/NVSHost/LocalSchemeHandler.swift),
+  // so assets must resolve relative to index.html, not a server root.
   base: './',
   build: {
     target: 'es2020',

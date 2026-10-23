@@ -35,9 +35,11 @@ final class LocalSchemeHandler: NSObject, WKURLSchemeHandler {
         }
         var path = url.path
         if path.isEmpty || path == "/" { path = "/index.html" }
-        let fileURL = root.appendingPathComponent(path)
+        let fileURL = root.appendingPathComponent(path).standardizedFileURL
 
-        guard let data = try? Data(contentsOf: fileURL) else {
+        // Refuse "../" escapes out of the bundled dist/ folder.
+        guard fileURL.path.hasPrefix(root.standardizedFileURL.path + "/"),
+              let data = try? Data(contentsOf: fileURL) else {
             urlSchemeTask.didFailWithError(URLError(.fileDoesNotExist))
             return
         }
