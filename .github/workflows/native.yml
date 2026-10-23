@@ -18,7 +18,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Build web app
@@ -65,6 +65,7 @@ jobs:
           cat build/console.log
           grep -q 'NVS_HEALTH' build/console.log || { echo "no health line — page never finished loading"; exit 1; }
           grep 'NVS_HEALTH' build/console.log | grep -q '"root":[1-9]' || { echo "React root empty — bundle failed to run"; exit 1; }
+          ! grep -q 'without a usage description' build/console.log || { echo "missing Info.plist usage string (see above)"; exit 1; }
 
       - uses: actions/upload-artifact@v4
         if: always()
