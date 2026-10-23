@@ -75,6 +75,17 @@ struct WebViewContainer: UIViewRepresentable {
             decisionHandler(.allow)
         }
 
+        // Health line for the CI simulator smoke test (.github/workflows/native.yml):
+        // a non-zero child count means the bundled React app actually mounted.
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            let probe = "JSON.stringify({ url: location.href, root: document.getElementById('root')?.childElementCount ?? -1, bridge: !!window.__nvsRemote })"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                webView.evaluateJavaScript(probe) { result, error in
+                    print("NVS_HEALTH", result ?? "nil", error?.localizedDescription ?? "")
+                }
+            }
+        }
+
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
             print("NVS web view failed to load:", error.localizedDescription)
         }
