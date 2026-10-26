@@ -49,12 +49,57 @@ void main(){
   o = vec4(mix(p, c, uAlpha), 1.);
 }`
 
+
+// ── BRIGHT SOURCE PROTECTION ───────────────────────────────────────────────
+// A headlight does three things: it blooms, it throws veiling glare across the
+// surrounding field (scattered light added to everything near it), and it drags
+// the exposure metering down so the rest of the scene goes black. Real NVGs
+// answer this with auto-gating and bright-source protection. Here we estimate
+// the glare field at 1/8 resolution, subtract the scattered component, apply a
+// LOCAL gain so the area beside the lamp lifts without lifting the lamp, and
+// hold the source core to a ceiling.
+
+// Downsample to a small field: R = local mean luma, G = excess above threshold.
+const GLARE_FS = `#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 o;
+uniform sampler2D uSrc;
+uniform vec2 uTexel;
+uniform float uThresh;
+float L(vec3 c){ return dot(c, vec3(.299,.587,.114)); }
+void main(){
+  float sum = 0., exc = 0.;
+  for (int y = -1; y <= 2; y++)
+    for (int x = -1; x <= 2; x++) {
+      float l = L(texture(uSrc, vUv + vec2(float(x), float(y)) * uTexel * 2.).rgb);
+      sum += l;
+      exc += max(l - uThresh, 0.);
+    }
+  o = vec4(sum / 16., exc / 16., 0., 1.);
+}`
+
+// Separable gaussian on the small field — a wide blur here is nearly free and
+// approximates the lens/atmosphere point-spread function that creates the halo.
+const BLUR_FS = `#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 o;
+uniform sampler2D uSrc;
+uniform vec2 uStep;
+void main(){
+  vec4 a = texture(uSrc, vUv) * .2270270270;
+  a += (texture(uSrc, vUv + uStep * 1.3846153846) + texture(uSrc, vUv - uStep * 1.3846153846)) * .3162162162;
+  a += (texture(uSrc, vUv + uStep * 3.2307692308) + texture(uSrc, vUv - uStep * 3.2307692308)) * .0702702703;
+  o = a;
+}`
+
 const DISP_FS = `#version 300 es
 precision highp float;
 in vec2 vUv; out vec4 o;
 uniform sampler2D uTex, uLut;
 uniform int uMode;
 uniform float uGain, uTime, uZoom, uEdge, uSharp, uExp, uDce;
+uniform float uBsp, uBspT, uBspD;
+uniform sampler2D uGlare;
 uniform vec2 uRes;
 float L(vec3 c){ return dot(c, vec3(.299,.587,.114)); }
 // Zero-DCE-style zero-reference light-enhancement curve (Guo et al., CVPR 2020):
@@ -82,8 +127,32 @@ void main(){
     c = clamp(c + (c - mix(b, b2, .35)) * uSharp, 0., 1.);
   }
   if (uDce > 0.) c = zeroDCE(c, uDce);                  // low-light curve enhance, pre-mode
-  float l = L(c);
-  float g = uGain * uExp;                             // user EV × auto exposure
+  // ── bright source protection ──
+  // Separate the frame into a low-frequency BASE (the headlight and the
+  // veiling glare it throws) and the DETAIL riding on top (the pedestrian,
+  // the kerb, the road markings). Compress the base hard and amplify the
+  // detail: the lamp stops dominating and what sits beside it becomes
+  // visible. Subtracting an estimated glare field instead fails, because a
+  // clipped source hides its own energy and the estimate always undershoots.
+  float g = uGain * uExp;
+  if (uBsp > 0.) {
+    float b = texture(uGlare, uv).r;                  // blurred luminance field
+    float lv = L(c);
+    float d = lv - b;                                 // local detail
+    // Work out the luminance we want ON SCREEN, then invert the tone curve so
+    // the mode shader's own TM(l*g) lands exactly there. Compressing the base
+    // before that gain would simply be undone by it.
+    // The lamp core is itself high-frequency, so an unbounded detail boost
+    // would amplify the very thing we are suppressing. Soft-limit it: small
+    // detail (a pedestrian, a kerb) passes through, a bright source saturates.
+    float dt = d * g * uBspD;
+    dt = 0.5 * tanh(dt / 0.5);
+    float want = TM(b * g) * uBspT + dt;
+    want = clamp(want, 0., .995);
+    float pre = -log(1. - want) / 1.85 / max(g, 1e-3);
+    c *= mix(1., pre / max(lv, 1e-4), uBsp);
+  }
+  float l = L(c);                             // user EV × auto exposure
   vec3 col;
 
   if (uMode == 0) {                                   // RAW
@@ -217,6 +286,8 @@ export function createRenderer(canvas) {
   const acc = program(gl, ACC_FS)
   const disp = program(gl, DISP_FS, VS_FLAT)
   const pip = program(gl, PIP_FS)
+  const glare = program(gl, GLARE_FS, VS_FLAT)
+  const blur = program(gl, BLUR_FS, VS_FLAT)
 
   const vbo = gl.createBuffer()
   gl.bindBuffer(gl.ARRAY_BUFFER, vbo)
@@ -254,6 +325,7 @@ export function createRenderer(canvas) {
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 3, 0, gl.RGBA, gl.UNSIGNED_BYTE, buildLut())
 
   let W = 0, H = 0, ping = [], cur = 0, fresh = true
+  let gw = 0, gh = 0, gbuf = []
 
   function resize(w, h) {
     if (w === W && h === H) return
@@ -263,6 +335,17 @@ export function createRenderer(canvas) {
       const tex = mkTex()
       if (halfFloat) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null)
       else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+      const fbo = gl.createFramebuffer()
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0)
+      return { tex, fbo }
+    })
+    // glare field at 1/8 resolution: wide blur here is nearly free
+    gw = Math.max(2, Math.ceil(w / 8)); gh = Math.max(2, Math.ceil(h / 8))
+    gbuf.forEach(b => { gl.deleteTexture(b.tex); gl.deleteFramebuffer(b.fbo) })
+    gbuf = [0, 1].map(() => {
+      const tex = mkTex()
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gw, gh, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
       const fbo = gl.createFramebuffer()
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
       gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0)
@@ -280,6 +363,37 @@ export function createRenderer(canvas) {
   canvas.addEventListener('webglcontextlost', onLost, false)
   canvas.addEventListener('webglcontextrestored', onRestored, false)
 
+
+  // Estimate the veiling-glare field: downsample, then blur separably. Runs at
+  // 1/64 the pixel count of the main passes, so the cost is negligible.
+  function buildGlare(srcTex, o) {
+    if (!gbuf.length) return
+    gl.bindFramebuffer(gl.FRAMEBUFFER, gbuf[0].fbo)
+    gl.viewport(0, 0, gw, gh)
+    gl.useProgram(glare.p)
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, srcTex)
+    gl.uniform1i(glare.u.uSrc, 0)
+    gl.uniform2f(glare.u.uTexel, 1 / W, 1 / H)
+    gl.uniform1f(glare.u.uThresh, 0.62)
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+
+    gl.useProgram(blur.p)
+    // Two separable iterations at a wide step. The base must be much broader
+    // than the targets we want to keep, or the decomposition erases them too.
+    const SP = 2.5
+    for (const [from, to, dir] of [
+      [0, 1, [SP / gw, 0]], [1, 0, [0, SP / gh]],
+      [0, 1, [SP / gw, 0]], [1, 0, [0, SP / gh]],
+    ]) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, gbuf[to].fbo)
+      gl.viewport(0, 0, gw, gh)
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, gbuf[from].tex)
+      gl.uniform1i(blur.u.uSrc, 0)
+      gl.uniform2f(blur.u.uStep, dir[0], dir[1])
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+    }
+  }
+
   function drawDisplay(tex, o, target = null, tw = 0, th = 0) {
     gl.bindFramebuffer(gl.FRAMEBUFFER, target)
     gl.viewport(0, 0, tw || W, th || H)
@@ -295,6 +409,11 @@ export function createRenderer(canvas) {
     gl.uniform1f(disp.u.uSharp, o.sharp || 0)
     gl.uniform1f(disp.u.uExp, o.exposure == null ? 1 : o.exposure)
     gl.uniform1f(disp.u.uDce, o.dce || 0)
+    gl.uniform1f(disp.u.uBsp, o.bsp || 0)
+    gl.uniform1f(disp.u.uBspT, o.bspT == null ? 0.28 : o.bspT)   // base compression
+    gl.uniform1f(disp.u.uBspD, o.bspD == null ? 3.0 : o.bspD)    // detail boost
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, (gbuf[0] || {}).tex || lut)
+    gl.uniform1i(disp.u.uGlare, 2)
     gl.uniform2f(disp.u.uRes, tw || W, th || H)
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
   }
@@ -325,6 +444,9 @@ export function createRenderer(canvas) {
     gl.uniform2f(acc.u.uShift, o.shift ? o.shift[0] : 0, o.shift ? o.shift[1] : 0)
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
     cur = 1 - cur; fresh = false
+
+    // pass 1.5 — glare field (only when bright-source protection is on)
+    if (o.bsp > 0) buildGlare(dst.tex, o)
 
     // pass 2 — mode shader to screen
     drawDisplay(dst.tex, o)
@@ -439,7 +561,8 @@ export function createRenderer(canvas) {
     canvas.removeEventListener('webglcontextlost', onLost)
     canvas.removeEventListener('webglcontextrestored', onRestored)
     ping.forEach(b => { gl.deleteTexture(b.tex); gl.deleteFramebuffer(b.fbo) })
-    ping = []
+    gbuf.forEach(b => { gl.deleteTexture(b.tex); gl.deleteFramebuffer(b.fbo) })
+    ping = []; gbuf = []
     try { gl.getExtension('WEBGL_lose_context')?.loseContext() } catch {}
   }
 

@@ -91,6 +91,7 @@ export default function App() {
   const [vaultOn, setVaultOn] = useState(true)
   const [quality, setQuality] = useState('ULTRA')
   const [agc, setAgc] = useState(true)
+  const [bsp, setBsp] = useState(0)        // bright source protection, 0..1
   const [adaptive, setAdaptive] = useState(true)
   const [govScale, setGovScale] = useState(1)
   const [preset, setPreset] = useState(null)
@@ -148,7 +149,7 @@ export default function App() {
   cfg.current = {
     mode: M.idx, ev, zoom, edge, mirror, sens, sentry, alerts, vaultOn,
     denoise: sr ? 0.93 : (denoise ?? M.denoise), needMotion: sentry || !ai,
-    dual: dualOk, ai, mirror2: facing !== 'user', pipColor: color, sr, quality, agc, adaptive, dce, recording,
+    dual: dualOk, ai, mirror2: facing !== 'user', pipColor: color, sr, quality, agc, adaptive, bsp, dce, recording,
   }
 
   const say = useCallback(msg => { setToast(msg); clearTimeout(say.t); say.t = setTimeout(() => setToast(null), 2200) }, [])
@@ -381,7 +382,7 @@ export default function App() {
           sharp = Math.min(1.6, 0.25 + st.n * 0.05)
           if ((st.n & 7) === 0 || a.lost) setSrFrames(Math.min(st.n, 40))
         }
-        const g = r.render(v, { mode: S.mode, gain: Math.pow(2, S.ev), denoise: S.denoise, zoom: S.zoom, edge: S.edge, mirror: S.mirror, time: t / 1000, shift, sharp, exposure: S.agc ? expRef.current : 1, dce: S.dce })
+        const g = r.render(v, { mode: S.mode, gain: Math.pow(2, S.ev), denoise: S.denoise, zoom: S.zoom, edge: S.edge, mirror: S.mirror, time: t / 1000, shift, sharp, exposure: S.agc ? expRef.current : 1, dce: S.dce, bsp: S.bsp })
         if (g) geomRef.current = g
         else if (v.readyState >= 2 && r.isLost?.()) {
           // silent context death — the event does not always fire
@@ -399,7 +400,7 @@ export default function App() {
           lastSample = t
           const m = motionFn.current(v, S.sens)
           if (S.agc && m.luma) {
-            expRef.current = autoExposure(m.luma, expRef.current)
+            expRef.current = autoExposure(m.luma, expRef.current, 0.12, undefined, { bsp: S.bsp > 0 })
             if (t - lastExp > 400) { lastExp = t; setExpShow(expRef.current) }
           }
           if (S.needMotion) {
@@ -465,7 +466,7 @@ export default function App() {
         mode: cfg.current.mode, gain: Math.pow(2, cfg.current.ev),
         denoise: cfg.current.denoise, zoom: cfg.current.zoom, edge: cfg.current.edge,
         mirror: cfg.current.mirror, time: performance.now() / 1000, sharp: 0,
-        exposure: cfg.current.agc ? expRef.current : 1,
+        exposure: cfg.current.agc ? expRef.current : 1, bsp: cfg.current.bsp,
       }, size, { frames: cfg.current.denoise > 0.4 ? 6 : 3 })
       if (big) { url = big.toDataURL('image/jpeg', 0.95); shotW = big.width; shotH = big.height }
     }
@@ -655,6 +656,7 @@ export default function App() {
         {sr && <Pill c="#ffaaff">🔬 SR</Pill>}
         {dualOk && <Pill c="#c89bff">⧉ DUAL</Pill>}
         {cast.on && <Pill c="#5cd6ff">📡 {cast.viewers}</Pill>}
+        {bsp > 0 && <Pill c="#ffd27a">GLARE {Math.round(bsp * 100)}</Pill>}
         {ai && <Pill c={aiState === 'ready' ? '#7dff9a' : '#ffd23f'} blink={aiState === 'loading' || aiState === 'warming'}>{aiState === 'ready' ? 'AI ✓' : aiState === 'failed' ? 'AI ✗' : aiState === 'warming' ? 'AI WARM' : 'AI …'}</Pill>}
         <span style={{ fontSize: 13, color: 'rgba(233,241,236,.8)' }}>{clock}</span>
       </div>
@@ -724,6 +726,8 @@ export default function App() {
           <div style={{ display: 'flex', gap: 8 }}>
             <Tool icon="🔬" label="SUPER-RES" c="#ffaaff" on={sr} onClick={() => { setSr(x => !x); if (!sr) say('Super-res — hold the phone still') }} />
             <Tool icon="🌑" label="STEALTH" c="#9aa4b2" onClick={() => setStealth(true)} />
+            <Tool icon="◑" label="GLARE" c="#ffd27a" on={bsp > 0}
+                  onClick={() => { const v = bsp > 0 ? 0 : 0.7; setBsp(v); say(v ? 'Headlight suppression on' : 'Headlight suppression off') }} />
             <Tool icon="📡" label="CAST" c="#5cd6ff" on={cast.on} onClick={() => setSheet('cast')} />
             <Tool icon="?" label="HELP" c={color} onClick={() => setSheet('help')} />
           </div>
@@ -749,6 +753,13 @@ export default function App() {
           <Slider color={color} label="NOISE REDUCTION" value={denoise ?? M.denoise} min={0} max={0.95} step={0.05}
             onChange={setDenoise} fmt={v => denoise === null ? `AUTO ${Math.round(v * 100)}%` : `${Math.round(v * 100)}%`} />
           {denoise !== null && <Btn color={color} onClick={() => setDenoise(null)}>RESET NOISE TO AUTO</Btn>}
+          <Slider color={color} label="HEADLIGHT SUPPRESSION" value={bsp} min={0} max={1} step={0.05} onChange={setBsp}
+                  fmt={v => v === 0 ? 'OFF' : `${Math.round(v * 100)}%`} />
+          <div style={{ fontSize: 12.5, color: 'rgba(233,241,236,.62)', lineHeight: 1.5, padding: '0 4px 6px' }}>
+            Splits the frame into the glare field and the detail riding on it, then compresses the glare
+            and amplifies the detail — so oncoming headlights stop dominating and what is beside them stays readable.
+            Exposure metering also ignores blown pixels while this is on.
+          </div>
           <Slider color={color} label="ZOOM" value={zoom} min={1} max={8} step={0.1} onChange={setZoom} fmt={v => `${v.toFixed(1)}×`} />
           <Slider color={color} label="LOW-LIGHT ENHANCE" hint="Zero-DCE-style curve: lifts shadow detail without blowing out highlights"
             value={dce} min={0} max={0.5} step={0.01} onChange={setDce} fmt={v => v === 0 ? 'OFF' : `${Math.round(v * 200)}%`} />
@@ -852,6 +863,7 @@ export default function App() {
             ['Thermal modes', 'THERMAL, WHT-HOT, BLK-HOT, RAINBOW and ARCTIC map brightness to false color. Phone cameras see light, not heat — these are visualizations, not real thermal imaging.'],
             ['AI detection', 'Turn on AI to name objects (person, car, dog…) with confidence scores. The model downloads once, then works offline.'],
             ['Super-resolution', 'Turn on SUPER-RES and hold still. Each frame is aligned to the first on the GPU, then averaged and sharpened, so detail builds up and noise cancels out. The chip shows progress; moving too far restarts the stack.'],
+            ['Headlight suppression', 'GLARE splits the image into the slow-moving glare field and the fine detail on top of it, then compresses the glare and amplifies the detail. Oncoming headlights stop blowing out the frame and what sits beside them stays readable. Exposure metering ignores blown pixels while it is on. Tune the strength in SETTINGS.'],
             ['Stealth', 'STEALTH blacks out the screen so it emits no light, while the camera, sentry, recording and cast keep running. Double-tap anywhere to wake.'],
             ['Dual camera', 'DUAL shows front and rear together, with the second camera as an inset that is included in photos, videos and casts. Tap the inset to swap. Works where the browser allows two cameras at once (Chrome on many Android phones). Safari on iPhone stops the first camera when a second opens, so there DUAL will tell you and fall back to FLIP. Native apps like Snapchat use iOS multi-camera APIs that websites cannot reach.'],
             ['Sentry', 'Arm SENTRY and set the phone down. Motion or a person triggers an alert and a 15-second clip that extends while activity continues.'],

@@ -52,7 +52,11 @@ group('Wired into App.jsx exactly once, with stable identities')
   // directly, or it would always act on whatever `recording` was when the
   // effect last registered.
   ok('toggleRecording reads the live recRef, not a captured recording value', /recRef\.current \? stopRec\(\) : startRec\(false\)/.test(app))
-  ok('status mirrors recording into cfg.current for the bridge to read live', /pipColor: color, sr, quality, agc, adaptive, dce, recording,/.test(app))
+  // Match the property, not the key ORDER: pinning the exact adjacency broke
+  // every time an unrelated flag was added to cfg.current.
+  const cfgBlock = app.slice(app.indexOf('cfg.current = {'), app.indexOf('cfg.current = {') + 400)
+  ok('status mirrors recording into cfg.current for the bridge to read live',
+     /[{,]\s*recording\s*[,}]/.test(cfgBlock), cfgBlock.split('\n')[3])
 }
 
 console.log(`\n${'─'.repeat(50)}\n# ${pass} passed, ${fail} failed`)

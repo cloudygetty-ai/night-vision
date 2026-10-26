@@ -112,11 +112,28 @@ export async function warmup(model, makeCanvas) {
 // upward and makes the shader crush the whole scene to black.
 export const AGC_TARGET = 0.34, AGC_MIN = 0.35, AGC_MAX = 12
 
-export function autoExposure(luma, prev = 1, rate = 0.12, target = AGC_TARGET) {
+export const BLOWN = 236          // a headlight core sits here; it carries no detail
+
+// Fraction of the frame occupied by sources bright enough to be a lamp.
+export function glareLoad(luma, cutoff = BLOWN) {
+  if (!luma || !luma.length) return 0
+  let n = 0
+  for (let i = 0; i < luma.length; i++) if (luma[i] >= cutoff) n++
+  return n / luma.length
+}
+
+export function autoExposure(luma, prev = 1, rate = 0.12, target = AGC_TARGET, opts = {}) {
   if (!luma || !luma.length) return prev
   const step = Math.max(1, (luma.length / 4096) | 0)
-  const s = []
+  let s = []
   for (let i = 0; i < luma.length; i += step) s.push(luma[i])
+  // With bright-source protection on, meter the scene we actually want to see:
+  // drop blown pixels before measuring, so an oncoming headlight cannot pull
+  // the whole frame down. Keep them if that is nearly all there is.
+  if (opts.bsp) {
+    const kept = s.filter(v => v < (opts.cutoff || BLOWN))
+    if (kept.length > s.length * 0.25) s = kept
+  }
   s.sort((a, b) => a - b)
   const med = s[(s.length * 0.5) | 0] / 255
   // Guard on the 90th percentile, not the 98th: a lamp or torch reflection
@@ -125,7 +142,8 @@ export function autoExposure(luma, prev = 1, rate = 0.12, target = AGC_TARGET) {
   const hi = s[(s.length * 0.90) | 0] / 255
   let want = target / Math.max(med, 0.004)
   // only pull back once a broad area (not just the tail) would blow out
-  if (hi * want > 2.0) want = Math.min(want, 2.0 / Math.max(hi, 0.02))
+  const ceiling = opts.bsp ? 2.6 : 2.0     // BSP compresses highlights downstream
+  if (hi * want > ceiling) want = Math.min(want, ceiling / Math.max(hi, 0.02))
   want = Math.min(AGC_MAX, Math.max(AGC_MIN, want))
   const r = Math.min(1, Math.max(0.01, rate))
   const next = prev + (want - prev) * r                // temporal smoothing
