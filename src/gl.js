@@ -280,9 +280,9 @@ export function createRenderer(canvas) {
   canvas.addEventListener('webglcontextlost', onLost, false)
   canvas.addEventListener('webglcontextrestored', onRestored, false)
 
-  function drawDisplay(tex, o) {
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
-    gl.viewport(0, 0, W, H)
+  function drawDisplay(tex, o, target = null, tw = 0, th = 0) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target)
+    gl.viewport(0, 0, tw || W, th || H)
     gl.useProgram(disp.p)
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex)
     gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, lut)
@@ -295,7 +295,7 @@ export function createRenderer(canvas) {
     gl.uniform1f(disp.u.uSharp, o.sharp || 0)
     gl.uniform1f(disp.u.uExp, o.exposure == null ? 1 : o.exposure)
     gl.uniform1f(disp.u.uDce, o.dce || 0)
-    gl.uniform2f(disp.u.uRes, W, H)
+    gl.uniform2f(disp.u.uRes, tw || W, th || H)
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
   }
 
@@ -362,6 +362,78 @@ export function createRenderer(canvas) {
     gl.viewport(0, 0, W, H)
   }
 
+
+  // ── FULL-DETAIL STILL CAPTURE ───────────────────────────────────────────
+  // The preview buffer is sized for the screen (and shrunk further by the
+  // frame-rate governor), so reading the canvas throws away most of the
+  // sensor. Render the still in dedicated buffers at the true crop
+  // resolution, stack a few frames for denoise, then free immediately —
+  // holding large buffers is what drives the browser to evict a GL context.
+  function captureFull(el, o, size, opts = {}) {
+    if (lost || gl.isContextLost()) return null
+    const vw = el.videoWidth, vh = el.videoHeight
+    if (!vw || !vh || !size?.w || !size?.h) return null
+    const w = size.w, h = size.h
+    const frames = Math.max(1, Math.min(12, opts.frames ?? 1))
+
+    const bufs = [], made = []
+    try {
+      // RGBA8, not half-float: stills do not need the extra range and this
+      // halves peak memory at full resolution.
+      for (let i = 0; i < 3; i++) {
+        const tex = mkTex()
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+        const fbo = gl.createFramebuffer()
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0)
+        if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('fbo')
+        made.push({ tex, fbo }); bufs.push({ tex, fbo })
+      }
+      const out = bufs.pop()
+      const ca = w / h, va = vw / vh
+      const sx = va > ca ? ca / va : 1
+      const sy = va > ca ? 1 : va / ca
+
+      upload(video, el, vw, vh)
+      let c = 0
+      for (let i = 0; i < frames; i++) {
+        const src = bufs[c], dst = bufs[1 - c]
+        gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo)
+        gl.viewport(0, 0, w, h)
+        gl.useProgram(acc.p)
+        gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, video)
+        gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, src.tex)
+        gl.uniform1i(acc.u.uCur, 0); gl.uniform1i(acc.u.uPrev, 1)
+        gl.uniform1f(acc.u.uAlpha, i === 0 ? 1 : 1 / (i + 1))
+        gl.uniform1f(acc.u.uMirror, o.mirror ? 1 : 0)
+        gl.uniform2f(acc.u.uScale, sx, sy)
+        gl.uniform2f(acc.u.uShift, 0, 0)
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+        c = 1 - c
+      }
+      drawDisplay(bufs[c].tex, o, out.fbo, w, h)
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, out.fbo)
+      const px = new Uint8Array(w * h * 4)
+      gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px)
+
+      // GL origin is bottom-left; flip into image order
+      const cv = document.createElement('canvas'); cv.width = w; cv.height = h
+      const img = cv.getContext('2d').createImageData(w, h)
+      const row = w * 4
+      for (let y = 0; y < h; y++) img.data.set(px.subarray((h - 1 - y) * row, (h - y) * row), y * row)
+      cv.getContext('2d').putImageData(img, 0, 0)
+      return cv
+    } catch {
+      return null
+    } finally {
+      made.forEach(b => { gl.deleteTexture(b.tex); gl.deleteFramebuffer(b.fbo) })
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+      gl.viewport(0, 0, W, H)
+      if (lastTex && lastOpts) drawDisplay(lastTex, lastOpts)
+    }
+  }
+
   function isLost() { return lost || gl.isContextLost() }
   function dispose() {
     canvas.removeEventListener('webglcontextlost', onLost)
@@ -371,7 +443,7 @@ export function createRenderer(canvas) {
     try { gl.getExtension('WEBGL_lose_context')?.loseContext() } catch {}
   }
 
-  return { gl, resize, render, renderPip, reset, redraw, isLost, dispose, halfFloat }
+  return { gl, resize, render, renderPip, reset, redraw, captureFull, isLost, dispose, halfFloat }
 }
 
 // Map a point in normalized raw-video space (0..1) to normalized screen space.

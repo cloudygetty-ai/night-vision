@@ -15,7 +15,12 @@ group('ULTRA uses the sensor, not an arbitrary cap')
   const r = fitCanvas(IPHONE.cssW, IPHONE.cssH, IPHONE.dpr, 'ULTRA', IPHONE.srcW, IPHONE.srcH, false)
   ok('renders above the old 1600px ceiling', Math.max(r.w, r.h) > 1600, `${r.w}×${r.h}`)
   ok('uses full DPR 3 (was clamped to 2)', r.dpr === 3, `dpr=${r.dpr}`)
-  ok('matches native screen pixels (393×3 = 1179 wide)', r.w === 1179, `w=${r.w}`)
+  // a 16:9 sensor cannot fill a portrait screen with real detail: cropping
+  // 3840×2160 to 0.46 aspect leaves only 996 px of width
+  ok('does not invent detail a 16:9 crop cannot supply', r.w === 996, `w=${r.w}`)
+  // a 4:3 sensor does have the detail, so the full screen buffer is justified
+  const native = fitCanvas(IPHONE.cssW, IPHONE.cssH, IPHONE.dpr, 'ULTRA', 4032, 3024, false)
+  ok('matches native screen pixels from a 4:3 sensor (393×3 = 1179)', native.w === 1179, `w=${native.w}`)
   ok('stays within the 4096 cap', Math.max(r.w, r.h) <= QUALITY_CAP.ULTRA, `${r.w}×${r.h}`)
 }
 
@@ -23,8 +28,11 @@ group('Never wastes GPU upscaling past the sensor')
 {
   const r = fitCanvas(2000, 2000, 3, 'ULTRA', 1280, 720, false)
   ok('clamped to the 1280px source', Math.max(r.w, r.h) <= 1280, `${r.w}×${r.h}`)
+  // 1280×720 cropped to a square frame yields 720px of real detail; super-res
+  // stacking legitimately resolves beyond that single-frame limit
   const sr = fitCanvas(2000, 2000, 3, 'ULTRA', 1280, 720, true)
-  ok('super-res is allowed past the source (real detail)', Math.max(sr.w, sr.h) > 1280, `${sr.w}×${sr.h}`)
+  ok('super-res is allowed past the per-frame crop limit', Math.max(sr.w, sr.h) > 720, `${sr.w}×${sr.h}`)
+  ok('but is still bounded, not unlimited', Math.max(sr.w, sr.h) <= 720 * 1.5 + 1, `${sr.w}×${sr.h}`)
 }
 
 group('Quality ladder is monotonic')

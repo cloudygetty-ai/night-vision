@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { MODES, createRenderer, videoToScreen } from './gl.js'
 import { createMotion, createAligner, vault, stamp, sha256, beep, recorderType, shareBlob, download, dataUrlToBlob,
-         fitCanvas, pickBitrate, resLabel, autoExposure, qualityGovernor, memoryScale, initDetector, warmup } from './engine.js'
+         fitCanvas, pickBitrate, resLabel, autoExposure, qualityGovernor, memoryScale, initDetector, warmup,
+         rankCameraModes, captureSize, usablePixels } from './engine.js'
 import { Sheet, Btn, Section, Toggle, Slider, Tool, FONT, DISPLAY, PANEL } from './ui.jsx'
 import { initWatchBridge } from './watchBridge.js'
 
@@ -24,7 +25,7 @@ function useCamera(facing, attempt) {
       try {
         s = await navigator.mediaDevices.getUserMedia({
           audio: false,
-          video: { facingMode: { ideal: facing }, width: { ideal: 3840 }, height: { ideal: 2160 }, frameRate: { ideal: 30 } },
+          video: { facingMode: { ideal: facing }, width: { ideal: 4032 }, height: { ideal: 3024 }, frameRate: { ideal: 30 } },
         })
         if (!live) { s.getTracks().forEach(t => t.stop()); return }
         setStream(s)
@@ -119,6 +120,8 @@ export default function App() {
   const scaleRef = useRef(1)
   const [expShow, setExpShow] = useState(1)
   const [camRes, setCamRes] = useState({ w: 0, h: 0 })
+  const [sensorMode, setSensorMode] = useState(null)
+  const [shotRes, setShotRes] = useState(null)
   const [clock, setClock] = useState('')
   const [alertFlash, setAlertFlash] = useState(false)
   const [cast, setCast] = useState({ on: false, code: '', viewers: 0, status: 'idle' })
@@ -188,12 +191,30 @@ export default function App() {
     setTorchOk(!!track?.getCapabilities?.()?.torch); setTorch(false)
     const ended = () => setAttempt(a => a + 1)
     track?.addEventListener('ended', ended)
-    // ask the track directly for the highest mode it supports
+    // Pick the sensor mode with the most pixels SURVIVING the portrait
+    // cover-crop. A 16:9 "4K" mode loses about half its width to that crop,
+    // so a 4:3 mode at the same long edge carries far more real detail.
     ;(async () => {
       try {
         const caps = track?.getCapabilities?.()
-        if (caps?.width?.max && caps.width.max > (track.getSettings()?.width || 0))
-          await track.applyConstraints({ width: { ideal: caps.width.max }, height: { ideal: caps.height?.max } })
+        if (!caps?.width?.max) return
+        const el = stageRef.current?.getBoundingClientRect()
+        const aspect = el && el.height ? el.width / el.height : 9 / 16
+        let best = null
+        for (const m of rankCameraModes(caps, aspect).slice(0, 3)) {
+          try {
+            await track.applyConstraints({ width: { ideal: m.width }, height: { ideal: m.height } })
+            const g = track.getSettings?.() || {}
+            if (!g.width || !g.height) continue
+            const got = usablePixels(g.width, g.height, aspect)
+            if (!best || got > best.usable) best = { usable: got, width: g.width, height: g.height }
+            if (got >= m.usable * 0.97) break        // got what we asked for
+          } catch { /* mode unsupported, try the next */ }
+        }
+        if (best) {
+          await track.applyConstraints({ width: { ideal: best.width }, height: { ideal: best.height } })
+          setSensorMode({ ...best })
+        }
       } catch {}
     })()
     rendererRef.current?.reset()
@@ -434,13 +455,27 @@ export default function App() {
     const c = canvasRef.current
     if (!c) return
     setFlash(true); setTimeout(() => setFlash(false), 140)
-    rendererRef.current?.redraw()      // drawing buffer is not preserved
-    let url = c.toDataURL('image/jpeg', 0.92)
+    const r = rendererRef.current, v = videoRef.current
+    let url = null, shotW = c.width, shotH = c.height
+    // Render the still at the sensor's true crop resolution rather than
+    // reading back the screen-sized preview buffer.
+    if (r?.captureFull && v?.videoWidth) {
+      const size = captureSize(c.width, c.height, v.videoWidth, v.videoHeight, cfg.current.zoom)
+      const big = r.captureFull(v, {
+        mode: cfg.current.mode, gain: Math.pow(2, cfg.current.ev),
+        denoise: cfg.current.denoise, zoom: cfg.current.zoom, edge: cfg.current.edge,
+        mirror: cfg.current.mirror, time: performance.now() / 1000, sharp: 0,
+        exposure: cfg.current.agc ? expRef.current : 1,
+      }, size, { frames: cfg.current.denoise > 0.4 ? 6 : 3 })
+      if (big) { url = big.toDataURL('image/jpeg', 0.95); shotW = big.width; shotH = big.height }
+    }
+    if (!url) { r?.redraw(); url = c.toDataURL('image/jpeg', 0.95) }
+    setShotRes({ w: shotW, h: shotH })
     const now = new Date()
     const meta = { utc: now.toISOString().replace('T', ' ').slice(0, 19) + 'Z', mode: M.label, zoom, gps: gpsRef.current }
     if (stampOn) { try { url = await stamp(url, meta) } catch { /* keep unstamped */ } }
     const hash = await sha256(url)
-    const shot = { ts: now.getTime(), url, hash, mode: M.label, utc: meta.utc, gps: meta.gps }
+    const shot = { ts: now.getTime(), url, hash, mode: M.label, utc: meta.utc, gps: meta.gps, w: shotW, h: shotH }
     setShots(s => [shot, ...s])
     if (vaultOn) { await vault.put('shots', shot); setStorage(await vault.usage()) }
   }, [M.label, zoom, stampOn, vaultOn])
@@ -748,8 +783,10 @@ export default function App() {
             ))}
           </div>
           <div style={{ fontSize: 12.5, color: 'rgba(233,241,236,.62)', lineHeight: 1.5, padding: '0 4px' }}>
-            Sensor {camRes.w ? `${camRes.w}×${camRes.h} (${resLabel(camRes.w, camRes.h)})` : '—'} · rendering {renderRes.w ? `${renderRes.w}×${renderRes.h}` : '—'}{adaptive && govScale < 0.995 ? ` (${Math.round(govScale * 100)}%)` : ''} at {fps} FPS · {rendererRef.current?.halfFloat ? 'high-precision' : 'standard'} GPU buffers.
-            ULTRA renders at full sensor resolution; choose SAVER on older phones or to save battery.
+            Sensor {camRes.w ? `${camRes.w}×${camRes.h} (${resLabel(camRes.w, camRes.h)})` : '—'}
+            {camRes.w ? ` · ${(usablePixels(camRes.w, camRes.h, renderRes.w / renderRes.h || 0.46) / 1e6).toFixed(1)}MP usable after crop` : ''}
+            {shotRes ? ` · last photo ${shotRes.w}×${shotRes.h}` : ''} · rendering {renderRes.w ? `${renderRes.w}×${renderRes.h}` : '—'}{adaptive && govScale < 0.995 ? ` (${Math.round(govScale * 100)}%)` : ''} at {fps} FPS · {rendererRef.current?.halfFloat ? 'high-precision' : 'standard'} GPU buffers.
+            Photos are rendered at the sensor's full crop resolution, not the on-screen buffer. Choose SAVER on older phones or to save battery.
           </div>
         </Sheet>
       )}

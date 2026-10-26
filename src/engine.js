@@ -3,6 +3,70 @@
 // ═════════════════════════════════════════════════════════════════════════
 
 
+// ── SENSOR MODE SELECTION ─────────────────────────────────────────────────
+// The camera hands us landscape frames; the app cover-crops them to a portrait
+// screen, so most of a 16:9 frame's width is thrown away. What matters is not
+// the sensor's headline resolution but the pixels that survive that crop:
+//   4K 16:9  3840x2160 -> 996x2160  = 2.15MP usable
+//   12MP 4:3 4032x3024 -> 1395x3024 = 4.22MP usable
+// Asking for "4K" therefore costs roughly half the real detail on a phone.
+export const ASPECTS = [[4, 3], [3, 2], [16, 10], [16, 9]]
+
+// Pixels that survive a cover-crop of srcW x srcH into a frame of aspect
+// `displayAspect` (width / height).
+export function usablePixels(srcW, srcH, displayAspect) {
+  if (!srcW || !srcH || !displayAspect) return 0
+  const srcAspect = srcW / srcH
+  // cover: scale until both axes are filled, then crop the overflowing one
+  const w = srcAspect > displayAspect ? srcH * displayAspect : srcW
+  const h = srcAspect > displayAspect ? srcH : srcW / displayAspect
+  return Math.round(w) * Math.round(h)
+}
+
+// Candidate capture modes ranked by usable detail, best first. Capabilities
+// give ranges rather than a mode list, so we probe standard aspect ratios at
+// the sensor's maximum and let the camera snap to its nearest real mode.
+export function rankCameraModes(caps = {}, displayAspect = 9 / 16, opts = {}) {
+  const maxW = caps.width?.max || opts.fallbackW || 1920
+  const maxH = caps.height?.max || opts.fallbackH || 1080
+  const cap = Math.max(maxW, maxH)
+  const seen = new Set(), out = []
+  for (const [aw, ah] of ASPECTS) {
+    // longest edge at the sensor maximum, in this aspect ratio
+    let w = cap, h = Math.round((cap * ah) / aw)
+    if (h > Math.max(maxW, maxH)) { h = Math.max(maxW, maxH); w = Math.round((h * aw) / ah) }
+    // cameras report landscape; keep width the long edge
+    if (w < h) { const t = w; w = h; h = t }
+    if (w > maxW && maxW >= maxH) w = maxW
+    if (h > maxH && maxH >= maxW) h = maxH
+    const key = w + 'x' + h
+    if (seen.has(key) || w < 320 || h < 240) continue
+    seen.add(key)
+    out.push({ width: w, height: h, aspect: `${aw}:${ah}`, usable: usablePixels(w, h, displayAspect) })
+  }
+  return out.sort((a, b) => b.usable - a.usable)
+}
+
+// The resolution a still should be rendered at: every pixel the sensor really
+// offers in the current framing, with no upscaling beyond it.
+export function captureSize(previewW, previewH, srcW, srcH, zoom = 1, maxPixels = 24e6) {
+  if (!previewW || !previewH || !srcW || !srcH) return { w: previewW || 2, h: previewH || 2, upscaled: false }
+  const a = previewW / previewH
+  const srcAspect = srcW / srcH
+  // the crop rectangle actually sampled, shrinking further as zoom increases
+  const cropW = (srcAspect > a ? srcH * a : srcW) / Math.max(1, zoom)
+  const cropH = (srcAspect > a ? srcH : srcW / a) / Math.max(1, zoom)
+  // Anchor to the sensor's real crop height, then derive width from it:
+  // deriving height from a rounded width loses a pixel off the true size.
+  let h = Math.round(Math.max(cropH, previewH)), w = Math.round(h * a)
+  if (w * h > maxPixels) {
+    const k = Math.sqrt(maxPixels / (w * h))
+    w = Math.floor(w * k); h = Math.floor(h * k)          // floor: rounding up re-breaches the cap
+    while (w * h > maxPixels && h > 2) { h -= 1; w = Math.floor(h * a) }
+  }
+  return { w: Math.max(2, w), h: Math.max(2, h), upscaled: h > cropH + 1 }
+}
+
 // ── AI DETECTOR BOOTSTRAP ─────────────────────────────────────────────────
 // Runs on the WASM backend, never WebGL. TF.js's WebGL backend would create a
 // SECOND GL context on the page; with the renderer already holding large
@@ -115,8 +179,17 @@ export function fitCanvas(cssW, cssH, dpr, quality = 'HIGH', srcW = 0, srcH = 0,
   const d = Math.min(Math.max(dpr || 1, 1), QUALITY_DPR[quality] || 2)
   const k = Math.min(1, Math.max(0.3, scale || 1))     // governor
   let w = Math.round(cssW * d * k), h = Math.round(cssH * d * k)
-  const srcLong = Math.max(srcW, srcH)
-  // cover-crop means the source must fill the shorter axis too
+  // Bound by the detail that SURVIVES the cover-crop, not by the sensor's
+  // headline size: cropping a landscape frame to a portrait screen discards
+  // most of its width, so the raw long edge overstates what is really there.
+  let srcLong = 0
+  if (srcW && srcH) {
+    const a = (cssW || 1) / (cssH || 1), sa = srcW / srcH
+    const cw = sa > a ? srcH * a : srcW
+    const ch = sa > a ? srcH : srcW / a
+    srcLong = Math.max(cw, ch)
+  }
+  // super-res stacks frames, which does create detail beyond one frame
   const ceiling = srcLong ? Math.round(srcLong * (sr ? 1.5 : 1)) : cap
   const limit = Math.min(cap, ceiling)
   const long = Math.max(w, h)

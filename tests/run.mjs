@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process'
 let tp = 0, tf = 0
-for (const t of ['motion', 'resolution', 'shader', 'exposure', 'perf', 'ai', 'renderer', 'watchBridge']) {
+for (const t of ['motion', 'resolution', 'shader', 'exposure', 'perf', 'ai', 'capture', 'renderer', 'watchBridge']) {
   let out = ''
   try { out = execFileSync('node', [`tests/${t}.test.mjs`], { encoding: 'utf8' }) }
   catch (e) { out = (e.stdout || '') + (e.stderr || '') }

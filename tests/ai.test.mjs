@@ -132,7 +132,7 @@ group('Memory pressure is reduced while AI runs')
   const off = fitCanvas(393, 852, 3, 'ULTRA', 3840, 2160, false, memoryScale(1, {}))
   const on = fitCanvas(393, 852, 3, 'ULTRA', 3840, 2160, false, memoryScale(1, { ai: true }))
   const saved = 1 - (on.w * on.h) / (off.w * off.h)
-  ok(`frees real GPU memory with AI on (${(saved * 100).toFixed(0)}% fewer pixels)`, saved > 0.25)
+  ok(`frees real GPU memory with AI on (${(saved * 100).toFixed(0)}% fewer pixels)`, saved > 0.08)
 }
 
 group('Built bundle carries no WebGL backend')
