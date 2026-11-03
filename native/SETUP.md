@@ -107,6 +107,8 @@ NVS calls `getUserMedia()` for the camera. Add to the **NVSHost** target's
 
 - `NSCameraUsageDescription` — e.g. "NVS needs the camera for night-vision
   capture."
+- `NSLocationWhenInUseUsageDescription` — NVS stamps captures with GPS
+  (`navigator.geolocation` in `App.jsx`); without it iOS silently denies location.
 
 `WebViewContainer.swift`'s `WKUIDelegate.requestMediaCapturePermissionFor`
 auto-grants the in-page permission prompt (WKWebView doesn't show Safari's
