@@ -29,21 +29,35 @@ export async function joinCast(code, handlers = {}, strategies = STRATEGIES) {
     const mod = await s.load()
     const joinRoom = mod.joinRoom || mod.default?.joinRoom
     if (typeof joinRoom !== 'function') throw new Error(`${s.name}: no joinRoom export`)
-    const room = joinRoom({ appId: APP_ID }, roomName(code))
+    // relayConfig.urls lets the integration harness point at a local broker;
+    // onJoinError is trystero reporting WHY a network refused us, which is the
+    // detail that was missing every time a cast silently failed.
+    const urls = globalThis.__NVS_RELAYS?.[s.name]
+    const room = joinRoom({
+      appId: APP_ID,
+      ...(urls ? { relayConfig: { urls } } : {}),
+      ...(globalThis.__NVS_RTC || {}),            // integration harness only
+      onJoinError: d => handlers.onJoinError?.(`${s.name}: ${d.error}`, s.name),
+    }, roomName(code))
 
-    room.onPeerJoin?.(id => {
+    // trystero 0.26 INVERTED this API: onPeerJoin and friends are properties
+    // you assign, not functions you call (0.25 was the other way round, which
+    // is what the NVS-13 note describes). Calling them throws; calling them
+    // with optional chaining — as this did — silently does nothing at all,
+    // so peers simply never connected and no error was ever raised.
+    room.onPeerJoin = id => {
       if (peerVia.has(id)) return            // same viewer reached us twice
       peerVia.set(id, { room, name: s.name })
       handlers.onPeerJoin?.(id, s.name)
-    })
-    room.onPeerLeave?.(id => {
+    }
+    room.onPeerLeave = id => {
       // Only the transport that introduced this peer may retire them; the
       // other one never had them, and letting it fire drops a live viewer.
       if (peerVia.get(id)?.name !== s.name) return
       peerVia.delete(id)
       handlers.onPeerLeave?.(id, s.name)
-    })
-    room.onPeerStream?.((stream, id) => handlers.onPeerStream?.(stream, id, s.name))
+    }
+    room.onPeerStream = (stream, id) => handlers.onPeerStream?.(stream, id, s.name)
 
     live.push({ name: s.name, room })
     return s.name
@@ -62,7 +76,7 @@ export async function joinCast(code, handlers = {}, strategies = STRATEGIES) {
     addStream(stream, id) {
       if (id) {
         const t = peerVia.get(id)
-        if (t) { try { t.room.addStream(stream, id) } catch { /* peer vanished */ } }
+        if (t) { try { t.room.addStream(stream, { target: id }) } catch { /* peer vanished */ } }
         return
       }
       live.forEach(({ room }) => { try { room.addStream(stream) } catch { /* no peers yet */ } })

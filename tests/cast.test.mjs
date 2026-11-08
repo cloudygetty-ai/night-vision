@@ -27,10 +27,11 @@ const mkStrategy = (name, { fail = false } = {}) => {
           joinRoom: (cfg, room) => {
             state.joined = { cfg, room }
             return {
-              onPeerJoin: f => { state.handlers.join = f },
-              onPeerLeave: f => { state.handlers.leave = f },
-              onPeerStream: f => { state.handlers.stream = f },
-              addStream: (s, id) => state.streams.push({ s, id }),
+              // 0.26: assignable properties, mirrored by these setters
+              set onPeerJoin(f) { state.handlers.join = f },
+              set onPeerLeave(f) { state.handlers.leave = f },
+              set onPeerStream(f) { state.handlers.stream = f },
+              addStream: (s, opts) => state.streams.push({ s, id: opts?.target }),
               leave: () => { state.left = true },
             }
           },
@@ -129,13 +130,24 @@ group('Broadcast before anyone has joined')
      (() => { try { room.addStream({}, 'nobody'); return true } catch { return false } })())
 }
 
-group('Trystero handlers are called, not assigned (the NVS-13 regression)')
+group('Trystero 0.26 handler convention (it INVERTED from 0.25)')
 {
-  ok('onPeerJoin is called, not assigned', /room\.onPeerJoin\?\.\(/.test(castSrc))
-  ok('onPeerLeave is called, not assigned', /room\.onPeerLeave\?\.\(/.test(castSrc))
-  ok('onPeerStream is called, not assigned', /room\.onPeerStream\?\.\(/.test(castSrc))
-  ok('nothing assigns a handler as a property',
-     !/\.onPeer(Join|Leave|Stream)\s*=[^=]/.test(app + watch + castSrc))
+  // 0.25 wanted room.onPeerJoin(cb); 0.26 wants room.onPeerJoin = cb. Calling
+  // it in 0.26 throws — and calling it with ?. silently does nothing, which is
+  // exactly how casting failed with no error for weeks.
+  ok('onPeerJoin is assigned, not called', /room\.onPeerJoin = /.test(castSrc))
+  ok('onPeerLeave is assigned, not called', /room\.onPeerLeave = /.test(castSrc))
+  ok('onPeerStream is assigned, not called', /room\.onPeerStream = /.test(castSrc))
+  ok('no handler is invoked as a function', !/room\.onPeer(Join|Leave|Stream)\?\?\.\(|room\.onPeer(Join|Leave|Stream)\(/.test(castSrc))
+  ok('addStream targets a peer via the options object, not a bare id',
+     /addStream\(stream, \{ target: id \}\)/.test(castSrc))
+
+  // the versions are pinned exactly so a minor bump cannot invert this again
+  const pkg = JSON.parse(R('../package.json'))
+  ok('trystero is pinned exactly', /^\d+\.\d+\.\d+$/.test(pkg.dependencies.trystero), pkg.dependencies.trystero)
+  ok('mqtt strategy is pinned exactly', /^\d+\.\d+\.\d+$/.test(pkg.dependencies['@trystero-p2p/mqtt']))
+  ok('strategy versions match trystero',
+     pkg.dependencies['@trystero-p2p/mqtt'] === pkg.dependencies.trystero)
 }
 
 group('captureStream gets a preserved drawing buffer')
