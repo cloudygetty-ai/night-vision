@@ -116,7 +116,6 @@ export default function App() {
   const [renderRes, setRenderRes] = useState({ w: 0, h: 0 })
   const [glReady, setGlReady] = useState(0)
   const [glEpoch, setGlEpoch] = useState(0)
-  const preserveRef = useRef(false)
   const sizeRef = useRef({ w: 0, h: 0 })
   const expRef = useRef(1)
   const scaleRef = useRef(1)
@@ -126,7 +125,7 @@ export default function App() {
   const [shotRes, setShotRes] = useState(null)
   const [clock, setClock] = useState('')
   const [alertFlash, setAlertFlash] = useState(false)
-  const [cast, setCast] = useState({ on: false, code: '', viewers: 0, status: 'idle' })
+  const [cast, setCast] = useState({ on: false, code: '', viewers: 0, status: 'idle', error: '' })
   const [storage, setStorage] = useState(null)
   const [toast, setToast] = useState(null)
   const [dual, setDual] = useState(false)
@@ -267,7 +266,11 @@ export default function App() {
     const cv = canvasRef.current
     if (!cv) return
     let r
-    try { r = createRenderer(cv, { preserve: preserveRef.current }) } catch { r = null }
+    try {
+      r = createRenderer(cv, {
+        onLost: () => { say('Display context reset — recovering'); setGlEpoch(n => n + 1) },
+      })
+    } catch { r = null }
     if (!r) { setGlFail(true); return }
     rendererRef.current = r
     motionFn.current = createMotion()
@@ -277,15 +280,9 @@ export default function App() {
     return () => { r.dispose(); if (rendererRef.current === r) rendererRef.current = null }
   }, [glEpoch])
 
-  // ── context-loss recovery ──
-  // A dropped GL context used to freeze the camera permanently. Rebuild it.
-  useEffect(() => {
-    const cv = canvasRef.current
-    if (!cv) return
-    const onLost = () => { say('Display context reset — recovering'); setGlEpoch(n => n + 1) }
-    cv.addEventListener('webglcontextlost', onLost)
-    return () => cv.removeEventListener('webglcontextlost', onLost)
-  }, [say])
+  // Context loss is reported BY the renderer (see createRenderer's onLost).
+  // A second listener here used to catch the loseContext() that dispose()
+  // fires, rebuild, dispose again, and loop forever.
 
   // ── sizing: re-runs freely, touches only the drawing buffer ──
   useEffect(() => {
@@ -313,22 +310,11 @@ export default function App() {
     srRef.current = { n: 0, shift: [0, 0] }; setSrFrames(0)
   }, [mode, facing, sr])
 
-  // canvas.captureStream() needs a preserved drawing buffer to be reliable.
-  // Rebuild the context before handing a stream to a recorder or a peer, and
-  // drop back to the fast path once nothing is streaming.
-  const ensurePreserve = useCallback(async want => {
-    if (preserveRef.current === want) return
-    preserveRef.current = want
-    setGlEpoch(n => n + 1)
-    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))
-  }, [])
 
   // ── recording ──
   const startRec = useCallback(async (auto = false) => {
     const c = canvasRef.current
     if (!c || recRef.current || !window.MediaRecorder) return
-    await ensurePreserve(true)
-    if (recRef.current) return                 // a second call landed while rebuilding
     const type = recorderType()
     const rec = new MediaRecorder(c.captureStream(30), type ? { mimeType: type, videoBitsPerSecond: pickBitrate(c.width, c.height, 30) } : undefined)
     const chunks = [], t0 = Date.now()
@@ -343,13 +329,12 @@ export default function App() {
     rec.start(1000)
     recRef.current = { rec, auto }
     setRecording(true)
-  }, [ensurePreserve])
+  }, [])
   const stopRec = useCallback(() => {
     const r = recRef.current; if (!r) return
     try { r.rec.stop() } catch { /* already stopped */ }
     recRef.current = null; setRecording(false)
-    if (!castRef.current) ensurePreserve(false)
-  }, [ensurePreserve])
+  }, [])
 
   // ── watch bridge: no-op outside the native iOS host app (see watchBridge.js) ──
   // Registered once; reads live values from cfg.current / recRef rather than
@@ -509,7 +494,6 @@ export default function App() {
   const startCast = useCallback(async () => {
     const c = canvasRef.current
     if (!c?.captureStream) { say('Casting not supported in this browser'); return }
-    await ensurePreserve(true)
     // Always exactly 4 characters. Math.random().toString(36) can be short for
     // the rare exactly-representable value (0.5 -> "0.i"), which would print a
     // broken code nobody could join.
@@ -525,14 +509,19 @@ export default function App() {
       room.onPeerLeave(() => setCast(s => ({ ...s, viewers: Math.max(0, s.viewers - 1) })))
       castRef.current = room
       setCast(s => ({ ...s, status: 'waiting' }))
-    } catch { setCast({ on: false, code: '', viewers: 0, status: 'failed' }); say('Could not start cast') }
-  }, [say, ensurePreserve])
+    } catch (e) {
+      // Wiping the code here is what made a failure look like "the code
+      // disappears": the session vanished and the only clue was a toast.
+      // Keep it on screen and say what actually went wrong.
+      setCast({ on: true, code, viewers: 0, status: 'failed', error: String(e?.message || e).slice(0, 120) })
+      say('Cast failed to connect')
+    }
+  }, [say])
   const stopCast = useCallback(() => {
     try { castRef.current?.leave() } catch { /* noop */ }
     castRef.current = null
     setCast({ on: false, code: '', viewers: 0, status: 'idle' })
-    if (!recRef.current) ensurePreserve(false)
-  }, [ensurePreserve])
+  }, [])
 
   // ── presets ──
   const applyPreset = p => {
@@ -860,7 +849,9 @@ export default function App() {
                 <div style={{ fontSize: 13, color: 'rgba(233,241,236,.7)', letterSpacing: 2 }}>CAST CODE</div>
                 <div style={{ fontFamily: DISPLAY, fontSize: 46, fontWeight: 900, color: '#5cd6ff', letterSpacing: 10, margin: '6px 0' }}>{cast.code}</div>
                 <div style={{ fontSize: 13, color: '#5cd6ff' }}>
-                  {cast.status === 'connecting' ? 'Connecting…' : cast.viewers ? `${cast.viewers} watching` : 'Waiting for a viewer'}
+                  {cast.status === 'failed' ? 'Could not reach the relay — tap RETRY'
+                    : cast.status === 'connecting' ? 'Connecting…'
+                    : cast.viewers ? `${cast.viewers} watching` : 'Waiting for a viewer'}
                 </div>
               </div>
               <div style={{ fontSize: 13.5, lineHeight: 1.6, color: 'rgba(233,241,236,.85)' }}>
@@ -869,7 +860,15 @@ export default function App() {
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
                 <Btn color="#5cd6ff" onClick={() => { navigator.clipboard?.writeText(watchUrl); say('Link copied') }}>COPY LINK</Btn>
-                <Btn color="#5cd6ff" danger onClick={stopCast}>STOP</Btn>
+                {cast.status === 'failed' && cast.error && (
+                  <div style={{ fontSize: 12, opacity: .7, wordBreak: 'break-word', margin: '2px 0 8px' }}>{cast.error}</div>
+                )}
+                <div style={{ display: 'flex', gap: 10 }}>
+                  {cast.status === 'failed' && (
+                    <Btn color="#5cd6ff" onClick={() => { stopCast(); setTimeout(startCast, 60) }}>RETRY</Btn>
+                  )}
+                  <Btn color="#5cd6ff" danger onClick={stopCast}>STOP</Btn>
+                </div>
               </div>
             </>
           )}

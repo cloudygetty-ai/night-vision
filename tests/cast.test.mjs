@@ -41,38 +41,61 @@ group('Trystero handlers are called, not assigned (the NVS-13 regression)')
 
 group('captureStream gets a preserved drawing buffer')
 {
-  ok('renderer takes a preserve option', /createRenderer\(canvas, opts = \{\}\)/.test(gl))
-  ok('the flag is driven by that option', /preserveDrawingBuffer: !!opts\.preserve/.test(gl))
-  ok('renderer reports which mode it is in', /preserving,/.test(gl))
-  ok('app creates the context with the current preference',
-     /createRenderer\(cv, \{ preserve: preserveRef\.current \}\)/.test(app))
-
-  // ordering is the whole point: the stream must not be grabbed from a
-  // context that is about to be thrown away
-  const castBody = app.slice(app.indexOf('const startCast'), app.indexOf('const stopCast'))
-  ok('cast switches to preserving BEFORE grabbing the stream',
-     castBody.indexOf('ensurePreserve(true)') < castBody.indexOf('captureStream('),
-     'ensurePreserve must come first')
-  ok('cast awaits the rebuild', /await ensurePreserve\(true\)/.test(castBody))
-
-  const recBody = app.slice(app.indexOf('const startRec'), app.indexOf('const stopRec'))
-  ok('recording switches to preserving before grabbing the stream',
-     recBody.indexOf('ensurePreserve(true)') < recBody.indexOf('captureStream('))
-  ok('recording awaits the rebuild', /await ensurePreserve\(true\)/.test(recBody))
-  ok('startRec is async now that it awaits', /const startRec = useCallback\(async/.test(app))
-  ok('a second start during the rebuild is ignored',
-     /if \(recRef\.current\) return\s+\/\/ a second call landed while rebuilding/.test(app))
+  ok('the drawing buffer is preserved by default', /preserveDrawingBuffer: opts\.preserve !== false/.test(gl))
+  ok('app does not opt out of it', !/preserve: false/.test(app))
+  ok('renderer reports its mode', /const preserving = opts\.preserve !== false/.test(gl))
+  // Rebuilding the context at cast start (to switch this flag) is what set the
+  // dispose -> loseContext -> rebuild loop going. There must be no such path.
+  ok('no context rebuild on the cast path', !/ensurePreserve/.test(app))
+  ok('no second preserve mode to switch between', !/preserveRef/.test(app))
 }
 
-group('The fast path comes back when nothing is streaming')
+group('Disposing must not look like a context loss (the runaway loop)')
 {
-  ok('stopping the cast drops preserving if not recording',
-     /if \(!recRef\.current\) ensurePreserve\(false\)/.test(app))
-  ok('stopping recording drops preserving if not casting',
-     /if \(!castRef\.current\) ensurePreserve\(false\)/.test(app))
-  ok('switching is a no-op when already in the right mode',
-     /if \(preserveRef\.current === want\) return/.test(app))
-  ok('the switch rebuilds the context', /preserveRef\.current = want\s+setGlEpoch/.test(app))
+  ok('renderer tracks deliberate teardown', /let lost = false, disposing = false/.test(gl))
+  ok('dispose marks itself before losing the context', /disposing = true\n\s*canvas\.removeEventListener/.test(gl))
+  ok('a deliberate loss is not reported to the owner', /if \(!disposing\) opts\.onLost\?\.\(\)/.test(gl))
+  ok('only the renderer listens for context loss',
+     !/addEventListener\('webglcontextlost'/.test(app),
+     'App must not attach its own listener')
+  ok('the owner is notified through the callback', /onLost: \(\) =>/.test(app))
+
+  // Simulate the wiring: a deliberate dispose must terminate, not recurse.
+  let rebuilds = 0, disposals = 0
+  const canvasListeners = []
+  const mkRenderer = onLost => {
+    rebuilds++
+    let disposing = false
+    const handler = () => { if (!disposing) onLost() }
+    canvasListeners.push(handler)
+    return {
+      dispose() { disposing = true; disposals++; canvasListeners.forEach(h => h()) },  // loseContext()
+    }
+  }
+  let current = null
+  const rebuild = () => { if (current) current.dispose(); current = mkRenderer(rebuild) }
+  let overflowed = false
+  try { rebuild(); current.dispose() } catch { overflowed = true }
+  ok('a deliberate dispose terminates', !overflowed)
+  ok('it does not trigger a rebuild storm', rebuilds <= 2, `${rebuilds} rebuilds`)
+  ok('each renderer is disposed at most once', disposals <= 2, `${disposals} disposals`)
+
+  // a GENUINE loss must still rebuild exactly once
+  let recovered = 0
+  const genuine = mkRenderer(() => { recovered++ })
+  canvasListeners[canvasListeners.length - 1]()
+  ok('a real context loss still recovers', recovered === 1, `${recovered}`)
+}
+
+group('A failed cast keeps the code on screen')
+{
+  const castBody = app.slice(app.indexOf('const startCast'), app.indexOf('const stopCast'))
+  ok('failure does not blank the code', !/status: 'failed' \}\); say/.test(castBody))
+  ok('the session stays open so the user can retry', /setCast\(\{ on: true, code, viewers: 0, status: 'failed'/.test(castBody))
+  ok('the real error is captured', /error: String\(e\?\.message \|\| e\)/.test(castBody))
+  ok('the reason is shown in the sheet', /cast\.status === 'failed' \? 'Could not reach the relay/.test(app))
+  ok('the error text is rendered', /\{cast\.error\}/.test(app))
+  ok('there is a retry control', /RETRY<\/Btn>/.test(app))
 }
 
 group('Session code')
@@ -98,8 +121,11 @@ group('Lifecycle and failure handling')
 {
   ok('leaves the room on stop', /castRef\.current\?\.leave\(\)/.test(app))
   ok('clears the room reference', /castRef\.current = null/.test(app))
-  ok('a failed start resets state rather than hanging on "connecting"',
-     /catch \{ setCast\(\{ on: false, code: '', viewers: 0, status: 'failed' \}\)/.test(app))
+  // Previously a failure wiped the session, so the code flashed up and
+  // vanished and the only clue was a transient toast. It must now land in a
+  // visible failed state instead.
+  ok('a failed start lands in a visible failed state, not a blank one',
+     /status: 'failed', error:/.test(app) && !/status: 'failed' \}\); say\('Could not start cast'\)/.test(app))
   ok('unsupported browsers are told so', /Casting not supported in this browser/.test(app))
   ok('viewer count cannot go negative', /Math\.max\(0, s\.viewers - 1\)/.test(app))
   ok('a late joiner is sent the stream too', /room\.addStream\(out, id\)/.test(app))

@@ -25,10 +25,15 @@ group('Per-frame GPU upload')
 
 group('Compositing fast path')
 {
-  // The preview must not pay for a preserved buffer; it is enabled only while
-  // recording or casting, which need canvas.captureStream() to be reliable.
-  ok('preserveDrawingBuffer is opt-in, not always on', /preserveDrawingBuffer: !!opts\.preserve/.test(gl))
-  ok('the preview opts out by default', /preserveRef = useRef\(false\)/.test(app))
+  // TRADE-OFF, deliberate: preserveDrawingBuffer stays ON. Turning it off was
+  // worth some frame time, but recording and casting both read the canvas via
+  // captureStream(), and switching the flag at stream time meant rebuilding
+  // the GL context — which set off a dispose/recover loop and broke casting.
+  // Correctness of the capture paths beats the frame-time saving; the other
+  // three optimisations in this group carry the performance work.
+  ok('drawing buffer is preserved so captureStream is reliable',
+     /preserveDrawingBuffer: opts\.preserve !== false/.test(gl))
+  ok('no context rebuild is needed to start a stream', !/ensurePreserve/.test(app))
   ok('desynchronized compositing requested', /desynchronized: true/.test(gl))
   ok('redraw() exists for pixel reads', /function redraw\(\)/.test(gl) && /redraw,/.test(gl))
   ok('photo capture repaints before toDataURL',

@@ -261,7 +261,7 @@ export function createRenderer(canvas, opts = {}) {
     // live preview. But canvas.captureStream() — which both recording and
     // casting rely on — can hand WebKit an already-cleared buffer and emit
     // black frames, so it is switched back on while either is running.
-    preserveDrawingBuffer: !!opts.preserve, antialias: false, alpha: false, depth: false,
+    preserveDrawingBuffer: opts.preserve !== false, antialias: false, alpha: false, depth: false,
     desynchronized: true,
     powerPreference: 'high-performance',
   })
@@ -361,8 +361,14 @@ export function createRenderer(canvas, opts = {}) {
   function reset() { fresh = true }
 
   let lastTex = null, lastOpts = null
-  let lost = false
-  const onLost = e => { e.preventDefault(); lost = true; texDim.clear() }
+  let lost = false, disposing = false
+  const onLost = e => {
+    e.preventDefault()
+    lost = true; texDim.clear()
+    // A deliberate teardown calls loseContext() itself. Reporting that as a
+    // failure made the owner rebuild, which disposed again — an endless loop.
+    if (!disposing) opts.onLost?.()
+  }
   const onRestored = () => { lost = false }
   canvas.addEventListener('webglcontextlost', onLost, false)
   canvas.addEventListener('webglcontextrestored', onRestored, false)
@@ -561,8 +567,9 @@ export function createRenderer(canvas, opts = {}) {
   }
 
   function isLost() { return lost || gl.isContextLost() }
-  const preserving = !!opts.preserve
+  const preserving = opts.preserve !== false
   function dispose() {
+    disposing = true
     canvas.removeEventListener('webglcontextlost', onLost)
     canvas.removeEventListener('webglcontextrestored', onRestored)
     ping.forEach(b => { gl.deleteTexture(b.tex); gl.deleteFramebuffer(b.fbo) })
