@@ -255,9 +255,13 @@ function program(gl, fs, vs = VS) {
   return { p, u }
 }
 
-export function createRenderer(canvas) {
+export function createRenderer(canvas, opts = {}) {
   const gl = canvas.getContext('webgl2', {
-    preserveDrawingBuffer: false, antialias: false, alpha: false, depth: false,
+    // preserveDrawingBuffer costs real frame time, so it stays off for the
+    // live preview. But canvas.captureStream() — which both recording and
+    // casting rely on — can hand WebKit an already-cleared buffer and emit
+    // black frames, so it is switched back on while either is running.
+    preserveDrawingBuffer: !!opts.preserve, antialias: false, alpha: false, depth: false,
     desynchronized: true,
     powerPreference: 'high-performance',
   })
@@ -557,6 +561,7 @@ export function createRenderer(canvas) {
   }
 
   function isLost() { return lost || gl.isContextLost() }
+  const preserving = !!opts.preserve
   function dispose() {
     canvas.removeEventListener('webglcontextlost', onLost)
     canvas.removeEventListener('webglcontextrestored', onRestored)
@@ -566,7 +571,7 @@ export function createRenderer(canvas) {
     try { gl.getExtension('WEBGL_lose_context')?.loseContext() } catch {}
   }
 
-  return { gl, resize, render, renderPip, reset, redraw, captureFull, isLost, dispose, halfFloat }
+  return { gl, resize, render, renderPip, reset, redraw, captureFull, isLost, dispose, preserving, halfFloat }
 }
 
 // Map a point in normalized raw-video space (0..1) to normalized screen space.

@@ -116,6 +116,7 @@ export default function App() {
   const [renderRes, setRenderRes] = useState({ w: 0, h: 0 })
   const [glReady, setGlReady] = useState(0)
   const [glEpoch, setGlEpoch] = useState(0)
+  const preserveRef = useRef(false)
   const sizeRef = useRef({ w: 0, h: 0 })
   const expRef = useRef(1)
   const scaleRef = useRef(1)
@@ -266,7 +267,7 @@ export default function App() {
     const cv = canvasRef.current
     if (!cv) return
     let r
-    try { r = createRenderer(cv) } catch { r = null }
+    try { r = createRenderer(cv, { preserve: preserveRef.current }) } catch { r = null }
     if (!r) { setGlFail(true); return }
     rendererRef.current = r
     motionFn.current = createMotion()
@@ -312,10 +313,22 @@ export default function App() {
     srRef.current = { n: 0, shift: [0, 0] }; setSrFrames(0)
   }, [mode, facing, sr])
 
+  // canvas.captureStream() needs a preserved drawing buffer to be reliable.
+  // Rebuild the context before handing a stream to a recorder or a peer, and
+  // drop back to the fast path once nothing is streaming.
+  const ensurePreserve = useCallback(async want => {
+    if (preserveRef.current === want) return
+    preserveRef.current = want
+    setGlEpoch(n => n + 1)
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))
+  }, [])
+
   // ── recording ──
-  const startRec = useCallback((auto = false) => {
+  const startRec = useCallback(async (auto = false) => {
     const c = canvasRef.current
     if (!c || recRef.current || !window.MediaRecorder) return
+    await ensurePreserve(true)
+    if (recRef.current) return                 // a second call landed while rebuilding
     const type = recorderType()
     const rec = new MediaRecorder(c.captureStream(30), type ? { mimeType: type, videoBitsPerSecond: pickBitrate(c.width, c.height, 30) } : undefined)
     const chunks = [], t0 = Date.now()
@@ -330,12 +343,13 @@ export default function App() {
     rec.start(1000)
     recRef.current = { rec, auto }
     setRecording(true)
-  }, [])
+  }, [ensurePreserve])
   const stopRec = useCallback(() => {
     const r = recRef.current; if (!r) return
     try { r.rec.stop() } catch { /* already stopped */ }
     recRef.current = null; setRecording(false)
-  }, [])
+    if (!castRef.current) ensurePreserve(false)
+  }, [ensurePreserve])
 
   // ── watch bridge: no-op outside the native iOS host app (see watchBridge.js) ──
   // Registered once; reads live values from cfg.current / recRef rather than
@@ -489,11 +503,18 @@ export default function App() {
     catch { say('Torch not supported on this camera') }
   }, [stream, torch, say])
 
+
+
   // ── cast ──
   const startCast = useCallback(async () => {
     const c = canvasRef.current
     if (!c?.captureStream) { say('Casting not supported in this browser'); return }
-    const code = Math.random().toString(36).slice(2, 6).toUpperCase()
+    await ensurePreserve(true)
+    // Always exactly 4 characters. Math.random().toString(36) can be short for
+    // the rare exactly-representable value (0.5 -> "0.i"), which would print a
+    // broken code nobody could join.
+    const AL = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'   // no 0/O/1/I to misread aloud
+    const code = Array.from({ length: 4 }, () => AL[(Math.random() * AL.length) | 0]).join('')
     setCast({ on: true, code, viewers: 0, status: 'connecting' })
     try {
       const { joinRoom } = await import('trystero/nostr')
@@ -505,12 +526,13 @@ export default function App() {
       castRef.current = room
       setCast(s => ({ ...s, status: 'waiting' }))
     } catch { setCast({ on: false, code: '', viewers: 0, status: 'failed' }); say('Could not start cast') }
-  }, [say])
+  }, [say, ensurePreserve])
   const stopCast = useCallback(() => {
     try { castRef.current?.leave() } catch { /* noop */ }
     castRef.current = null
     setCast({ on: false, code: '', viewers: 0, status: 'idle' })
-  }, [])
+    if (!recRef.current) ensurePreserve(false)
+  }, [ensurePreserve])
 
   // ── presets ──
   const applyPreset = p => {
