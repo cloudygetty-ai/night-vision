@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { MODES, createRenderer, videoToScreen } from './gl.js'
+import { joinCast } from './cast.js'
 import { createMotion, createAligner, vault, stamp, sha256, beep, recorderType, shareBlob, download, dataUrlToBlob,
          fitCanvas, pickBitrate, resLabel, autoExposure, qualityGovernor, memoryScale, initDetector, warmup,
          rankCameraModes, captureSize, usablePixels } from './engine.js'
@@ -500,20 +501,25 @@ export default function App() {
     const AL = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'   // no 0/O/1/I to misread aloud
     const code = Array.from({ length: 4 }, () => AL[(Math.random() * AL.length) | 0]).join('')
     setCast({ on: true, code, viewers: 0, status: 'connecting' })
+    // Grab the stream BEFORE joining: onPeerJoin can fire during the await,
+    // and referencing `out` from the handler before assignment would throw.
+    const out = c.captureStream(24)
+    let room = null                       // declared first: the handlers close over it
     try {
-      const { joinRoom } = await import('trystero/nostr')
-      const room = joinRoom({ appId: 'nvs15-cast' }, `nvs-${code}`)
-      const out = c.captureStream(24)
+      room = await joinCast(code, {
+        onPeerJoin: id => {
+          try { room?.addStream(out, id) } catch { /* peer vanished */ }
+          setCast(s => ({ ...s, viewers: s.viewers + 1, status: 'live' }))
+        },
+        onPeerLeave: () => setCast(s => ({ ...s, viewers: Math.max(0, s.viewers - 1) })),
+      })
       room.addStream(out)
-      room.onPeerJoin(id => { try { room.addStream(out, id) } catch { /* noop */ } ; setCast(s => ({ ...s, viewers: s.viewers + 1, status: 'live' })) })
-      room.onPeerLeave(() => setCast(s => ({ ...s, viewers: Math.max(0, s.viewers - 1) })))
       castRef.current = room
-      setCast(s => ({ ...s, status: 'waiting' }))
+      setCast(s => ({ ...s, status: 'waiting', via: room.transports.join('+') }))
     } catch (e) {
-      // Wiping the code here is what made a failure look like "the code
-      // disappears": the session vanished and the only clue was a toast.
-      // Keep it on screen and say what actually went wrong.
-      setCast({ on: true, code, viewers: 0, status: 'failed', error: String(e?.message || e).slice(0, 120) })
+      // Keep the code on screen with the real reason rather than wiping the
+      // session, which made a relay failure look like a vanishing code.
+      setCast({ on: true, code, viewers: 0, status: 'failed', error: String(e?.message || e).slice(0, 160) })
       say('Cast failed to connect')
     }
   }, [say])
@@ -852,6 +858,7 @@ export default function App() {
                   {cast.status === 'failed' ? 'Could not reach the relay — tap RETRY'
                     : cast.status === 'connecting' ? 'Connecting…'
                     : cast.viewers ? `${cast.viewers} watching` : 'Waiting for a viewer'}
+                  {cast.via && cast.status !== 'failed' ? ` · via ${cast.via}` : ''}
                 </div>
               </div>
               <div style={{ fontSize: 13.5, lineHeight: 1.6, color: 'rgba(233,241,236,.85)' }}>

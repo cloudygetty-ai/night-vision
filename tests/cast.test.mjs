@@ -11,32 +11,131 @@ const ok = (n, c, d = '') => { c ? (pass++, console.log(`  ✓ ${n}`)) : (fail++
 const group = n => console.log(`\n${n}`)
 
 const R = f => fs.readFileSync(path.join(import.meta.dirname, '../src/' + f), 'utf8')
-const app = R('App.jsx'), watch = R('Watch.jsx'), gl = R('gl.js')
+const app = R('App.jsx'), watch = R('Watch.jsx'), gl = R('gl.js'), castSrc = R('cast.js')
+const { joinCast, roomName, APP_ID, STRATEGIES } = await import('../src/cast.js')
 
-group('Sender and receiver must agree, or casting fails silently')
+// A fake trystero room that records what it was asked to do.
+const mkStrategy = (name, { fail = false } = {}) => {
+  const state = { name, joined: null, streams: [], left: false, handlers: {} }
+  return {
+    state,
+    strategy: {
+      name,
+      load: async () => {
+        if (fail) throw new Error(`${name} relay unreachable`)
+        return {
+          joinRoom: (cfg, room) => {
+            state.joined = { cfg, room }
+            return {
+              onPeerJoin: f => { state.handlers.join = f },
+              onPeerLeave: f => { state.handlers.leave = f },
+              onPeerStream: f => { state.handlers.stream = f },
+              addStream: (s, id) => state.streams.push({ s, id }),
+              leave: () => { state.left = true },
+            }
+          },
+        }
+      },
+    },
+  }
+}
+
+
+group('Sender and receiver share one transport module')
 {
-  const sendApp = app.match(/joinRoom\(\{ appId: '([^']+)' \}, `([^`]+)`\)/)
-  const recvApp = watch.match(/joinRoom\(\{ appId: '([^']+)' \}, `([^`]+)`\)/)
-  ok('sender joins a room', !!sendApp)
-  ok('receiver joins a room', !!recvApp)
-  ok('appId matches on both sides', sendApp?.[1] === recvApp?.[1],
-     `${sendApp?.[1]} vs ${recvApp?.[1]}`)
-  const norm = s => (s || '').replace('.toUpperCase()', '')
-  ok('room name template matches on both sides', norm(sendApp?.[2]) === norm(recvApp?.[2]),
-     `${sendApp?.[2]} vs ${recvApp?.[2]}`)
-  ok('receiver normalises case so a typed lowercase code still joins',
-     /code\.toUpperCase\(\)/.test(watch))
-  ok('both use the same trystero strategy',
-     /trystero\/nostr/.test(app) && /trystero\/nostr/.test(watch))
+  ok('sender uses the shared module', /import \{ joinCast \} from '\.\/cast\.js'/.test(app))
+  ok('receiver uses the shared module', /import \{ joinCast \} from '\.\/cast\.js'/.test(watch))
+  ok('neither hardcodes a room name any more',
+     !/joinRoom\(\{ appId/.test(app) && !/joinRoom\(\{ appId/.test(watch))
+  ok('room name derives from the code', roomName('ab7k') === 'NVS-AB7K'.replace('NVS-', 'nvs-'))
+  ok('room name is case-insensitive', roomName('ab7k') === roomName('AB7K'))
+  ok('both sides therefore cannot disagree', roomName('X2Y9') === `nvs-X2Y9`)
+}
+
+group('Deprecated trystero subpaths are gone (they throw in 0.26)')
+{
+  ok('no trystero/nostr import anywhere', !/'trystero\/nostr'/.test(app + watch + castSrc))
+  ok('no trystero/mqtt import anywhere', !/'trystero\/mqtt'/.test(app + watch + castSrc))
+  ok('strategies come from their own packages',
+     /@trystero-p2p\/mqtt/.test(castSrc) && /@trystero-p2p\/nostr/.test(castSrc))
+  const pkg = JSON.parse(R('../package.json'))
+  ok('mqtt strategy is a declared dependency', !!pkg.dependencies['@trystero-p2p/mqtt'])
+}
+
+group('MQTT is primary, nostr runs alongside it')
+{
+  const m = mkStrategy('mqtt'), n = mkStrategy('nostr')
+  const room = await joinCast('ab7k', {}, [m.strategy, n.strategy])
+  ok('mqtt is the primary transport', STRATEGIES[0].name === 'mqtt', STRATEGIES.map(s => s.name).join(','))
+  ok('nostr is kept as a backup', STRATEGIES.some(s => s.name === 'nostr'))
+  ok('both transports join', room.transports.join(',') === 'mqtt,nostr', room.transports.join(','))
+  ok('both join the same room name', m.state.joined.room === n.state.joined.room, m.state.joined.room)
+  ok('room name is normalised to upper case', m.state.joined.room === 'nvs-AB7K', m.state.joined.room)
+  ok('both use the same appId', m.state.joined.cfg.appId === APP_ID && n.state.joined.cfg.appId === APP_ID)
+  room.leave()
+  ok('leaving leaves every transport', m.state.left && n.state.left)
+}
+
+group('One dead network does not kill the cast')
+{
+  const m = mkStrategy('mqtt'), n = mkStrategy('nostr', { fail: true })
+  const room = await joinCast('ab7k', {}, [m.strategy, n.strategy])
+  ok('survives on the healthy transport', room.transports.join(',') === 'mqtt', room.transports.join(','))
+  ok('the failure is reported, not swallowed', room.failures.length === 1 && /nostr relay unreachable/.test(room.failures[0]),
+     JSON.stringify(room.failures))
+
+  const a = mkStrategy('mqtt', { fail: true }), b = mkStrategy('nostr', { fail: true })
+  let threw = null
+  try { await joinCast('ab7k', {}, [a.strategy, b.strategy]) } catch (e) { threw = e }
+  ok('all transports failing does throw', !!threw)
+  ok('and the error names both causes',
+     /mqtt relay unreachable/.test(threw.message) && /nostr relay unreachable/.test(threw.message),
+     threw?.message)
+}
+
+group('A viewer reaching us on both transports counts once')
+{
+  const m = mkStrategy('mqtt'), n = mkStrategy('nostr')
+  let joins = 0, leaves = 0
+  const room = await joinCast('ab7k', { onPeerJoin: () => joins++, onPeerLeave: () => leaves++ },
+                              [m.strategy, n.strategy])
+  m.state.handlers.join('peer-1')
+  n.state.handlers.join('peer-1')          // same viewer, second network
+  ok('the peer is reported once, not twice', joins === 1, `${joins}`)
+
+  const stream = { id: 'video' }
+  room.addStream(stream, 'peer-1')
+  ok('the stream goes only to the transport that introduced them',
+     m.state.streams.length === 1 && n.state.streams.length === 0,
+     `mqtt=${m.state.streams.length} nostr=${n.state.streams.length}`)
+
+  n.state.handlers.leave('peer-1')
+  ok('a leave on the other transport is ignored', leaves === 0, `${leaves}`)
+  m.state.handlers.leave('peer-1')
+  ok('the owning transport reports the leave', leaves === 1, `${leaves}`)
+
+  m.state.handlers.join('peer-2')
+  ok('a genuinely new viewer is reported', joins === 2, `${joins}`)
+}
+
+group('Broadcast before anyone has joined')
+{
+  const m = mkStrategy('mqtt'), n = mkStrategy('nostr')
+  const room = await joinCast('ab7k', {}, [m.strategy, n.strategy])
+  room.addStream({ id: 'video' })
+  ok('an untargeted stream is offered to every transport',
+     m.state.streams.length === 1 && n.state.streams.length === 1)
+  ok('addStream for an unknown peer is a no-op, not a throw',
+     (() => { try { room.addStream({}, 'nobody'); return true } catch { return false } })())
 }
 
 group('Trystero handlers are called, not assigned (the NVS-13 regression)')
 {
-  ok('sender calls onPeerJoin as a function', /room\.onPeerJoin\(/.test(app))
-  ok('sender calls onPeerLeave as a function', /room\.onPeerLeave\(/.test(app))
-  ok('receiver calls onPeerStream as a function', /room\.onPeerStream\(/.test(watch))
+  ok('onPeerJoin is called, not assigned', /room\.onPeerJoin\?\.\(/.test(castSrc))
+  ok('onPeerLeave is called, not assigned', /room\.onPeerLeave\?\.\(/.test(castSrc))
+  ok('onPeerStream is called, not assigned', /room\.onPeerStream\?\.\(/.test(castSrc))
   ok('nothing assigns a handler as a property',
-     !/\.onPeer(Join|Leave|Stream)\s*=/.test(app + watch))
+     !/\.onPeer(Join|Leave|Stream)\s*=[^=]/.test(app + watch + castSrc))
 }
 
 group('captureStream gets a preserved drawing buffer')
@@ -128,8 +227,11 @@ group('Lifecycle and failure handling')
      /status: 'failed', error:/.test(app) && !/status: 'failed' \}\); say\('Could not start cast'\)/.test(app))
   ok('unsupported browsers are told so', /Casting not supported in this browser/.test(app))
   ok('viewer count cannot go negative', /Math\.max\(0, s\.viewers - 1\)/.test(app))
-  ok('a late joiner is sent the stream too', /room\.addStream\(out, id\)/.test(app))
-  ok('trystero loads lazily, off the startup path', /await import\('trystero\/nostr'\)/.test(app))
+  ok('a late joiner is sent the stream too', /room\?\.addStream\(out, id\)/.test(app))
+  ok('transports load lazily, off the startup path',
+     /load: \(\) => import\('@trystero-p2p/.test(castSrc))
+  ok('the stream is captured before joining, avoiding a TDZ on the handler path',
+     app.indexOf('const out = c.captureStream(24)') < app.indexOf('room = await joinCast'))
 }
 
 console.log(`\n${'─'.repeat(46)}\n${pass} passed, ${fail} failed\n`)

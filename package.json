@@ -14,9 +14,10 @@
     "@tensorflow/tfjs-backend-wasm": "^4.22.0",
     "@tensorflow/tfjs-converter": "^4.22.0",
     "@tensorflow/tfjs-core": "^4.22.0",
+    "@trystero-p2p/mqtt": "^0.26.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "trystero": "^0.25.4"
+    "trystero": "^0.26.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
